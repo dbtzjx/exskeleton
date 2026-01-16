@@ -1948,6 +1948,13 @@ void updateGaitCollection() {
 }
 
 // ============================================================================
+// 主循环控制函数前向声明
+// ============================================================================
+
+void setControlLoopEnabled(bool enabled);
+void updateControlLoop();
+
+// ============================================================================
 // 串口命令处理
 // ============================================================================
 
@@ -2297,6 +2304,13 @@ void processSerialCommand() {
       Serial.printf(">>> Current state: %d\n", complianceCtrl.currentState);
     }
   }
+  // 启用/禁用控制循环：ctrlon / ctrloff
+  else if (cmd == "ctrlon" || cmd == "controlon") {
+    setControlLoopEnabled(true);
+  }
+  else if (cmd == "ctrloff" || cmd == "controloff") {
+    setControlLoopEnabled(false);
+  }
   // 位置控制命令：move1 <angle> 表示髋关节移动到指定角度（关节角度，度）
   else if (cmd.startsWith("move1 ") || cmd.startsWith("pos1 ")) {
     int spaceIdx = cmd.indexOf(' ');
@@ -2389,6 +2403,7 @@ void processSerialCommand() {
     Serial.println("Assist On/Off: assiston / assistoff (enable/disable ankle assist)");
     Serial.println("Compliance: compliance (show compliance control status)");
     Serial.println("Reset Fault: resetfault (reset fault state to normal)");
+    Serial.println("Control Loop: ctrlon / ctrloff (enable/disable 100Hz control loop)");
     Serial.println("Help:    h, help");
   }
   else {
@@ -2433,11 +2448,160 @@ void setup() {
   initDefaultGaitTrajectory();
 }
 
+// ============================================================================
+// 主循环控制（100Hz控制频率）
+// ============================================================================
+
+// 控制循环状态
+struct ControlLoop {
+  uint32_t lastControlMs;      // 上次控制循环时间（毫秒）
+  uint32_t controlIntervalMs;  // 控制周期（毫秒），100Hz = 10ms
+  bool controlEnabled;          // 是否启用控制循环
+  uint32_t controlCount;        // 控制循环计数（用于调试）
+};
+
+ControlLoop controlLoop = {
+  0,        // lastControlMs
+  10,       // controlIntervalMs (100Hz = 10ms)
+  false,    // controlEnabled
+  0         // controlCount
+};
+
+// 启用/禁用控制循环
+void setControlLoopEnabled(bool enabled) {
+  controlLoop.controlEnabled = enabled;
+  if (enabled) {
+    controlLoop.lastControlMs = millis();
+    controlLoop.controlCount = 0;
+    Serial.println(">>> Control loop ENABLED (100Hz)");
+  } else {
+    Serial.println(">>> Control loop DISABLED");
+  }
+}
+
+// 100Hz控制循环（在主循环中调用）
+void updateControlLoop() {
+  if (!controlLoop.controlEnabled) {
+    return;
+  }
+  
+  uint32_t now = millis();
+  uint32_t elapsed = now - controlLoop.lastControlMs;
+  
+  // 检查是否到达控制周期（10ms for 100Hz）
+  if (elapsed < controlLoop.controlIntervalMs) {
+    return;  // 还没到时间，跳过本次控制
+  }
+  
+  // 更新控制时间戳
+  controlLoop.lastControlMs = now;
+  controlLoop.controlCount++;
+  
+  // ========================================================================
+  // 1. 传感器更新（已在handleCanMessage中完成，这里确保数据新鲜）
+  // ========================================================================
+  // 检查传感器数据是否新鲜（500ms内）
+  bool hipDataOk = (hipStatus.lastUpdateMs > 0) && 
+                   ((now - hipStatus.lastUpdateMs) < COMM_TIMEOUT_MS);
+  bool ankleDataOk = (ankleStatus.lastUpdateMs > 0) && 
+                     ((now - ankleStatus.lastUpdateMs) < COMM_TIMEOUT_MS);
+  
+  // 如果数据不新鲜，请求更新
+  if (!hipDataOk) {
+    requestMotorAngle(hipMotor);
+  }
+  if (!ankleDataOk) {
+    requestMotorAngle(ankleMotor);
+    // 同时请求状态2以获取电流数据
+    sendCanCommand(ankleMotor.id, CMD_READ_STATUS2, nullptr, 0, false);
+  }
+  
+  // ========================================================================
+  // 2. 相位识别（已在handleCanMessage中更新，这里确保已初始化）
+  // ========================================================================
+  // 相位识别在handleCanMessage中自动更新，这里只需要检查是否已初始化
+  
+  // ========================================================================
+  // 3. 辅助计算（已在handleCanMessage中更新）
+  // ========================================================================
+  // 辅助策略和顺从控制在handleCanMessage中已更新
+  
+  // ========================================================================
+  // 4. 安全检查（顺从控制状态机已在updateComplianceController中完成）
+  // ========================================================================
+  // 安全检查已完成，获取当前状态
+  ComplianceState compState = getComplianceState();
+  float speedFactor = getComplianceSpeedFactor();
+  
+  // ========================================================================
+  // 5. 下发控制命令（仅在辅助启用且数据有效时）
+  // ========================================================================
+  if (ankleAssist.enabled && ankleAssist.initialized && 
+      ankleDataOk && hipDataOk &&
+      hipProcessor.initialized && adaptiveThreshold.initialized &&
+      gaitPhaseDetector.initialized && swingProgress.initialized &&
+      complianceCtrl.initialized) {
+    
+    // 获取参考角度
+    float theta_ref = getAnkleReferenceAngle();
+    
+    // 根据顺从控制状态调整参考角度
+    if (compState == STATE_HOLD) {
+      // HOLD状态：保持当前位置
+      theta_ref = getComplianceHoldPosition();
+    } else if (compState == STATE_FAULT_SAFE) {
+      // 故障状态：不发送控制命令（或发送停止命令）
+      // 这里可以选择不发送命令，或者发送当前位置保持命令
+      theta_ref = ankleStatus.angleDeg;  // 保持当前位置
+    }
+    
+    // 限制参考角度在安全范围内（双重保险）
+    if (theta_ref < ANKLE_THETA_MIN) {
+      theta_ref = ANKLE_THETA_MIN;
+    } else if (theta_ref > ANKLE_THETA_MAX) {
+      theta_ref = ANKLE_THETA_MAX;
+    }
+    
+    // 计算速度限制（考虑顺从控制的速度因子和助力衰减）
+    // 基础速度限制（关节速度，度/秒）
+    float baseMaxSpeedDps = 30.0f;  // 基础最大速度30度/秒
+    
+    // 应用速度因子（顺从控制）
+    float maxSpeedDps = baseMaxSpeedDps * speedFactor;
+    
+    // 应用助力衰减因子（患者抬得越好，速度越慢）
+    float assistFactor = getAnkleAssistFactor();
+    maxSpeedDps = maxSpeedDps * (0.3f + 0.7f * assistFactor);  // 速度范围：30% ~ 100%
+    
+    // 确保速度不为0（至少有一个最小值）
+    if (maxSpeedDps < 5.0f) {
+      maxSpeedDps = 5.0f;
+    }
+    
+    // 转换为电机轴速度（协议单位：1 dps/LSB）
+    uint16_t motorSpeed = jointSpeedToMotorSpeed(ankleMotor, maxSpeedDps);
+    
+    // 确保速度不为0（至少有一个最小值）
+    if (motorSpeed < 5) {
+      motorSpeed = 5;
+    }
+    
+    // 发送位置控制命令（带速度限制）
+    sendPositionCommandWithSpeed(ankleMotor, theta_ref, motorSpeed);
+    
+    // 调试输出（每100次控制循环输出一次，避免串口阻塞）
+    if (controlLoop.controlCount % 100 == 0) {
+      Serial.printf("[CTRL] ref=%.2f deg, speed=%.1f dps (factor=%.2f), state=%d, iq=%d mA\n",
+                   theta_ref, maxSpeedDps, speedFactor, compState, ankleStatus.iq);
+    }
+  }
+}
+
 void loop() {
-  // 处理串口命令
+  // 处理串口命令（非阻塞）
   processSerialCommand();
   
-  // 轮询接收 CAN 帧
+  // 轮询接收 CAN 帧（非阻塞）
   {
     CAN_message_t inMsg;
     while (can1.read(inMsg)) {
@@ -2445,9 +2609,10 @@ void loop() {
     }
   }
   
-  // 注意：髋关节信号预处理已在handleCanMessage中调用，这里不需要重复调用
+  // 100Hz控制循环（仅在启用时执行）
+  updateControlLoop();
   
-  // 更新摆动
+  // 更新摆动（用于调试功能）
   updateSwing(hipSwing);
   updateSwing(ankleSwing);
   
