@@ -228,6 +228,370 @@ void updateAdaptiveThreshold(float hip_f) {
 }
 
 // ============================================================================
+// 步态相位识别（两态状态机）
+// ============================================================================
+
+// 步态相位枚举
+enum GaitPhase {
+  PHASE_STANCE = 0,  // 支撑相
+  PHASE_SWING = 1    // 摆动相
+};
+
+// 步态相位识别状态
+struct GaitPhaseDetector {
+  GaitPhase currentPhase;         // 当前相位
+  uint32_t phaseStartMs;           // 当前相位开始时间（毫秒）
+  uint32_t conditionHoldMs;        // 条件持续满足的时间（毫秒）
+  bool initialized;                // 是否已初始化
+  uint32_t lastUpdateMs;            // 上次更新时间
+};
+
+GaitPhaseDetector gaitPhaseDetector = {
+  PHASE_STANCE, 0, 0, false, 0
+};
+
+// 更新步态相位识别
+// 输入：使用hipProcessor和adaptiveThreshold中的数据
+// 输出：更新gaitPhaseDetector中的相位状态
+void updateGaitPhaseDetector() {
+  // 检查前置条件：信号处理和阈值计算必须已初始化
+  if (!hipProcessor.initialized || !adaptiveThreshold.initialized) {
+    return;
+  }
+  
+  uint32_t now = millis();
+  
+  // 初始化：默认从支撑相开始
+  if (!gaitPhaseDetector.initialized) {
+    gaitPhaseDetector.currentPhase = PHASE_STANCE;
+    gaitPhaseDetector.phaseStartMs = now;
+    gaitPhaseDetector.conditionHoldMs = 0;
+    gaitPhaseDetector.lastUpdateMs = now;
+    gaitPhaseDetector.initialized = true;
+    return;
+  }
+  
+  // 计算时间差
+  uint32_t dt_ms = now - gaitPhaseDetector.lastUpdateMs;
+  if (dt_ms == 0) {
+    return;  // 避免除零
+  }
+  
+  // 获取当前信号值
+  float hip_f = hipProcessor.hip_f;
+  float hip_vel_f = hipProcessor.hip_vel_f;
+  float hip_mean = adaptiveThreshold.hip_mean;
+  float A_up = adaptiveThreshold.A_up;
+  float A_dn = adaptiveThreshold.A_dn;
+  float V_up = adaptiveThreshold.V_up;
+  float V_dn = adaptiveThreshold.V_dn;
+  
+  // 检查相位转换条件
+  bool swingConditionMet = (hip_vel_f > V_up) && (hip_f > hip_mean + A_up);
+  bool stanceConditionMet = (hip_vel_f < V_dn) && (hip_f < hip_mean - A_dn);
+  
+  // 根据当前相位和条件，更新防抖计时器
+  if (gaitPhaseDetector.currentPhase == PHASE_STANCE) {
+    // 当前是支撑相，检查是否满足进入摆动相的条件
+    if (swingConditionMet) {
+      gaitPhaseDetector.conditionHoldMs += dt_ms;
+    } else {
+      // 条件不满足，重置计时器
+      gaitPhaseDetector.conditionHoldMs = 0;
+    }
+    
+    // 如果条件持续满足超过防抖时间，切换到摆动相
+    if (gaitPhaseDetector.conditionHoldMs >= T_HOLD_MS) {
+      gaitPhaseDetector.currentPhase = PHASE_SWING;
+      gaitPhaseDetector.phaseStartMs = now;
+      gaitPhaseDetector.conditionHoldMs = 0;  // 重置计时器
+    }
+  } else {
+    // 当前是摆动相，检查是否满足进入支撑相的条件
+    if (stanceConditionMet) {
+      gaitPhaseDetector.conditionHoldMs += dt_ms;
+    } else {
+      // 条件不满足，重置计时器
+      gaitPhaseDetector.conditionHoldMs = 0;
+    }
+    
+    // 如果条件持续满足超过防抖时间，切换到支撑相
+    if (gaitPhaseDetector.conditionHoldMs >= T_HOLD_MS) {
+      gaitPhaseDetector.currentPhase = PHASE_STANCE;
+      gaitPhaseDetector.phaseStartMs = now;
+      gaitPhaseDetector.conditionHoldMs = 0;  // 重置计时器
+    }
+  }
+  
+  gaitPhaseDetector.lastUpdateMs = now;
+}
+
+// 获取当前步态相位（供其他模块调用）
+GaitPhase getCurrentGaitPhase() {
+  return gaitPhaseDetector.initialized ? gaitPhaseDetector.currentPhase : PHASE_STANCE;
+}
+
+// 获取当前相位持续时间（毫秒）
+uint32_t getCurrentPhaseDurationMs() {
+  if (!gaitPhaseDetector.initialized) {
+    return 0;
+  }
+  return millis() - gaitPhaseDetector.phaseStartMs;
+}
+
+// ============================================================================
+// 摆动相进度计算（用于踝控制）
+// ============================================================================
+
+// 摆动相进度状态
+struct SwingProgress {
+  float Ts;                        // 摆动平均周期（秒）
+  float t_swing;                   // 当前摆动时长（秒）
+  float swing_progress;            // 摆动进度 s (0.0 ~ 1.0)
+  bool initialized;                // 是否已初始化
+  GaitPhase lastPhase;             // 上次相位（用于检测相位切换）
+};
+
+SwingProgress swingProgress = {
+  0.4f,    // 初始 Ts = 0.4s
+  0.0f,    // 初始 t_swing = 0
+  0.0f,    // 初始进度 = 0
+  false,   // 未初始化
+  PHASE_STANCE
+};
+
+// 更新摆动相进度计算
+// 输入：使用gaitPhaseDetector中的相位信息
+// 输出：更新swingProgress中的进度值
+void updateSwingProgress() {
+  // 检查前置条件：相位识别必须已初始化
+  if (!gaitPhaseDetector.initialized) {
+    return;
+  }
+  
+  // 初始化
+  if (!swingProgress.initialized) {
+    swingProgress.Ts = 0.4f;  // 初始 Ts = 0.4s
+    swingProgress.t_swing = 0.0f;
+    swingProgress.swing_progress = 0.0f;
+    swingProgress.lastPhase = gaitPhaseDetector.currentPhase;
+    swingProgress.initialized = true;
+  }
+  
+  // 检测相位切换
+  GaitPhase currentPhase = gaitPhaseDetector.currentPhase;
+  bool phaseChanged = (currentPhase != swingProgress.lastPhase);
+  
+  // 检测相位切换（在更新t_swing之前，先保存上一次的值）
+  float lastSwingDurationSec = 0.0f;
+  if (phaseChanged && swingProgress.lastPhase == PHASE_SWING) {
+    // 如果从SWING切换到其他相位，保存当前的t_swing值
+    // 注意：此时t_swing还是上一次SWING的值（因为还没有更新）
+    lastSwingDurationSec = swingProgress.t_swing;
+  }
+  
+  // 计算当前摆动进度
+  if (currentPhase == PHASE_SWING) {
+    // 当前是摆动相，计算进度
+    uint32_t swingDurationMs = getCurrentPhaseDurationMs();
+    swingProgress.t_swing = swingDurationMs / 1000.0f;  // 转换为秒
+    
+    // 计算进度：s = clamp(t_swing / Ts, 0, 1)
+    if (swingProgress.Ts > 0.001f) {  // 避免除零
+      float progress = swingProgress.t_swing / swingProgress.Ts;
+      if (progress < 0.0f) {
+        swingProgress.swing_progress = 0.0f;
+      } else if (progress > 1.0f) {
+        swingProgress.swing_progress = 1.0f;
+      } else {
+        swingProgress.swing_progress = progress;
+      }
+    } else {
+      swingProgress.swing_progress = 0.0f;
+    }
+  } else {
+    // 当前是支撑相，进度为0
+    swingProgress.t_swing = 0.0f;
+    swingProgress.swing_progress = 0.0f;
+  }
+  
+  // 处理相位切换（在更新t_swing之后）
+  if (phaseChanged) {
+    // 相位切换了
+    if (swingProgress.lastPhase == PHASE_SWING && currentPhase == PHASE_STANCE) {
+      // 从摆动相切换到支撑相：使用保存的摆动时长来更新平均周期
+      // 只有当摆动时长合理时才更新平均周期（避免初始化时的错误更新）
+      if (lastSwingDurationSec > 0.01f && lastSwingDurationSec < 2.0f) {  // 至少10ms，最多2s
+        // 更新平均周期：Ts = 0.8 * Ts + 0.2 * t_swing
+        swingProgress.Ts = 0.8f * swingProgress.Ts + 0.2f * lastSwingDurationSec;
+        
+        // 限制Ts在合理范围内（0.1s ~ 2.0s）
+        if (swingProgress.Ts < 0.1f) {
+          swingProgress.Ts = 0.1f;
+        } else if (swingProgress.Ts > 2.0f) {
+          swingProgress.Ts = 2.0f;
+        }
+      }
+    }
+    
+    // 更新上次相位
+    swingProgress.lastPhase = currentPhase;
+  }
+}
+
+// 获取当前摆动进度（0.0 ~ 1.0）
+float getSwingProgress() {
+  return swingProgress.initialized ? swingProgress.swing_progress : 0.0f;
+}
+
+// 获取摆动平均周期（秒）
+float getSwingAveragePeriod() {
+  return swingProgress.initialized ? swingProgress.Ts : 0.4f;
+}
+
+// 获取当前摆动时长（秒）
+float getCurrentSwingDuration() {
+  return swingProgress.initialized ? swingProgress.t_swing : 0.0f;
+}
+
+// ============================================================================
+// 踝背屈辅助策略（B人群核心）
+// ============================================================================
+
+// 辅助策略参数
+#define ANKLE_THETA_LOW  2.0f   // 背屈窗口下限（度）
+#define ANKLE_THETA_HIGH 8.0f   // 背屈窗口上限（度）
+#define ANKLE_THETA_MIN  -15.0f // 安全限位下限（跖屈，度）
+#define ANKLE_THETA_MAX  15.0f  // 安全限位上限（背屈，度）
+
+// 踝背屈辅助状态
+struct AnkleAssistController {
+  float theta_ref;              // 参考角度（度）
+  float theta_target;           // S曲线目标角度（度）
+  float assist_factor;          // 助力衰减因子（0.0 ~ 1.0）
+  bool enabled;                 // 是否启用辅助
+  bool initialized;             // 是否已初始化
+};
+
+AnkleAssistController ankleAssist = {
+  0.0f,    // theta_ref
+  0.0f,    // theta_target
+  1.0f,    // assist_factor
+  false,   // enabled
+  false    // initialized
+};
+
+// 计算S曲线平滑函数
+// 输入：s (0.0 ~ 1.0)
+// 输出：u (0.0 ~ 1.0)，S曲线平滑值
+float smoothStep(float s) {
+  // u = s*s*(3 - 2*s)
+  if (s <= 0.0f) {
+    return 0.0f;
+  } else if (s >= 1.0f) {
+    return 1.0f;
+  } else {
+    return s * s * (3.0f - 2.0f * s);
+  }
+}
+
+// 更新踝背屈辅助策略
+// 输入：当前踝关节角度（度）、当前步态相位、摆动进度
+// 输出：更新ankleAssist中的参考角度和助力因子
+void updateAnkleAssistStrategy(float ankle_deg, GaitPhase currentPhase, float swing_progress) {
+  // 检查前置条件：必须在摆动相且摆动进度已初始化
+  if (currentPhase != PHASE_SWING || !swingProgress.initialized) {
+    // 不在摆动相，不提供辅助
+    ankleAssist.theta_ref = ankle_deg;  // 跟随当前角度
+    ankleAssist.theta_target = ANKLE_THETA_LOW;
+    ankleAssist.assist_factor = 0.0f;
+    return;
+  }
+  
+  // 初始化
+  if (!ankleAssist.initialized) {
+    ankleAssist.enabled = true;
+    ankleAssist.initialized = true;
+  }
+  
+  // 如果辅助未启用，直接返回
+  if (!ankleAssist.enabled) {
+    ankleAssist.theta_ref = ankle_deg;
+    ankleAssist.theta_target = ANKLE_THETA_LOW;
+    ankleAssist.assist_factor = 0.0f;
+    return;
+  }
+  
+  // 1. 计算S曲线目标角
+  // u = s*s*(3 - 2*s)
+  float u = smoothStep(swing_progress);
+  // θ_target = θ_low + (θ_high - θ_low) * u
+  ankleAssist.theta_target = ANKLE_THETA_LOW + (ANKLE_THETA_HIGH - ANKLE_THETA_LOW) * u;
+  
+  // 2. 窗口辅助核心逻辑
+  // if ankle_deg >= θ_low:
+  //     θ_ref = ankle_deg       // 不压人，让他自己抬
+  // else:
+  //     θ_ref = max(ankle_deg, θ_target)
+  if (ankle_deg >= ANKLE_THETA_LOW) {
+    // 患者已经抬得足够高，不干预
+    ankleAssist.theta_ref = ankle_deg;
+  } else {
+    // 患者抬得不够，提供辅助
+    // θ_ref = max(ankle_deg, θ_target)
+    ankleAssist.theta_ref = (ankle_deg > ankleAssist.theta_target) ? ankle_deg : ankleAssist.theta_target;
+  }
+  
+  // 3. 安全限位检查
+  // 限制参考角度在安全范围内
+  if (ankleAssist.theta_ref < ANKLE_THETA_MIN) {
+    ankleAssist.theta_ref = ANKLE_THETA_MIN;
+  } else if (ankleAssist.theta_ref > ANKLE_THETA_MAX) {
+    ankleAssist.theta_ref = ANKLE_THETA_MAX;
+  }
+  
+  // 4. 助力衰减计算
+  // p = clamp((ankle_deg - θ_min) / (θ_low - θ_min), 0, 1)
+  // assist = 1 - p
+  float denominator = ANKLE_THETA_LOW - ANKLE_THETA_MIN;  // θ_low - θ_min = 2 - (-15) = 17
+  if (denominator > 0.001f) {
+    float p = (ankle_deg - ANKLE_THETA_MIN) / denominator;
+    // clamp to [0, 1]
+    if (p < 0.0f) {
+      p = 0.0f;
+    } else if (p > 1.0f) {
+      p = 1.0f;
+    }
+    ankleAssist.assist_factor = 1.0f - p;
+  } else {
+    ankleAssist.assist_factor = 1.0f;  // 默认最大助力
+  }
+}
+
+// 获取踝关节参考角度（度）
+float getAnkleReferenceAngle() {
+  return ankleAssist.initialized ? ankleAssist.theta_ref : 0.0f;
+}
+
+// 获取S曲线目标角度（度）
+float getAnkleTargetAngle() {
+  return ankleAssist.initialized ? ankleAssist.theta_target : ANKLE_THETA_LOW;
+}
+
+// 获取助力衰减因子（0.0 ~ 1.0）
+float getAnkleAssistFactor() {
+  return ankleAssist.initialized ? ankleAssist.assist_factor : 0.0f;
+}
+
+// 启用/禁用踝背屈辅助
+void setAnkleAssistEnabled(bool enabled) {
+  ankleAssist.enabled = enabled;
+  if (!ankleAssist.initialized) {
+    ankleAssist.initialized = true;
+  }
+}
+
+// ============================================================================
 // CAN ID 定义（根据协议文档）
 // ============================================================================
 #define CAN_CMD_BASE_ID       0x140  // 控制指令基地址（0x140 + ID）
@@ -478,12 +842,23 @@ void handleCanMessage(const CAN_message_t &msg) {
         
         status->lastUpdateMs = millis();
         
-        // 对于髋关节，更新信号预处理和自适应阈值
+        // 对于髋关节，更新信号预处理、自适应阈值、步态相位识别和摆动进度
         if (motor->id == 1) {
           updateHipSignalProcessor(status->angleDeg);
           // 使用滤波后的髋角更新自适应阈值
           if (hipProcessor.initialized) {
             updateAdaptiveThreshold(hipProcessor.hip_f);
+            // 更新步态相位识别
+            updateGaitPhaseDetector();
+            // 更新摆动相进度计算
+            updateSwingProgress();
+            // 更新踝背屈辅助策略（需要髋关节相位和进度信息）
+            if (ankleStatus.lastUpdateMs > 0 && 
+                (millis() - ankleStatus.lastUpdateMs) < 200) {  // 确保踝关节数据是新鲜的
+              GaitPhase currentPhase = getCurrentGaitPhase();
+              float swing_progress = getSwingProgress();
+              updateAnkleAssistStrategy(ankleStatus.angleDeg, currentPhase, swing_progress);
+            }
           }
         }
         
@@ -1216,8 +1591,44 @@ GaitDataCollection gaitCollection = {false, 0, 20, 0, 20}; // 默认20ms间隔�
 
 // 发送步态数据到串口（JSON格式，便于上位机解析）
 void sendGaitData() {
-  // 格式：{"t":时间戳(ms),"h":髋角度(deg),"a":踝角度(deg),"hf":滤波髋角(deg),"hv":髋速度(deg/s),"hvf":滤波髋速度(deg/s),"hm":均值(deg),"ha":幅度(deg),"A_up":阈值(deg),"A_dn":阈值(deg)}
-  if (hipProcessor.initialized && adaptiveThreshold.initialized) {
+  // 格式：{"t":时间戳(ms),"h":髋角度(deg),"a":踝角度(deg),"hf":滤波髋角(deg),"hv":髋速度(deg/s),"hvf":滤波髋速度(deg/s),"hm":均值(deg),"ha":幅度(deg),"A_up":阈值(deg),"A_dn":阈值(deg),"phase":相位(0=STANCE,1=SWING),"phase_dur":相位持续时间(ms),"Ts":摆动平均周期(s),"t_swing":当前摆动时长(s),"s":摆动进度(0-1),"theta_ref":踝参考角(deg),"theta_target":S曲线目标角(deg),"assist":助力因子(0-1)}
+  if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized && swingProgress.initialized && ankleAssist.initialized) {
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f,\"hf\":%.2f,\"hv\":%.2f,\"hvf\":%.2f,\"hm\":%.2f,\"ha\":%.2f,\"A_up\":%.2f,\"A_dn\":%.2f,\"phase\":%d,\"phase_dur\":%lu,\"Ts\":%.3f,\"t_swing\":%.3f,\"s\":%.3f,\"theta_ref\":%.2f,\"theta_target\":%.2f,\"assist\":%.3f}\n",
+                  millis(),
+                  hipStatus.angleDeg,
+                  ankleStatus.angleDeg,
+                  hipProcessor.hip_f,
+                  hipProcessor.hip_vel,
+                  hipProcessor.hip_vel_f,
+                  adaptiveThreshold.hip_mean,
+                  adaptiveThreshold.hip_amp,
+                  adaptiveThreshold.A_up,
+                  adaptiveThreshold.A_dn,
+                  gaitPhaseDetector.currentPhase,
+                  getCurrentPhaseDurationMs(),
+                  swingProgress.Ts,
+                  swingProgress.t_swing,
+                  swingProgress.swing_progress,
+                  ankleAssist.theta_ref,
+                  ankleAssist.theta_target,
+                  ankleAssist.assist_factor);
+  } else if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized) {
+    // 如果信号处理器、阈值和相位识别已初始化但摆动进度未初始化
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f,\"hf\":%.2f,\"hv\":%.2f,\"hvf\":%.2f,\"hm\":%.2f,\"ha\":%.2f,\"A_up\":%.2f,\"A_dn\":%.2f,\"phase\":%d,\"phase_dur\":%lu}\n",
+                  millis(),
+                  hipStatus.angleDeg,
+                  ankleStatus.angleDeg,
+                  hipProcessor.hip_f,
+                  hipProcessor.hip_vel,
+                  hipProcessor.hip_vel_f,
+                  adaptiveThreshold.hip_mean,
+                  adaptiveThreshold.hip_amp,
+                  adaptiveThreshold.A_up,
+                  adaptiveThreshold.A_dn,
+                  gaitPhaseDetector.currentPhase,
+                  getCurrentPhaseDurationMs());
+  } else if (hipProcessor.initialized && adaptiveThreshold.initialized) {
+    // 如果信号处理器和阈值已初始化但相位识别未初始化
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f,\"hf\":%.2f,\"hv\":%.2f,\"hvf\":%.2f,\"hm\":%.2f,\"ha\":%.2f,\"A_up\":%.2f,\"A_dn\":%.2f}\n",
                   millis(),
                   hipStatus.angleDeg,
@@ -1484,6 +1895,109 @@ void processSerialCommand() {
       Serial.println(">>> Start gait collection (gc) to initialize threshold calculation");
     }
   }
+  // 步态相位调试命令：phase
+  else if (cmd == "phase" || cmd == "gaitphase") {
+    if (gaitPhaseDetector.initialized) {
+      Serial.println(">>> Gait Phase Detection Status:");
+      Serial.printf(">>>   Current Phase: %s\n", 
+                   gaitPhaseDetector.currentPhase == PHASE_SWING ? "SWING" : "STANCE");
+      Serial.printf(">>>   Phase Duration: %lu ms (%.2f s)\n", 
+                   getCurrentPhaseDurationMs(),
+                   getCurrentPhaseDurationMs() / 1000.0f);
+      Serial.printf(">>>   Condition Hold Time: %lu ms\n", gaitPhaseDetector.conditionHoldMs);
+      if (hipProcessor.initialized && adaptiveThreshold.initialized) {
+        float hip_f = hipProcessor.hip_f;
+        float hip_vel_f = hipProcessor.hip_vel_f;
+        float hip_mean = adaptiveThreshold.hip_mean;
+        float A_up = adaptiveThreshold.A_up;
+        float A_dn = adaptiveThreshold.A_dn;
+        float V_up = adaptiveThreshold.V_up;
+        float V_dn = adaptiveThreshold.V_dn;
+        
+        bool swingConditionMet = (hip_vel_f > V_up) && (hip_f > hip_mean + A_up);
+        bool stanceConditionMet = (hip_vel_f < V_dn) && (hip_f < hip_mean - A_dn);
+        
+        Serial.printf(">>>   Current hip_f: %.2f deg\n", hip_f);
+        Serial.printf(">>>   Current hip_vel_f: %.2f deg/s\n", hip_vel_f);
+        Serial.printf(">>>   hip_mean: %.2f deg\n", hip_mean);
+        Serial.printf(">>>   Swing condition (vel>%.1f && angle>%.2f): %s\n", 
+                     V_up, hip_mean + A_up, swingConditionMet ? "YES" : "NO");
+        Serial.printf(">>>   Stance condition (vel<%.1f && angle<%.2f): %s\n", 
+                     V_dn, hip_mean - A_dn, stanceConditionMet ? "YES" : "NO");
+      }
+      // 显示摆动进度信息
+      if (swingProgress.initialized) {
+        Serial.println(">>> Swing Progress:");
+        Serial.printf(">>>   Ts (avg period): %.3f s\n", swingProgress.Ts);
+        Serial.printf(">>>   t_swing (current): %.3f s\n", swingProgress.t_swing);
+        Serial.printf(">>>   s (progress): %.3f (%.1f%%)\n", 
+                     swingProgress.swing_progress,
+                     swingProgress.swing_progress * 100.0f);
+      }
+    } else {
+      Serial.println(">>> Gait Phase Detector: NOT INITIALIZED");
+      Serial.println(">>> Start gait collection (gc) to initialize phase detection");
+    }
+  }
+  // 摆动进度调试命令：swing
+  else if (cmd == "swing" || cmd == "swingprogress") {
+    if (swingProgress.initialized) {
+      Serial.println(">>> Swing Progress Status:");
+      Serial.printf(">>>   Ts (Average Period): %.3f s\n", swingProgress.Ts);
+      Serial.printf(">>>   t_swing (Current Duration): %.3f s\n", swingProgress.t_swing);
+      Serial.printf(">>>   s (Progress): %.3f (%.1f%%)\n", 
+                   swingProgress.swing_progress,
+                   swingProgress.swing_progress * 100.0f);
+      if (gaitPhaseDetector.initialized) {
+        Serial.printf(">>>   Current Phase: %s\n", 
+                     gaitPhaseDetector.currentPhase == PHASE_SWING ? "SWING" : "STANCE");
+        Serial.printf(">>>   Phase Duration: %lu ms\n", getCurrentPhaseDurationMs());
+      }
+    } else {
+      Serial.println(">>> Swing Progress: NOT INITIALIZED");
+      Serial.println(">>> Start gait collection (gc) to initialize swing progress calculation");
+    }
+  }
+  // 踝背屈辅助策略调试命令：assist
+  else if (cmd == "assist" || cmd == "ankleassist") {
+    if (ankleAssist.initialized) {
+      Serial.println(">>> Ankle Dorsiflexion Assist Strategy Status:");
+      Serial.printf(">>>   Enabled: %s\n", ankleAssist.enabled ? "YES" : "NO");
+      Serial.printf(">>>   Parameters:\n");
+      Serial.printf(">>>     θ_low:  %.2f deg\n", ANKLE_THETA_LOW);
+      Serial.printf(">>>     θ_high: %.2f deg\n", ANKLE_THETA_HIGH);
+      Serial.printf(">>>     θ_min:  %.2f deg (safety limit)\n", ANKLE_THETA_MIN);
+      Serial.printf(">>>     θ_max:  %.2f deg (safety limit)\n", ANKLE_THETA_MAX);
+      Serial.printf(">>>   Current Values:\n");
+      Serial.printf(">>>     Current Ankle Angle: %.2f deg\n", ankleStatus.angleDeg);
+      Serial.printf(">>>     Target Angle (S-curve): %.2f deg\n", ankleAssist.theta_target);
+      Serial.printf(">>>     Reference Angle: %.2f deg\n", ankleAssist.theta_ref);
+      Serial.printf(">>>     Assist Factor: %.3f (%.1f%%)\n", 
+                   ankleAssist.assist_factor,
+                   ankleAssist.assist_factor * 100.0f);
+      if (gaitPhaseDetector.initialized) {
+        GaitPhase currentPhase = getCurrentGaitPhase();
+        Serial.printf(">>>   Current Phase: %s\n", 
+                     currentPhase == PHASE_SWING ? "SWING (assist active)" : "STANCE (assist inactive)");
+        if (currentPhase == PHASE_SWING && swingProgress.initialized) {
+          float s = getSwingProgress();
+          Serial.printf(">>>   Swing Progress: %.3f (%.1f%%)\n", s, s * 100.0f);
+        }
+      }
+    } else {
+      Serial.println(">>> Ankle Assist Strategy: NOT INITIALIZED");
+      Serial.println(">>> Start gait collection (gc) to initialize assist strategy");
+    }
+  }
+  // 启用/禁用踝背屈辅助：assiston / assistoff
+  else if (cmd == "assiston") {
+    setAnkleAssistEnabled(true);
+    Serial.println(">>> Ankle dorsiflexion assist ENABLED");
+  }
+  else if (cmd == "assistoff") {
+    setAnkleAssistEnabled(false);
+    Serial.println(">>> Ankle dorsiflexion assist DISABLED");
+  }
   // 位置控制命令：move1 <angle> 表示髋关节移动到指定角度（关节角度，度）
   else if (cmd.startsWith("move1 ") || cmd.startsWith("pos1 ")) {
     int spaceIdx = cmd.indexOf(' ');
@@ -1570,6 +2084,10 @@ void processSerialCommand() {
     Serial.println("Load Gait: loadgait (load trajectory from JSON)");
     Serial.println("Ankle Zero: az (ankle zero calibration)");
     Serial.println("Threshold:  th (show adaptive threshold status)");
+    Serial.println("Gait Phase: phase (show gait phase detection status)");
+    Serial.println("Swing Progress: swing (show swing progress status)");
+    Serial.println("Ankle Assist: assist (show ankle assist strategy status)");
+    Serial.println("Assist On/Off: assiston / assistoff (enable/disable ankle assist)");
     Serial.println("Help:    h, help");
   }
   else {
