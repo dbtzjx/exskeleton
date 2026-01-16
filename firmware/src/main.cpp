@@ -32,6 +32,7 @@ struct MotorStatus {
   int64_t multiTurnAngle;  // 多圈角度（协议单位，int64_t，单位 0.01°/LSB）
   float angleDeg;          // 转换为角度（度）
   int16_t speed;           // 速度（dps）
+  int16_t iq;              // 电流（q轴电流，mA，用于阻力检测）
   int8_t temperature;      // 温度（℃）
   uint8_t motorState;      // 电机状态（0x00=开启，0x10=关闭）
   uint8_t errorState;      // 错误状态
@@ -39,8 +40,8 @@ struct MotorStatus {
   uint32_t lastUpdateMs;   // 最后更新时间
 };
 
-MotorStatus hipStatus = {0, 0.0f, 0, 0, 0, 0, false, 0};
-MotorStatus ankleStatus = {0, 0.0f, 0, 0, 0, 0, false, 0};
+MotorStatus hipStatus = {0, 0.0f, 0, 0, 0, 0, 0, false, 0};
+MotorStatus ankleStatus = {0, 0.0f, 0, 0, 0, 0, 0, false, 0};
 
 // 踝关节零点偏移（用于标定）
 // 在用户站立自然中立位时，读取的踝电机多圈编码器角度值
@@ -592,6 +593,244 @@ void setAnkleAssistEnabled(bool enabled) {
 }
 
 // ============================================================================
+// 顺从与软化控制（必须）
+// ============================================================================
+
+// 顺从控制参数（初始值，需通过日志校准）
+#define COMPLIANCE_I1  500   // 轻度阻力阈值（mA，q轴电流）
+#define COMPLIANCE_I2  1000  // 重度阻力阈值（mA，q轴电流）
+#define COMPLIANCE_E1  3.0f  // 位置误差阈值1（度）
+#define COMPLIANCE_E2  7.0f  // 位置误差阈值2（度）
+#define COMPLIANCE_T_RESIST  250  // 阻力持续时间阈值（ms），用于退出COMPLIANT/HOLD状态
+
+// 温度阈值（℃）
+#define TEMP_MAX  70   // 最大允许温度
+#define TEMP_WARN 60  // 温度警告阈值
+
+// 通讯超时阈值（ms）
+#define COMM_TIMEOUT_MS  500  // 通讯超时时间
+
+// 控制状态枚举
+enum ComplianceState {
+  STATE_NORMAL = 0,      // 正常辅助
+  STATE_COMPLIANT = 1,   // 降低maxSpeed，减缓推进
+  STATE_HOLD = 2,        // 停止推进，保持当前位置
+  STATE_FAULT_SAFE = 3   // 故障保护
+};
+
+// 顺从控制状态
+struct ComplianceController {
+  ComplianceState currentState;        // 当前状态
+  ComplianceState lastState;           // 上次状态（用于状态切换检测）
+  uint32_t stateStartMs;               // 当前状态开始时间（毫秒）
+  uint32_t lowResistanceStartMs;       // 低阻力开始时间（用于退出条件）
+  bool initialized;                    // 是否已初始化
+  
+  // 状态相关的控制参数
+  float maxSpeedFactor;                // 速度因子（NORMAL=1.0, COMPLIANT=0.5, HOLD=0.0）
+  float positionHold;                  // HOLD状态下的保持位置（度）
+};
+
+ComplianceController complianceCtrl = {
+  STATE_NORMAL,    // currentState
+  STATE_NORMAL,    // lastState
+  0,               // stateStartMs
+  0,               // lowResistanceStartMs
+  false,           // initialized
+  1.0f,            // maxSpeedFactor
+  0.0f             // positionHold
+};
+
+// 更新顺从控制状态机
+// 输入：当前踝关节角度、参考角度、电流、温度、通讯状态
+// 输出：更新complianceCtrl中的状态和控制参数
+void updateComplianceController(float ankle_deg, float theta_ref, int16_t iq_mA, int8_t temperature, bool commOk) {
+  // 初始化
+  if (!complianceCtrl.initialized) {
+    complianceCtrl.currentState = STATE_NORMAL;
+    complianceCtrl.lastState = STATE_NORMAL;
+    complianceCtrl.stateStartMs = millis();
+    complianceCtrl.lowResistanceStartMs = 0;
+    complianceCtrl.maxSpeedFactor = 1.0f;
+    complianceCtrl.positionHold = ankle_deg;
+    complianceCtrl.initialized = true;
+  }
+  
+  uint32_t now = millis();
+  
+  // 计算位置误差
+  float positionError = fabsf(theta_ref - ankle_deg);
+  
+  // 计算电流绝对值（阻力）
+  float iq_abs = fabsf((float)iq_mA);
+  
+  // 1. 故障检测（最高优先级）
+  bool faultCondition = false;
+  if (!commOk) {
+    // 通讯超时
+    faultCondition = true;
+  } else if (temperature > TEMP_MAX) {
+    // 超温
+    faultCondition = true;
+  } else if (ankle_deg < ANKLE_THETA_MIN || ankle_deg > ANKLE_THETA_MAX) {
+    // 越界
+    faultCondition = true;
+  }
+  
+  if (faultCondition) {
+    complianceCtrl.currentState = STATE_FAULT_SAFE;
+    complianceCtrl.maxSpeedFactor = 0.0f;  // 停止运动
+    complianceCtrl.positionHold = ankle_deg;  // 保持当前位置
+    complianceCtrl.stateStartMs = now;
+    return;
+  }
+  
+  // 2. 状态转换逻辑（仅在非故障状态下）
+  ComplianceState newState = complianceCtrl.currentState;
+  
+  // 检查是否满足进入COMPLIANT的条件
+  bool compliantCondition = (iq_abs > COMPLIANCE_I1) || (positionError > COMPLIANCE_E1);
+  
+  // 检查是否满足进入HOLD的条件
+  bool holdCondition = (iq_abs > COMPLIANCE_I2) || (positionError > COMPLIANCE_E2);
+  
+  // 检查是否满足退出条件（阻力低于I1）
+  bool lowResistanceCondition = (iq_abs < COMPLIANCE_I1);
+  
+  switch (complianceCtrl.currentState) {
+    case STATE_NORMAL:
+      if (holdCondition) {
+        // 直接进入HOLD状态
+        newState = STATE_HOLD;
+        complianceCtrl.positionHold = ankle_deg;  // 保持当前位置
+      } else if (compliantCondition) {
+        // 进入COMPLIANT状态
+        newState = STATE_COMPLIANT;
+      }
+      break;
+      
+    case STATE_COMPLIANT:
+      if (holdCondition) {
+        // 升级到HOLD状态
+        newState = STATE_HOLD;
+        complianceCtrl.positionHold = ankle_deg;
+      } else if (lowResistanceCondition) {
+        // 开始计时低阻力时间
+        if (complianceCtrl.lowResistanceStartMs == 0) {
+          complianceCtrl.lowResistanceStartMs = now;
+        } else {
+          // 检查是否持续低阻力足够长时间
+          uint32_t lowResistanceDuration = now - complianceCtrl.lowResistanceStartMs;
+          if (lowResistanceDuration >= COMPLIANCE_T_RESIST) {
+            // 退出到NORMAL状态
+            newState = STATE_NORMAL;
+            complianceCtrl.lowResistanceStartMs = 0;
+          }
+        }
+      } else {
+        // 阻力又升高了，重置低阻力计时
+        complianceCtrl.lowResistanceStartMs = 0;
+      }
+      break;
+      
+    case STATE_HOLD:
+      if (lowResistanceCondition) {
+        // 开始计时低阻力时间
+        if (complianceCtrl.lowResistanceStartMs == 0) {
+          complianceCtrl.lowResistanceStartMs = now;
+        } else {
+          // 检查是否持续低阻力足够长时间
+          uint32_t lowResistanceDuration = now - complianceCtrl.lowResistanceStartMs;
+          if (lowResistanceDuration >= COMPLIANCE_T_RESIST) {
+            // 先退回到COMPLIANT状态（而不是直接到NORMAL）
+            newState = STATE_COMPLIANT;
+            complianceCtrl.lowResistanceStartMs = 0;
+          }
+        }
+      } else {
+        // 阻力又升高了，重置低阻力计时
+        complianceCtrl.lowResistanceStartMs = 0;
+      }
+      break;
+      
+    case STATE_FAULT_SAFE:
+      // 故障状态需要手动恢复（通过命令或重启）
+      // 这里可以添加自动恢复逻辑（如果故障条件消失）
+      if (commOk && temperature <= TEMP_MAX && 
+          ankle_deg >= ANKLE_THETA_MIN && ankle_deg <= ANKLE_THETA_MAX) {
+        // 故障条件消失，可以恢复到NORMAL
+        newState = STATE_NORMAL;
+        complianceCtrl.lowResistanceStartMs = 0;
+      }
+      break;
+  }
+  
+  // 状态切换处理
+  if (newState != complianceCtrl.currentState) {
+    complianceCtrl.lastState = complianceCtrl.currentState;
+    complianceCtrl.currentState = newState;
+    complianceCtrl.stateStartMs = now;
+    
+    // 根据新状态设置控制参数
+    switch (newState) {
+      case STATE_NORMAL:
+        complianceCtrl.maxSpeedFactor = 1.0f;
+        break;
+      case STATE_COMPLIANT:
+        complianceCtrl.maxSpeedFactor = 0.5f;  // 降低速度到50%
+        break;
+      case STATE_HOLD:
+        complianceCtrl.maxSpeedFactor = 0.0f;  // 停止推进
+        complianceCtrl.positionHold = ankle_deg;  // 保持当前位置
+        break;
+      case STATE_FAULT_SAFE:
+        complianceCtrl.maxSpeedFactor = 0.0f;
+        complianceCtrl.positionHold = ankle_deg;
+        break;
+    }
+  }
+  
+  // 在HOLD状态下，更新参考角度为保持位置
+  if (complianceCtrl.currentState == STATE_HOLD) {
+    // theta_ref会被覆盖为positionHold（在主循环中处理）
+  }
+}
+
+// 获取当前顺从控制状态
+ComplianceState getComplianceState() {
+  return complianceCtrl.initialized ? complianceCtrl.currentState : STATE_NORMAL;
+}
+
+// 获取速度因子（用于限制电机速度）
+float getComplianceSpeedFactor() {
+  return complianceCtrl.initialized ? complianceCtrl.maxSpeedFactor : 1.0f;
+}
+
+// 获取HOLD状态下的保持位置（度）
+float getComplianceHoldPosition() {
+  return complianceCtrl.initialized ? complianceCtrl.positionHold : 0.0f;
+}
+
+// 获取当前状态持续时间（毫秒）
+uint32_t getComplianceStateDuration() {
+  if (!complianceCtrl.initialized) {
+    return 0;
+  }
+  return millis() - complianceCtrl.stateStartMs;
+}
+
+// 手动重置故障状态（用于调试和恢复）
+void resetComplianceFault() {
+  if (complianceCtrl.currentState == STATE_FAULT_SAFE) {
+    complianceCtrl.currentState = STATE_NORMAL;
+    complianceCtrl.lastState = STATE_FAULT_SAFE;
+    complianceCtrl.stateStartMs = millis();
+    complianceCtrl.maxSpeedFactor = 1.0f;
+    complianceCtrl.lowResistanceStartMs = 0;
+  }
+}
+
+// ============================================================================
 // CAN ID 定义（根据协议文档）
 // ============================================================================
 #define CAN_CMD_BASE_ID       0x140  // 控制指令基地址（0x140 + ID）
@@ -858,6 +1097,12 @@ void handleCanMessage(const CAN_message_t &msg) {
               GaitPhase currentPhase = getCurrentGaitPhase();
               float swing_progress = getSwingProgress();
               updateAnkleAssistStrategy(ankleStatus.angleDeg, currentPhase, swing_progress);
+              
+              // 更新顺从控制状态机（需要参考角度、电流、温度、通讯状态）
+              float theta_ref = getAnkleReferenceAngle();
+              bool commOk = (millis() - ankleStatus.lastUpdateMs) < COMM_TIMEOUT_MS;
+              updateComplianceController(ankleStatus.angleDeg, theta_ref, ankleStatus.iq, 
+                                         ankleStatus.temperature, commOk);
             }
           }
         }
@@ -902,6 +1147,7 @@ void handleCanMessage(const CAN_message_t &msg) {
         
         status->temperature = temperature;
         status->speed = speed;
+        status->iq = iq;  // 保存q轴电流（mA）
         status->lastUpdateMs = millis();
         
         Serial.printf("[RX] %s: temp=%d℃, iq=%d, speed=%d dps, encoder=%u, ID=0x%03X, CMD=0x%02X\n",
@@ -1591,9 +1837,9 @@ GaitDataCollection gaitCollection = {false, 0, 20, 0, 20}; // 默认20ms间隔�
 
 // 发送步态数据到串口（JSON格式，便于上位机解析）
 void sendGaitData() {
-  // 格式：{"t":时间戳(ms),"h":髋角度(deg),"a":踝角度(deg),"hf":滤波髋角(deg),"hv":髋速度(deg/s),"hvf":滤波髋速度(deg/s),"hm":均值(deg),"ha":幅度(deg),"A_up":阈值(deg),"A_dn":阈值(deg),"phase":相位(0=STANCE,1=SWING),"phase_dur":相位持续时间(ms),"Ts":摆动平均周期(s),"t_swing":当前摆动时长(s),"s":摆动进度(0-1),"theta_ref":踝参考角(deg),"theta_target":S曲线目标角(deg),"assist":助力因子(0-1)}
-  if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized && swingProgress.initialized && ankleAssist.initialized) {
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f,\"hf\":%.2f,\"hv\":%.2f,\"hvf\":%.2f,\"hm\":%.2f,\"ha\":%.2f,\"A_up\":%.2f,\"A_dn\":%.2f,\"phase\":%d,\"phase_dur\":%lu,\"Ts\":%.3f,\"t_swing\":%.3f,\"s\":%.3f,\"theta_ref\":%.2f,\"theta_target\":%.2f,\"assist\":%.3f}\n",
+  // 格式：{"t":时间戳(ms),"h":髋角度(deg),"a":踝角度(deg),"hf":滤波髋角(deg),"hv":髋速度(deg/s),"hvf":滤波髋速度(deg/s),"hm":均值(deg),"ha":幅度(deg),"A_up":阈值(deg),"A_dn":阈值(deg),"phase":相位(0=STANCE,1=SWING),"phase_dur":相位持续时间(ms),"Ts":摆动平均周期(s),"t_swing":当前摆动时长(s),"s":摆动进度(0-1),"theta_ref":踝参考角(deg),"theta_target":S曲线目标角(deg),"assist":助力因子(0-1),"comp_state":顺从状态(0=NORMAL,1=COMPLIANT,2=HOLD,3=FAULT_SAFE),"iq":电流(mA),"speed_factor":速度因子(0-1)}
+  if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized && swingProgress.initialized && ankleAssist.initialized && complianceCtrl.initialized) {
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f,\"hf\":%.2f,\"hv\":%.2f,\"hvf\":%.2f,\"hm\":%.2f,\"ha\":%.2f,\"A_up\":%.2f,\"A_dn\":%.2f,\"phase\":%d,\"phase_dur\":%lu,\"Ts\":%.3f,\"t_swing\":%.3f,\"s\":%.3f,\"theta_ref\":%.2f,\"theta_target\":%.2f,\"assist\":%.3f,\"comp_state\":%d,\"iq\":%d,\"speed_factor\":%.2f}\n",
                   millis(),
                   hipStatus.angleDeg,
                   ankleStatus.angleDeg,
@@ -1611,7 +1857,10 @@ void sendGaitData() {
                   swingProgress.swing_progress,
                   ankleAssist.theta_ref,
                   ankleAssist.theta_target,
-                  ankleAssist.assist_factor);
+                  ankleAssist.assist_factor,
+                  complianceCtrl.currentState,
+                  ankleStatus.iq,
+                  complianceCtrl.maxSpeedFactor);
   } else if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized) {
     // 如果信号处理器、阈值和相位识别已初始化但摆动进度未初始化
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f,\"hf\":%.2f,\"hv\":%.2f,\"hvf\":%.2f,\"hm\":%.2f,\"ha\":%.2f,\"A_up\":%.2f,\"A_dn\":%.2f,\"phase\":%d,\"phase_dur\":%lu}\n",
@@ -1998,6 +2247,56 @@ void processSerialCommand() {
     setAnkleAssistEnabled(false);
     Serial.println(">>> Ankle dorsiflexion assist DISABLED");
   }
+  // 顺从控制调试命令：compliance
+  else if (cmd == "compliance" || cmd == "comp") {
+    if (complianceCtrl.initialized) {
+      Serial.println(">>> Compliance Control Status:");
+      const char* stateNames[] = {"NORMAL", "COMPLIANT", "HOLD", "FAULT_SAFE"};
+      Serial.printf(">>>   Current State: %s\n", stateNames[complianceCtrl.currentState]);
+      Serial.printf(">>>   State Duration: %lu ms\n", getComplianceStateDuration());
+      Serial.printf(">>>   Speed Factor: %.2f (%.0f%%)\n", 
+                   complianceCtrl.maxSpeedFactor,
+                   complianceCtrl.maxSpeedFactor * 100.0f);
+      Serial.printf(">>>   Parameters:\n");
+      Serial.printf(">>>     I1 (轻度阻力): %d mA\n", COMPLIANCE_I1);
+      Serial.printf(">>>     I2 (重度阻力): %d mA\n", COMPLIANCE_I2);
+      Serial.printf(">>>     E1 (位置误差1): %.1f deg\n", COMPLIANCE_E1);
+      Serial.printf(">>>     E2 (位置误差2): %.1f deg\n", COMPLIANCE_E2);
+      Serial.printf(">>>     T_resist: %lu ms\n", COMPLIANCE_T_RESIST);
+      Serial.printf(">>>   Current Values:\n");
+      Serial.printf(">>>     Ankle Angle: %.2f deg\n", ankleStatus.angleDeg);
+      Serial.printf(">>>     Reference Angle: %.2f deg\n", getAnkleReferenceAngle());
+      float posError = fabsf(getAnkleReferenceAngle() - ankleStatus.angleDeg);
+      Serial.printf(">>>     Position Error: %.2f deg\n", posError);
+      Serial.printf(">>>     Current (iq): %d mA\n", ankleStatus.iq);
+      float iq_abs = fabsf((float)ankleStatus.iq);
+      Serial.printf(">>>     |iq|: %.1f mA\n", iq_abs);
+      Serial.printf(">>>     Temperature: %d ℃\n", ankleStatus.temperature);
+      bool commOk = (millis() - ankleStatus.lastUpdateMs) < COMM_TIMEOUT_MS;
+      Serial.printf(">>>     Communication: %s\n", commOk ? "OK" : "TIMEOUT");
+      if (complianceCtrl.currentState == STATE_HOLD) {
+        Serial.printf(">>>     Hold Position: %.2f deg\n", complianceCtrl.positionHold);
+      }
+      if (complianceCtrl.lowResistanceStartMs > 0) {
+        uint32_t lowResistDuration = millis() - complianceCtrl.lowResistanceStartMs;
+        Serial.printf(">>>     Low Resistance Duration: %lu ms (need %lu ms to exit)\n", 
+                     lowResistDuration, COMPLIANCE_T_RESIST);
+      }
+    } else {
+      Serial.println(">>> Compliance Control: NOT INITIALIZED");
+      Serial.println(">>> Start gait collection (gc) to initialize compliance control");
+    }
+  }
+  // 重置故障状态：resetfault
+  else if (cmd == "resetfault" || cmd == "reset") {
+    if (complianceCtrl.currentState == STATE_FAULT_SAFE) {
+      resetComplianceFault();
+      Serial.println(">>> Fault state RESET to NORMAL");
+    } else {
+      Serial.println(">>> Current state is not FAULT_SAFE, no reset needed");
+      Serial.printf(">>> Current state: %d\n", complianceCtrl.currentState);
+    }
+  }
   // 位置控制命令：move1 <angle> 表示髋关节移动到指定角度（关节角度，度）
   else if (cmd.startsWith("move1 ") || cmd.startsWith("pos1 ")) {
     int spaceIdx = cmd.indexOf(' ');
@@ -2088,6 +2387,8 @@ void processSerialCommand() {
     Serial.println("Swing Progress: swing (show swing progress status)");
     Serial.println("Ankle Assist: assist (show ankle assist strategy status)");
     Serial.println("Assist On/Off: assiston / assistoff (enable/disable ankle assist)");
+    Serial.println("Compliance: compliance (show compliance control status)");
+    Serial.println("Reset Fault: resetfault (reset fault state to normal)");
     Serial.println("Help:    h, help");
   }
   else {
