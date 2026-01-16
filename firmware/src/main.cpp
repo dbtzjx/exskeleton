@@ -32,7 +32,6 @@ struct MotorStatus {
   int64_t multiTurnAngle;  // 多圈角度（协议单位，int64_t，单位 0.01°/LSB）
   float angleDeg;          // 转换为角度（度）
   int16_t speed;           // 速度（dps）
-  int16_t torqueCurrent;   // 转矩电流（iq，用于阻力检测）
   int8_t temperature;      // 温度（℃）
   uint8_t motorState;      // 电机状态（0x00=开启，0x10=关闭）
   uint8_t errorState;      // 错误状态
@@ -40,8 +39,193 @@ struct MotorStatus {
   uint32_t lastUpdateMs;   // 最后更新时间
 };
 
-MotorStatus hipStatus = {0, 0.0f, 0, 0, 0, 0, 0, false, 0};
-MotorStatus ankleStatus = {0, 0.0f, 0, 0, 0, 0, 0, false, 0};
+MotorStatus hipStatus = {0, 0.0f, 0, 0, 0, 0, false, 0};
+MotorStatus ankleStatus = {0, 0.0f, 0, 0, 0, 0, false, 0};
+
+// 踝关节零点偏移（用于标定）
+// 在用户站立自然中立位时，读取的踝电机多圈编码器角度值
+// 后续踝解剖角计算：ankle_deg = (pos_raw - ankle_zero_offset) * k_deg
+int64_t ankle_zero_offset = 0;  // 协议单位（0.01°/LSB）
+bool ankle_zero_calibrated = false;  // 是否已完成标定
+
+// ============================================================================
+// 髋关节信号预处理（用于步态相位识别）
+// ============================================================================
+
+// 髋关节信号预处理状态
+struct HipSignalProcessor {
+  float hip_f;          // 滤波后的髋角（度）
+  float hip_f_prev;      // 上次滤波后的髋角（用于计算速度）
+  float hip_vel;         // 髋角速度（度/秒）
+  float hip_vel_f;       // 滤波后的髋角速度（度/秒）
+  uint32_t lastUpdateMs; // 上次更新时间（毫秒）
+  bool initialized;      // 是否已初始化
+};
+
+HipSignalProcessor hipProcessor = {0.0f, 0.0f, 0.0f, 0.0f, 0, false};
+
+// 滤波参数（根据《调整开发计划V1.md》）
+const float HIP_FILTER_ALPHA = 0.2f;   // 髋角滤波系数（α = 0.15~0.25，取0.2）
+const float HIP_VEL_FILTER_BETA = 0.2f; // 速度滤波系数（β = 0.2）
+
+// 更新髋关节信号预处理
+// 输入：hip_raw（原始髋角，度）
+// 输出：更新hipProcessor中的滤波值和速度
+void updateHipSignalProcessor(float hip_raw) {
+  uint32_t now = millis();
+  
+  // 初始化
+  if (!hipProcessor.initialized) {
+    hipProcessor.hip_f = hip_raw;
+    hipProcessor.hip_f_prev = hip_raw;
+    hipProcessor.hip_vel = 0.0f;
+    hipProcessor.hip_vel_f = 0.0f;
+    hipProcessor.lastUpdateMs = now;
+    hipProcessor.initialized = true;
+    return;
+  }
+  
+  // 计算时间差（秒）
+  float dt = (now - hipProcessor.lastUpdateMs) / 1000.0f;
+  
+  // 如果时间差太大（>500ms）或无效，说明数据不连续，重新初始化
+  // 注意：放宽限制，因为CAN响应时间可能不稳定
+  if (dt > 0.5f || dt <= 0.0f) {
+    hipProcessor.hip_f = hip_raw;
+    hipProcessor.hip_f_prev = hip_raw;
+    hipProcessor.hip_vel = 0.0f;
+    hipProcessor.hip_vel_f = 0.0f;
+    hipProcessor.lastUpdateMs = now;
+    return;
+  }
+  
+  // 如果时间差太小（<1ms），跳过本次更新，避免除零或计算不稳定
+  if (dt < 0.001f) {
+    return;
+  }
+  
+  // 1. 髋角低通滤波（EMA）
+  // hip_f = hip_f + α * (hip_raw - hip_f)
+  hipProcessor.hip_f = hipProcessor.hip_f + HIP_FILTER_ALPHA * (hip_raw - hipProcessor.hip_f);
+  
+  // 2. 髋角速度计算（差分）
+  // hip_vel = (hip_f - hip_f_prev) / dt
+  // 注意：使用滤波后的角度变化来计算速度
+  float angle_diff = hipProcessor.hip_f - hipProcessor.hip_f_prev;
+  hipProcessor.hip_vel = angle_diff / dt;
+  
+  // 3. 髋角速度再滤波（EMA）
+  // hip_vel_f = hip_vel_f + β * (hip_vel - hip_vel_f)
+  hipProcessor.hip_vel_f = hipProcessor.hip_vel_f + HIP_VEL_FILTER_BETA * (hipProcessor.hip_vel - hipProcessor.hip_vel_f);
+  
+  // 更新状态
+  hipProcessor.hip_f_prev = hipProcessor.hip_f;
+  hipProcessor.lastUpdateMs = now;
+}
+
+// ============================================================================
+// 自适应阈值计算（用于步态相位识别）
+// ============================================================================
+
+// 滑动窗口大小：2秒 @ 100Hz = 200个数据点
+#define HIP_WINDOW_SIZE 200
+
+// 自适应阈值状态
+struct AdaptiveThreshold {
+  float window[HIP_WINDOW_SIZE];  // 滑动窗口（存储滤波后的髋角）
+  uint16_t windowIndex;            // 当前窗口索引（循环缓冲区）
+  uint16_t windowCount;            // 窗口中的数据数量（初始填充时使用）
+  bool initialized;                // 是否已初始化
+  
+  float hip_mean;                  // 髋角均值（度）
+  float hip_amp;                   // 髋角幅度（度）
+  
+  float A_up;                      // 角度阈值（向上）
+  float A_dn;                      // 角度阈值（向下）
+  float V_up;                      // 速度阈值（向上，度/秒）
+  float V_dn;                      // 速度阈值（向下，度/秒）
+  
+  uint32_t lastUpdateMs;           // 上次更新时间
+};
+
+AdaptiveThreshold adaptiveThreshold = {
+  {0}, 0, 0, false,
+  0.0f, 0.0f,
+  0.0f, 0.0f, 20.0f, -20.0f,
+  0
+};
+
+// 防抖时间（毫秒）
+const uint32_t T_HOLD_MS = 80;
+
+// 更新自适应阈值
+// 输入：hip_f（滤波后的髋角，度）
+// 输出：更新adaptiveThreshold中的均值和阈值
+void updateAdaptiveThreshold(float hip_f) {
+  uint32_t now = millis();
+  
+  // 初始化
+  if (!adaptiveThreshold.initialized) {
+    // 填充窗口初始值
+    for (uint16_t i = 0; i < HIP_WINDOW_SIZE; i++) {
+      adaptiveThreshold.window[i] = hip_f;
+    }
+    adaptiveThreshold.windowIndex = 0;
+    adaptiveThreshold.windowCount = HIP_WINDOW_SIZE;
+    adaptiveThreshold.hip_mean = hip_f;
+    adaptiveThreshold.hip_amp = 0.0f;
+    adaptiveThreshold.A_up = 0.0f;
+    adaptiveThreshold.A_dn = 0.0f;
+    adaptiveThreshold.lastUpdateMs = now;
+    adaptiveThreshold.initialized = true;
+    return;
+  }
+  
+  // 将新数据加入滑动窗口（覆盖最旧的数据）
+  adaptiveThreshold.window[adaptiveThreshold.windowIndex] = hip_f;
+  adaptiveThreshold.windowIndex = (adaptiveThreshold.windowIndex + 1) % HIP_WINDOW_SIZE;
+  
+  // 如果窗口还未填满，增加计数
+  if (adaptiveThreshold.windowCount < HIP_WINDOW_SIZE) {
+    adaptiveThreshold.windowCount++;
+  }
+  
+  // 计算均值
+  float sum = 0.0f;
+  for (uint16_t i = 0; i < adaptiveThreshold.windowCount; i++) {
+    sum += adaptiveThreshold.window[i];
+  }
+  adaptiveThreshold.hip_mean = sum / adaptiveThreshold.windowCount;
+  
+  // 计算幅度（max - min）
+  float min_val = adaptiveThreshold.window[0];
+  float max_val = adaptiveThreshold.window[0];
+  for (uint16_t i = 1; i < adaptiveThreshold.windowCount; i++) {
+    if (adaptiveThreshold.window[i] < min_val) {
+      min_val = adaptiveThreshold.window[i];
+    }
+    if (adaptiveThreshold.window[i] > max_val) {
+      max_val = adaptiveThreshold.window[i];
+    }
+  }
+  adaptiveThreshold.hip_amp = max_val - min_val;
+  
+  // 如果幅度太小（<1度），使用默认值避免阈值过小
+  if (adaptiveThreshold.hip_amp < 1.0f) {
+    adaptiveThreshold.hip_amp = 10.0f;  // 默认幅度10度
+  }
+  
+  // 计算阈值
+  // A_up = 0.2 * hip_amp, A_dn = 0.2 * hip_amp
+  adaptiveThreshold.A_up = 0.2f * adaptiveThreshold.hip_amp;
+  adaptiveThreshold.A_dn = 0.2f * adaptiveThreshold.hip_amp;
+  
+  // V_up = +20 deg/s, V_dn = -20 deg/s（固定值）
+  adaptiveThreshold.V_up = 20.0f;
+  adaptiveThreshold.V_dn = -20.0f;
+  
+  adaptiveThreshold.lastUpdateMs = now;
+}
 
 // ============================================================================
 // CAN ID 定义（根据协议文档）
@@ -174,11 +358,6 @@ void requestMotorAngle(const MotorConfig &motor) {
   sendCanCommand(motor.id, CMD_READ_MULTI_ANGLE, nullptr, 0, false);  // 查询命令不输出TX调试信息
 }
 
-// 请求电机状态2（读取电流、速度等信息，用于阻力检测）
-void requestMotorStatus2(const MotorConfig &motor) {
-  sendCanCommand(motor.id, CMD_READ_STATUS2, nullptr, 0, false);  // 查询命令不输出TX调试信息
-}
-
 // 清除电机错误标志（命令 0x9B）
 void clearMotorError(const MotorConfig &motor) {
   sendCanCommand(motor.id, CMD_CLEAR_ERROR);
@@ -285,14 +464,39 @@ void handleCanMessage(const CAN_message_t &msg) {
         }
         
         status->multiTurnAngle = angle;
-        status->angleDeg = unitsToAngleDeg(*motor, angle);
+        
+        // 对于踝关节，如果已标定，使用零点偏移计算解剖角度
+        if (motor->id == 2 && ankle_zero_calibrated) {
+          // 踝解剖角 = (pos_raw - ankle_zero_offset) * k_deg
+          // k_deg = 1.0 / unitsPerDeg（将协议单位转换为关节角度）
+          int64_t offsetAngle = angle - ankle_zero_offset;
+          status->angleDeg = unitsToAngleDeg(*motor, offsetAngle);
+        } else {
+          // 未标定或髋关节，使用原始角度
+          status->angleDeg = unitsToAngleDeg(*motor, angle);
+        }
+        
         status->lastUpdateMs = millis();
+        
+        // 对于髋关节，更新信号预处理和自适应阈值
+        if (motor->id == 1) {
+          updateHipSignalProcessor(status->angleDeg);
+          // 使用滤波后的髋角更新自适应阈值
+          if (hipProcessor.initialized) {
+            updateAdaptiveThreshold(hipProcessor.hip_f);
+          }
+        }
         
         // 简化输出：只显示角度数据
         if (motor->id == 1) {
           Serial.printf("Hip: %.2f deg\n", status->angleDeg);
         } else {
-          Serial.printf("Ankle: %.2f deg\n", status->angleDeg);
+          if (ankle_zero_calibrated) {
+            Serial.printf("Ankle: %.2f deg (calibrated, offset=%lld)\n", 
+                         status->angleDeg, static_cast<long long>(ankle_zero_offset));
+          } else {
+            Serial.printf("Ankle: %.2f deg (raw, NOT calibrated!)\n", status->angleDeg);
+          }
         }
       }
       else if (cmd == CMD_READ_STATUS1) {
@@ -323,7 +527,6 @@ void handleCanMessage(const CAN_message_t &msg) {
         
         status->temperature = temperature;
         status->speed = speed;
-        status->torqueCurrent = iq;  // 保存转矩电流，用于阻力检测
         status->lastUpdateMs = millis();
         
         Serial.printf("[RX] %s: temp=%d℃, iq=%d, speed=%d dps, encoder=%u, ID=0x%03X, CMD=0x%02X\n",
@@ -629,17 +832,6 @@ struct VelocitySmoother {
   uint32_t lastUpdateMs;     // 上次更新时间
 };
 
-// 阻力检测和柔性响应结构
-struct ResistanceDetector {
-  float positionErrorThreshold;  // 位置偏差阈值（度），超过此值认为有阻力
-  int16_t currentThreshold;       // 电流阈值，超过此值认为有阻力
-  float complianceFactor;         // 柔性系数（0.0-1.0），1.0=完全刚性，0.0=完全柔性
-  float maxComplianceFactor;      // 最大柔性系数（遇到强阻力时的最小值）
-  float positionError;           // 当前位置偏差
-  int16_t currentLevel;           // 当前电流水平
-  bool resistanceDetected;        // 是否检测到阻力
-};
-
 // 步态播放状态
 struct GaitPlaybackState {
   bool active;              // 是否正在播放
@@ -648,8 +840,6 @@ struct GaitPlaybackState {
   uint32_t cycleStartMs;     // 当前周期开始时间（毫秒）
   uint32_t lastUpdateMs;     // 上次更新时间
   uint32_t updateIntervalMs; // 更新间隔（毫秒）
-  uint32_t lastStatusRequestMs; // 上次请求状态的时间
-  uint32_t statusRequestIntervalMs; // 状态请求间隔（毫秒，用于阻力检测）
   float currentPhase;        // 当前相位（0.0-1.0）
   float maxHipSpeedJoint;    // 髋关节最大速度限制（关节速度，dps）
   float maxAnkleSpeedJoint;   // 踝关节最大速度限制（关节速度，dps）
@@ -657,16 +847,12 @@ struct GaitPlaybackState {
   float centerAnkleAngle;    // 摆动中心位置（踝关节）
   VelocitySmoother hipSmoother;   // 髋关节速度平滑器
   VelocitySmoother ankleSmoother; // 踝关节速度平滑器
-  ResistanceDetector hipResistance;    // 髋关节阻力检测器
-  ResistanceDetector ankleResistance;  // 踝关节阻力检测器
 };
 
 GaitPlaybackState gaitPlayback = {
-  false, 1.0f, 2.0f, 0, 0, 5, 0, 50, 0.0f, 100.0f, 100.0f, 0.0f, 0.0f,
+  false, 1.0f, 2.0f, 0, 0, 5, 0.0f, 100.0f, 100.0f, 0.0f, 0.0f,
   {0.0f, 0.0f, 300.0f, 0},  // hipSmoother: 最大加速度300 dps²（关节速度）
-  {0.0f, 0.0f, 300.0f, 0},   // ankleSmoother: 最大加速度300 dps²（关节速度）
-  {5.0f, 500, 1.0f, 0.3f, 0.0f, 0, false},  // hipResistance: 位置偏差阈值5度，电流阈值500，柔性系数1.0（初始刚性），最小柔性0.3
-  {3.0f, 300, 1.0f, 0.3f, 0.0f, 0, false}   // ankleResistance: 位置偏差阈值3度，电流阈值300，柔性系数1.0（初始刚性），最小柔性0.3
+  {0.0f, 0.0f, 300.0f, 0}   // ankleSmoother: 最大加速度300 dps²（关节速度）
 };
 
 // 线性插值函数
@@ -746,46 +932,6 @@ float updateVelocitySmoother(VelocitySmoother &smoother, float targetPosition, u
   
   smoother.lastUpdateMs = currentTimeMs;
   return smoother.currentPosition;
-}
-
-// 阻力检测和柔性响应函数
-// 根据位置偏差和电流检测阻力，并计算柔性系数
-float updateResistanceDetector(ResistanceDetector &detector, float targetPosition, float currentPosition, int16_t current) {
-  // 计算位置偏差
-  detector.positionError = fabsf(targetPosition - currentPosition);
-  detector.currentLevel = abs(current);
-  
-  // 检测阻力：位置偏差大或电流大
-  bool positionResistance = detector.positionError > detector.positionErrorThreshold;
-  bool currentResistance = detector.currentLevel > detector.currentThreshold;
-  
-  detector.resistanceDetected = positionResistance || currentResistance;
-  
-  // 根据阻力程度调整柔性系数
-  if (detector.resistanceDetected) {
-    // 计算阻力强度（0.0-1.0）
-    float positionResistanceLevel = fminf(detector.positionError / (detector.positionErrorThreshold * 2.0f), 1.0f);
-    float currentResistanceLevel = fminf((float)detector.currentLevel / (float)(detector.currentThreshold * 2), 1.0f);
-    float resistanceLevel = fmaxf(positionResistanceLevel, currentResistanceLevel);
-    
-    // 根据阻力强度降低柔性系数（增加柔性）
-    // 阻力越大，柔性系数越小（越柔性）
-    detector.complianceFactor = detector.maxComplianceFactor + 
-                                (1.0f - detector.maxComplianceFactor) * (1.0f - resistanceLevel);
-    
-    // 限制柔性系数范围
-    if (detector.complianceFactor < detector.maxComplianceFactor) {
-      detector.complianceFactor = detector.maxComplianceFactor;
-    }
-  } else {
-    // 没有阻力时，逐渐恢复到完全刚性（柔性系数=1.0）
-    detector.complianceFactor += (1.0f - detector.complianceFactor) * 0.1f;  // 每次恢复10%
-    if (detector.complianceFactor > 0.99f) {
-      detector.complianceFactor = 1.0f;
-    }
-  }
-  
-  return detector.complianceFactor;
 }
 
 // 根据相位获取步态轨迹点（使用线性插值）
@@ -988,13 +1134,6 @@ void startGaitPlayback(float frequencyHz, float maxSpeedDps) {
   gaitPlayback.cycleDuration = 1.0f / frequencyHz;
   gaitPlayback.cycleStartMs = millis();
   gaitPlayback.currentPhase = 0.0f;
-  gaitPlayback.lastStatusRequestMs = 0;  // 初始化状态请求时间
-  
-  // 初始化阻力检测器
-  gaitPlayback.hipResistance.complianceFactor = 1.0f;
-  gaitPlayback.hipResistance.resistanceDetected = false;
-  gaitPlayback.ankleResistance.complianceFactor = 1.0f;
-  gaitPlayback.ankleResistance.resistanceDetected = false;
   
   Serial.printf(">>> Gait playback started: freq=%.2f Hz, duration=%.2f s\n",
                 frequencyHz, gaitPlayback.cycleDuration);
@@ -1017,13 +1156,6 @@ void updateGaitPlayback() {
   
   gaitPlayback.lastUpdateMs = now;
   
-  // 定期请求电机状态2（获取电流信息，用于阻力检测）
-  if (now - gaitPlayback.lastStatusRequestMs >= gaitPlayback.statusRequestIntervalMs) {
-    gaitPlayback.lastStatusRequestMs = now;
-    requestMotorStatus2(hipMotor);
-    requestMotorStatus2(ankleMotor);
-  }
-  
   // 计算当前相位（0.0 - 1.0）
   uint32_t elapsedMs = now - gaitPlayback.cycleStartMs;
   float elapsedSec = elapsedMs / 1000.0f;
@@ -1038,52 +1170,25 @@ void updateGaitPlayback() {
   float targetHipAngle = gaitPlayback.centerHipAngle + trajectoryHipAngle;
   float targetAnkleAngle = gaitPlayback.centerAnkleAngle + trajectoryAnkleAngle;
   
-  // 读取当前实际位置（用于阻力检测）
-  float currentHipAngle = hipStatus.angleDeg;
-  float currentAnkleAngle = ankleStatus.angleDeg;
-  
-  // 阻力检测和柔性响应
-  float hipCompliance = updateResistanceDetector(
-    gaitPlayback.hipResistance, 
-    targetHipAngle, 
-    currentHipAngle, 
-    hipStatus.torqueCurrent
-  );
-  float ankleCompliance = updateResistanceDetector(
-    gaitPlayback.ankleResistance, 
-    targetAnkleAngle, 
-    currentAnkleAngle, 
-    ankleStatus.torqueCurrent
-  );
-  
-  // 根据柔性系数调整目标位置（柔性响应）
-  // 柔性系数越小，实际目标位置越接近当前位置（越柔性）
-  float compliantHipTarget = currentHipAngle + (targetHipAngle - currentHipAngle) * hipCompliance;
-  float compliantAnkleTarget = currentAnkleAngle + (targetAnkleAngle - currentAnkleAngle) * ankleCompliance;
-  
   // 使用速度平滑器更新位置（限制加速度，确保速度曲线连续）
-  float smoothedHipAngle = updateVelocitySmoother(gaitPlayback.hipSmoother, compliantHipTarget, now);
-  float smoothedAnkleAngle = updateVelocitySmoother(gaitPlayback.ankleSmoother, compliantAnkleTarget, now);
+  float smoothedHipAngle = updateVelocitySmoother(gaitPlayback.hipSmoother, targetHipAngle, now);
+  float smoothedAnkleAngle = updateVelocitySmoother(gaitPlayback.ankleSmoother, targetAnkleAngle, now);
   
   // 计算实际需要的速度（基于平滑后的位置变化）
   // 注意：这里使用平滑器的速度，但需要转换为电机轴速度
   float hipVelocityJoint = fabsf(gaitPlayback.hipSmoother.currentVelocity);
   float ankleVelocityJoint = fabsf(gaitPlayback.ankleSmoother.currentVelocity);
   
-  // 根据柔性系数调整速度限制（遇到阻力时降低速度，更柔和）
-  float adjustedHipSpeed = hipVelocityJoint * hipCompliance;
-  float adjustedAnkleSpeed = ankleVelocityJoint * ankleCompliance;
-  
   // 限制速度不超过最大值，并转换为电机轴速度
-  if (adjustedHipSpeed > gaitPlayback.maxHipSpeedJoint) {
-    adjustedHipSpeed = gaitPlayback.maxHipSpeedJoint;
+  if (hipVelocityJoint > gaitPlayback.maxHipSpeedJoint) {
+    hipVelocityJoint = gaitPlayback.maxHipSpeedJoint;
   }
-  if (adjustedAnkleSpeed > gaitPlayback.maxAnkleSpeedJoint) {
-    adjustedAnkleSpeed = gaitPlayback.maxAnkleSpeedJoint;
+  if (ankleVelocityJoint > gaitPlayback.maxAnkleSpeedJoint) {
+    ankleVelocityJoint = gaitPlayback.maxAnkleSpeedJoint;
   }
   
-  uint16_t hipMotorSpeed = jointSpeedToMotorSpeed(hipMotor, adjustedHipSpeed);
-  uint16_t ankleMotorSpeed = jointSpeedToMotorSpeed(ankleMotor, adjustedAnkleSpeed);
+  uint16_t hipMotorSpeed = jointSpeedToMotorSpeed(hipMotor, hipVelocityJoint);
+  uint16_t ankleMotorSpeed = jointSpeedToMotorSpeed(ankleMotor, ankleVelocityJoint);
   
   // 确保速度不为0（至少有一个最小值，避免电机停止）
   if (hipMotorSpeed < 10) hipMotorSpeed = 10;
@@ -1111,11 +1216,35 @@ GaitDataCollection gaitCollection = {false, 0, 20, 0, 20}; // 默认20ms间隔�
 
 // 发送步态数据到串口（JSON格式，便于上位机解析）
 void sendGaitData() {
-  // 格式：{"t":时间戳(ms),"h":髋角度(deg),"a":踝角度(deg)}
-  Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f}\n",
-                millis(),
-                hipStatus.angleDeg,
-                ankleStatus.angleDeg);
+  // 格式：{"t":时间戳(ms),"h":髋角度(deg),"a":踝角度(deg),"hf":滤波髋角(deg),"hv":髋速度(deg/s),"hvf":滤波髋速度(deg/s),"hm":均值(deg),"ha":幅度(deg),"A_up":阈值(deg),"A_dn":阈值(deg)}
+  if (hipProcessor.initialized && adaptiveThreshold.initialized) {
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f,\"hf\":%.2f,\"hv\":%.2f,\"hvf\":%.2f,\"hm\":%.2f,\"ha\":%.2f,\"A_up\":%.2f,\"A_dn\":%.2f}\n",
+                  millis(),
+                  hipStatus.angleDeg,
+                  ankleStatus.angleDeg,
+                  hipProcessor.hip_f,
+                  hipProcessor.hip_vel,
+                  hipProcessor.hip_vel_f,
+                  adaptiveThreshold.hip_mean,
+                  adaptiveThreshold.hip_amp,
+                  adaptiveThreshold.A_up,
+                  adaptiveThreshold.A_dn);
+  } else if (hipProcessor.initialized) {
+    // 如果信号处理器已初始化但自适应阈值未初始化，只发送信号处理数据
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f,\"hf\":%.2f,\"hv\":%.2f,\"hvf\":%.2f}\n",
+                  millis(),
+                  hipStatus.angleDeg,
+                  ankleStatus.angleDeg,
+                  hipProcessor.hip_f,
+                  hipProcessor.hip_vel,
+                  hipProcessor.hip_vel_f);
+  } else {
+    // 如果信号处理器未初始化，只发送基本数据
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f}\n",
+                  millis(),
+                  hipStatus.angleDeg,
+                  ankleStatus.angleDeg);
+  }
 }
 
 // 启动/停止步态数据采集
@@ -1232,6 +1361,27 @@ void processSerialCommand() {
     Serial.printf("Ankle: angle=%.2f deg (%lld units), speed=%d dps, enabled=%d, state=0x%02X\n",
                   ankleStatus.angleDeg, static_cast<long long>(ankleStatus.multiTurnAngle),
                   ankleStatus.speed, ankleStatus.enabled, ankleStatus.motorState);
+    
+    // 显示髋关节信号预处理状态
+    if (hipProcessor.initialized) {
+      Serial.println("\n=== Hip Signal Processing ===");
+      Serial.printf("Raw angle:     %.2f deg\n", hipStatus.angleDeg);
+      Serial.printf("Filtered:      %.2f deg\n", hipProcessor.hip_f);
+      Serial.printf("Velocity:      %.2f deg/s\n", hipProcessor.hip_vel);
+      Serial.printf("Vel filtered:  %.2f deg/s\n", hipProcessor.hip_vel_f);
+    } else {
+      Serial.println("\n=== Hip Signal Processing ===");
+      Serial.println("Not initialized (need hip angle data)");
+    }
+    
+    // 显示踝关节标定状态
+    Serial.println("\n=== Ankle Calibration ===");
+    if (ankle_zero_calibrated) {
+      Serial.printf("Calibrated: YES (offset=%lld units)\n", 
+                   static_cast<long long>(ankle_zero_offset));
+    } else {
+      Serial.println("Calibrated: NO (use 'az' command to calibrate)");
+    }
   }
   // 步态数据采集命令
   else if (cmd == "gc" || cmd == "gaitcollect" || cmd == "gaitstart") {
@@ -1282,6 +1432,57 @@ void processSerialCommand() {
   // 加载步态数据命令：loadgait 开始接收JSON格式的步态数据
   else if (cmd == "loadgait" || cmd == "loadtrajectory") {
     startReceivingGaitData();
+  }
+  // 踝关节零点标定命令：az（ankle zero）
+  // 在用户站立自然中立位时执行，将当前踝关节角度设为0度
+  else if (cmd == "az" || cmd == "anklezero") {
+    // 先读取当前踝关节角度
+    requestMotorAngle(ankleMotor);
+    delay(50);  // 等待回复
+    {
+      CAN_message_t inMsg;
+      while (can1.read(inMsg)) {
+        handleCanMessage(inMsg);
+      }
+    }
+    
+    // 如果成功读取到角度，保存为零点偏移
+    if (ankleStatus.lastUpdateMs > 0 && 
+        (millis() - ankleStatus.lastUpdateMs) < 200) {  // 确保数据是新鲜的
+      ankle_zero_offset = ankleStatus.multiTurnAngle;
+      ankle_zero_calibrated = true;
+      Serial.println(">>> Ankle zero calibration SUCCESS");
+      Serial.printf(">>> Zero offset: %lld units (%.2f deg)\n", 
+                   static_cast<long long>(ankle_zero_offset),
+                   unitsToAngleDeg(ankleMotor, ankle_zero_offset));
+      Serial.println(">>> Ankle angle will now be calculated relative to this zero position");
+      Serial.println(">>> 0 deg = foot at 90° to shank (neutral position)");
+    } else {
+      Serial.println("ERROR: Failed to read ankle angle. Please try again.");
+    }
+  }
+  // 自适应阈值调试命令：th（threshold）
+  else if (cmd == "th" || cmd == "threshold") {
+    if (adaptiveThreshold.initialized) {
+      Serial.println(">>> Adaptive Threshold Status:");
+      Serial.printf(">>>   Window: %d/%d samples\n", adaptiveThreshold.windowCount, HIP_WINDOW_SIZE);
+      Serial.printf(">>>   Hip Mean: %.2f deg\n", adaptiveThreshold.hip_mean);
+      Serial.printf(">>>   Hip Amplitude: %.2f deg\n", adaptiveThreshold.hip_amp);
+      Serial.printf(">>>   A_up: %.2f deg\n", adaptiveThreshold.A_up);
+      Serial.printf(">>>   A_dn: %.2f deg\n", adaptiveThreshold.A_dn);
+      Serial.printf(">>>   V_up: %.2f deg/s\n", adaptiveThreshold.V_up);
+      Serial.printf(">>>   V_dn: %.2f deg/s\n", adaptiveThreshold.V_dn);
+      Serial.printf(">>>   T_hold: %lu ms\n", T_HOLD_MS);
+      if (hipProcessor.initialized) {
+        Serial.printf(">>>   Current hip_f: %.2f deg\n", hipProcessor.hip_f);
+        Serial.printf(">>>   Current hip_vel_f: %.2f deg/s\n", hipProcessor.hip_vel_f);
+        Serial.printf(">>>   Swing condition: hip_vel_f > V_up && hip_f > hip_mean + A_up\n");
+        Serial.printf(">>>   Stance condition: hip_vel_f < V_dn && hip_f < hip_mean - A_dn\n");
+      }
+    } else {
+      Serial.println(">>> Adaptive Threshold: NOT INITIALIZED");
+      Serial.println(">>> Start gait collection (gc) to initialize threshold calculation");
+    }
   }
   // 位置控制命令：move1 <angle> 表示髋关节移动到指定角度（关节角度，度）
   else if (cmd.startsWith("move1 ") || cmd.startsWith("pos1 ")) {
@@ -1367,6 +1568,8 @@ void processSerialCommand() {
     Serial.println("Stop:    stop1, stop2, stopsw1, stopsw2");
     Serial.println("Gait Playback: gp <freq> <speed>, gps (gait playback start/stop)");
     Serial.println("Load Gait: loadgait (load trajectory from JSON)");
+    Serial.println("Ankle Zero: az (ankle zero calibration)");
+    Serial.println("Threshold:  th (show adaptive threshold status)");
     Serial.println("Help:    h, help");
   }
   else {
@@ -1422,6 +1625,8 @@ void loop() {
       handleCanMessage(inMsg);
     }
   }
+  
+  // 注意：髋关节信号预处理已在handleCanMessage中调用，这里不需要重复调用
   
   // 更新摆动
   updateSwing(hipSwing);
