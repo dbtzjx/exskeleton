@@ -691,6 +691,10 @@ class GaitDataCollectorGUI:
         self.update_interval = 50  # 更新间隔（毫秒）
         self.history_max_lines = 500  # 历史记录最大行数
         
+        # 按钮状态跟踪
+        self.gait_collection_enabled = False  # 步态采集状态
+        self.assist_enabled = False  # 辅助启用状态
+        self.control_loop_enabled = False  # 控制循环启用状态
         
         # 创建界面
         self.create_widgets()
@@ -774,12 +778,25 @@ class GaitDataCollectorGUI:
         cmd_frame = ttk.Frame(control_frame)
         cmd_frame.grid(row=6, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
         
+        # 第一行：基础控制
         ttk.Button(cmd_frame, text="使能", command=lambda: self.send_command_text("e"), width=8).grid(row=0, column=0, padx=2)
         ttk.Button(cmd_frame, text="掉电", command=lambda: self.send_command_text("d"), width=8).grid(row=0, column=1, padx=2)
         ttk.Button(cmd_frame, text="读取", command=lambda: self.send_command_text("r"), width=8).grid(row=0, column=2, padx=2)
-        ttk.Button(cmd_frame, text="状态", command=lambda: self.send_command_text("s"), width=8).grid(row=1, column=0, padx=2, pady=2)
-        ttk.Button(cmd_frame, text="开始采集", command=lambda: self.send_command_text("gc"), width=8).grid(row=1, column=1, padx=2, pady=2)
-        ttk.Button(cmd_frame, text="停止采集", command=lambda: self.send_command_text("gcs"), width=8).grid(row=1, column=2, padx=2, pady=2)
+        ttk.Button(cmd_frame, text="状态", command=lambda: self.send_command_text("s"), width=8).grid(row=0, column=3, padx=2)
+        
+        # 第二行：采集控制（复用按钮）
+        self.gait_collection_btn = ttk.Button(cmd_frame, text="开始采集", command=self.toggle_gait_collection, width=8)
+        self.gait_collection_btn.grid(row=1, column=0, padx=2, pady=2)
+        
+        # 第二行：新增按钮
+        ttk.Button(cmd_frame, text="踝关节零点", command=lambda: self.send_command_text("az"), width=10).grid(row=1, column=1, padx=2, pady=2)
+        self.assist_btn = ttk.Button(cmd_frame, text="启用辅助", command=self.toggle_assist, width=10)
+        self.assist_btn.grid(row=1, column=2, padx=2, pady=2)
+        self.control_loop_btn = ttk.Button(cmd_frame, text="启用控制循环", command=self.toggle_control_loop, width=12)
+        self.control_loop_btn.grid(row=1, column=3, padx=2, pady=2)
+        
+        # 第三行：重置故障
+        ttk.Button(cmd_frame, text="重置故障", command=lambda: self.send_command_text("resetfault"), width=10).grid(row=2, column=0, padx=2, pady=2)
         
         # 分隔线
         ttk.Separator(cmd_frame, orient=tk.HORIZONTAL).grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
@@ -1583,6 +1600,99 @@ class GaitDataCollectorGUI:
                 self.add_history("髋关节数据模块已开启", "信息")
             except Exception as e:
                 error_msg = f"启动髋关节数据模块失败: {str(e)}"
+                self.add_history(error_msg, "信息")
+                messagebox.showerror("错误", str(e))
+    
+    def toggle_gait_collection(self):
+        """切换步态采集（开始/停止）"""
+        if not self.collector.is_connected():
+            messagebox.showerror("错误", "请先连接串口")
+            return
+        
+        if self.gait_collection_enabled:
+            # 停止采集
+            try:
+                self.collector.send_command("gcs")
+                self.gait_collection_enabled = False
+                self.gait_collection_btn.config(text="开始采集")
+                self.add_history("gcs", "TX")
+                self.add_history("步态采集已停止", "信息")
+            except Exception as e:
+                error_msg = f"停止采集失败: {str(e)}"
+                self.add_history(error_msg, "信息")
+                messagebox.showerror("错误", str(e))
+        else:
+            # 开始采集
+            try:
+                self.collector.send_command("gc")
+                self.gait_collection_enabled = True
+                self.gait_collection_btn.config(text="停止采集")
+                self.add_history("gc", "TX")
+                self.add_history("步态采集已开始", "信息")
+            except Exception as e:
+                error_msg = f"开始采集失败: {str(e)}"
+                self.add_history(error_msg, "信息")
+                messagebox.showerror("错误", str(e))
+    
+    def toggle_assist(self):
+        """切换辅助启用/禁用"""
+        if not self.collector.is_connected():
+            messagebox.showerror("错误", "请先连接串口")
+            return
+        
+        if self.assist_enabled:
+            # 禁用辅助
+            try:
+                self.collector.send_command("assistoff")
+                self.assist_enabled = False
+                self.assist_btn.config(text="启用辅助")
+                self.add_history("assistoff", "TX")
+                self.add_history("辅助已禁用", "信息")
+            except Exception as e:
+                error_msg = f"禁用辅助失败: {str(e)}"
+                self.add_history(error_msg, "信息")
+                messagebox.showerror("错误", str(e))
+        else:
+            # 启用辅助
+            try:
+                self.collector.send_command("assiston")
+                self.assist_enabled = True
+                self.assist_btn.config(text="禁用辅助")
+                self.add_history("assiston", "TX")
+                self.add_history("辅助已启用", "信息")
+            except Exception as e:
+                error_msg = f"启用辅助失败: {str(e)}"
+                self.add_history(error_msg, "信息")
+                messagebox.showerror("错误", str(e))
+    
+    def toggle_control_loop(self):
+        """切换控制循环启用/禁用"""
+        if not self.collector.is_connected():
+            messagebox.showerror("错误", "请先连接串口")
+            return
+        
+        if self.control_loop_enabled:
+            # 禁用控制循环
+            try:
+                self.collector.send_command("ctrloff")
+                self.control_loop_enabled = False
+                self.control_loop_btn.config(text="启用控制循环")
+                self.add_history("ctrloff", "TX")
+                self.add_history("控制循环已禁用", "信息")
+            except Exception as e:
+                error_msg = f"禁用控制循环失败: {str(e)}"
+                self.add_history(error_msg, "信息")
+                messagebox.showerror("错误", str(e))
+        else:
+            # 启用控制循环
+            try:
+                self.collector.send_command("ctrlon")
+                self.control_loop_enabled = True
+                self.control_loop_btn.config(text="禁用控制循环")
+                self.add_history("ctrlon", "TX")
+                self.add_history("控制循环已启用", "信息")
+            except Exception as e:
+                error_msg = f"启用控制循环失败: {str(e)}"
                 self.add_history(error_msg, "信息")
                 messagebox.showerror("错误", str(e))
 
