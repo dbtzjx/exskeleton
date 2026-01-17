@@ -320,27 +320,28 @@ class GaitDataCollector:
                     
                     # 测试阶段：提取4个数据：hip_raw(h), hip_f(hf), hip_vel_f(hvf), phase, swing_progress(s)
                     timestamp = data.get('t', 0)  # 毫秒
-                    hip_raw = data.get('h', 0.0)   # 髋关节原始角度
+                    hip_raw = data.get('h', None)   # 髋关节原始角度
+                    
+                    # 如果hip_raw不存在，跳过这条数据
+                    if hip_raw is None:
+                        continue
+                    
                     hip_f = data.get('hf', None)  # 滤波后的髋角
                     hip_vel_f = data.get('hvf', None)  # 滤波后的髋速度
                     phase = data.get('phase', 0)  # 步态相位 (0=STANCE, 1=SWING)
                     swing_progress = data.get('s', 0.0)  # 摆动进度 (0-1)
                     
-                    # 存储数据
+                    # 存储数据（确保所有数据长度一致）
                     self.time_data.append(timestamp)
                     self.hip_data.append(hip_raw)  # 存储原始值用于绘图
                     
-                    if hip_f is not None:
-                        self.hip_filtered_data.append(hip_f)
-                    else:
-                        self.hip_filtered_data.append(None)
+                    # 确保hip_filtered_data长度与time_data一致
+                    self.hip_filtered_data.append(hip_f if hip_f is not None else None)
                     
-                    if hip_vel_f is not None:
-                        self.hip_velocity_filtered_data.append(hip_vel_f)
-                    else:
-                        self.hip_velocity_filtered_data.append(None)
+                    # 确保hip_velocity_filtered_data长度与time_data一致
+                    self.hip_velocity_filtered_data.append(hip_vel_f if hip_vel_f is not None else None)
                     
-                    # 存储相位和摆动进度
+                    # 存储相位和摆动进度（确保长度一致）
                     self.phase_data.append(phase)
                     self.swing_progress_data.append(swing_progress)
                     
@@ -354,6 +355,8 @@ class GaitDataCollector:
                 continue
             except Exception as e:
                 print(f"髋关节数据处理错误: {e}")
+                import traceback
+                traceback.print_exc()
                 time.sleep(0.01)
     
     def _detect_gait_cycle(self, timestamp, hip_angle, ankle_angle):
@@ -608,8 +611,8 @@ class GaitDataCollector:
         if len(self.time_data) == 0 or len(self.hip_data) == 0:
             return [], [], []
         
-        # 确保数据长度一致
-        min_len = min(len(self.time_data), len(self.hip_data))
+        # 确保数据长度一致（取所有相关数据的最小长度）
+        min_len = min(len(self.time_data), len(self.hip_data), len(self.hip_filtered_data))
         if min_len == 0:
             return [], [], []
         
@@ -618,10 +621,10 @@ class GaitDataCollector:
         relative_time = [(self.time_data[i] - latest_time) / 1000.0 for i in range(min_len)]  # 转换为秒
         hip_data = [self.hip_data[i] for i in range(min_len)]  # hip_raw
         
-        # 提取滤波后的髋角
+        # 提取滤波后的髋角（确保长度一致）
         hip_filtered = []
         for i in range(min_len):
-            if i < len(self.hip_filtered_data) and self.hip_filtered_data[i] is not None:
+            if i < len(self.hip_filtered_data):
                 hip_filtered.append(self.hip_filtered_data[i])
             else:
                 hip_filtered.append(None)
@@ -1481,31 +1484,57 @@ class GaitDataCollectorGUI:
         
         # 测试阶段：只显示hip_raw和hip_f
         time_data, hip_data, hip_filtered = self.collector.get_realtime_data()
-        if len(time_data) > 0 and len(hip_data) > 0 and len(time_data) == len(hip_data):
-            # 绘制原始髋关节角度
-            self.ax1.plot(time_data, hip_data, 'b-', label='髋关节原始(hip_raw)', linewidth=1.5)
-            
-            # 绘制髋关节滤波后的角度
-            hip_filtered_valid = [(x if x is not None else float('nan')) for x in hip_filtered]
-            if any(not np.isnan(x) for x in hip_filtered_valid):
-                self.ax1.plot(time_data, hip_filtered_valid, 'r--', label='髋关节滤波(hip_f)', linewidth=1.5, alpha=0.8)
-            
-            self.ax1.set_title('实时数据（髋关节原始值和滤波值）', fontsize=12)
-            self.ax1.set_xlabel('时间 (秒)')
-            self.ax1.set_ylabel('角度 (度)', color='black')
-            self.ax1.grid(True)
-            self.ax1.legend(loc='upper right')
-            
-            # 如果用户已经缩放/移动，恢复之前的X轴范围；否则自动缩放
-            if not auto_scale_x1 and xlim1 is not None:
-                self.ax1.set_xlim(xlim1)
+        
+        # 调试：检查数据长度
+        if len(time_data) > 0:
+            # 确保数据长度一致
+            min_len = min(len(time_data), len(hip_data), len(hip_filtered) if hip_filtered else 0)
+            if min_len > 0:
+                # 截取到最小长度
+                time_data = time_data[:min_len]
+                hip_data = hip_data[:min_len]
+                hip_filtered = hip_filtered[:min_len] if hip_filtered else []
+                
+                # 绘制原始髋关节角度
+                self.ax1.plot(time_data, hip_data, 'b-', label='髋关节原始(hip_raw)', linewidth=1.5)
+                
+                # 绘制髋关节滤波后的角度（如果有有效数据）
+                if len(hip_filtered) > 0:
+                    # 找到有效数据点（不是None）
+                    valid_indices = [i for i, x in enumerate(hip_filtered) if x is not None]
+                    if len(valid_indices) > 0:
+                        valid_time = [time_data[i] for i in valid_indices]
+                        valid_filtered = [hip_filtered[i] for i in valid_indices]
+                        self.ax1.plot(valid_time, valid_filtered, 'r--', label='髋关节滤波(hip_f)', linewidth=1.5, alpha=0.8)
+                
+                self.ax1.set_title('实时数据（髋关节原始值和滤波值）', fontsize=12)
+                self.ax1.set_xlabel('时间 (秒)')
+                self.ax1.set_ylabel('角度 (度)', color='black')
+                self.ax1.grid(True)
+                self.ax1.legend(loc='upper right')
+                
+                # 如果用户已经缩放/移动，恢复之前的X轴范围；否则自动缩放
+                if not auto_scale_x1 and xlim1 is not None:
+                    self.ax1.set_xlim(xlim1)
+                else:
+                    self.ax1.relim()
+                    self.ax1.autoscale()
             else:
-                self.ax1.relim()
-                self.ax1.autoscale()
+                # 数据长度不一致
+                debug_info = f'数据长度不一致\n时间: {len(self.collector.time_data)}\n髋角: {len(self.collector.hip_data)}\n滤波: {len(self.collector.hip_filtered_data)}'
+                self.ax1.text(0.5, 0.5, debug_info, 
+                             horizontalalignment='center', verticalalignment='center',
+                             transform=self.ax1.transAxes, fontsize=10)
+                self.ax1.set_title('实时数据（髋关节原始值和滤波值）', fontsize=12)
+                self.ax1.set_xlabel('时间 (秒)')
+                self.ax1.set_ylabel('角度 (度)')
+                self.ax1.grid(True)
         else:
-            self.ax1.text(0.5, 0.5, '等待数据...', 
+            # 没有数据
+            debug_info = f'等待数据...\n队列大小: {queue_size}\n数据点数: {total_points}'
+            self.ax1.text(0.5, 0.5, debug_info, 
                          horizontalalignment='center', verticalalignment='center',
-                         transform=self.ax1.transAxes, fontsize=14)
+                         transform=self.ax1.transAxes, fontsize=12)
             self.ax1.set_title('实时数据（髋关节原始值和滤波值）', fontsize=12)
             self.ax1.set_xlabel('时间 (秒)')
             self.ax1.set_ylabel('角度 (度)')

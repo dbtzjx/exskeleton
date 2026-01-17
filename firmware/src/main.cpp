@@ -1865,7 +1865,8 @@ void sendGaitData() {
                   hipProcessor.hip_f,
                   hipProcessor.hip_vel_f);
   } else {
-    // 如果信号处理器未初始化，只发送基本数据
+    // 如果信号处理器未初始化，只发送基本数据（但保持JSON格式完整）
+    // 注意：即使模块未初始化，也要输出完整的JSON格式，所有字段都要有
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":0.0,\"phase\":0,\"s\":0.0}\n",
                   millis(),
                   hipStatus.angleDeg,
