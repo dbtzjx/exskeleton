@@ -13,8 +13,9 @@ FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> can1;
 // 电机配置结构体
 struct MotorConfig {
   uint8_t id;          // 协议中的电机 ID（1=髋，2=踝）
-  float unitsPerDeg;   // 每 1° 对应的协议单位数
-  const char *name;    // 关节名称，便于调试打印
+  float unitsPerDeg;    // 每 1° 对应的协议单位数
+  int8_t dir;          // 方向系数（+1/-1），用于统一处理角度方向
+  const char *name;     // 关节名称，便于调试打印
 };
 
 // 协议规定：位置和多圈角度的电机轴单位为 0.01°/LSB，即 1° = 100 单位（与具体电机 ID 无关）
@@ -24,8 +25,12 @@ struct MotorConfig {
 // 因此：
 //   - 髋关节 unitsPerDeg = 3600（1 关节度 = 3600 协议单位，对应电机轴减速比 36）
 //   - 踝关节 unitsPerDeg = 1000（1 关节度 = 1000 协议单位，对应电机轴减速比 10）
-MotorConfig hipMotor { 1, 3600.0f, "Hip" };
-MotorConfig ankleMotor { 2, 1000.0f, "Ankle" };
+// 方向系数 dir：
+//   - 用于统一处理角度方向，在"角度↔协议单位"转换的唯一入口统一处理
+//   - 逻辑角 * dir * unitsPerDeg -> 协议单位
+//   - 协议单位 / unitsPerDeg * dir -> 逻辑角
+MotorConfig hipMotor { 1, 3600.0f, +1, "Hip" };
+MotorConfig ankleMotor { 2, 1000.0f, +1, "Ankle" };  // 默认+1，可根据实际电机方向调整
 
 // ============================================================================
 // 角度接口层：明确区分原始角和逻辑角
@@ -924,8 +929,9 @@ void resetComplianceFault() {
 // 此函数将逻辑角转换为协议单位，用于发送控制命令
 
 // 逻辑角（deg）转换为协议单位（int32）
-// 对于髋关节：逻辑角 -> 协议单位（考虑参考偏移）
-// 对于踝关节：逻辑角（解剖角） -> 协议单位（考虑零点偏移）
+// 对于髋关节：逻辑角 -> 协议单位（考虑参考偏移和方向系数）
+// 对于踝关节：逻辑角（解剖角） -> 协议单位（考虑零点偏移和方向系数）
+// 方向系数统一处理：逻辑角 * dir * unitsPerDeg -> 协议单位
 int32_t logicalAngleToUnits(const MotorConfig &m, float logicalDeg) {
   int64_t offset;
   if (m.id == 1) {
@@ -938,8 +944,9 @@ int32_t logicalAngleToUnits(const MotorConfig &m, float logicalDeg) {
     offset = 0;
   }
   
-  // 逻辑角转换为协议单位：units = logicalDeg * unitsPerDeg + offset
-  int64_t units = static_cast<int64_t>(logicalDeg * m.unitsPerDeg) + offset;
+  // 逻辑角转换为协议单位：units = logicalDeg * dir * unitsPerDeg + offset
+  // 方向系数 dir 统一处理角度方向
+  int64_t units = static_cast<int64_t>(logicalDeg * m.dir * m.unitsPerDeg) + offset;
   
   // 限制在int32范围内
   if (units > INT32_MAX) units = INT32_MAX;
@@ -955,8 +962,11 @@ int32_t angleDegToUnits(const MotorConfig &m, float deg) {
 }
 
 // 协议单位转换为角度（deg）
+// 方向系数统一处理：协议单位 / unitsPerDeg * dir -> 逻辑角
 float unitsToAngleDeg(const MotorConfig &m, int64_t units) {
-  return static_cast<float>(units) / m.unitsPerDeg;
+  // 协议单位转换为逻辑角：logicalDeg = (units / unitsPerDeg) * dir
+  // 方向系数 dir 统一处理角度方向
+  return static_cast<float>(units) * m.dir / m.unitsPerDeg;
 }
 
 // 关节速度（deg/s）转换为电机轴速度（dps）
