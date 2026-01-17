@@ -1835,75 +1835,41 @@ struct GaitDataCollection {
 
 GaitDataCollection gaitCollection = {false, 0, 20, 0, 20}; // 默认20ms间隔（50Hz）
 
+
 // 发送步态数据到串口（JSON格式，便于上位机解析）
+// 测试阶段：只输出4个数据：hip_raw(h), hip_f(hf), hip_vel_f(hvf), phase, swing_progress(s)
 void sendGaitData() {
-  // 格式：{"t":时间戳(ms),"h":髋角度(deg),"a":踝角度(deg),"hf":滤波髋角(deg),"hv":髋速度(deg/s),"hvf":滤波髋速度(deg/s),"hm":均值(deg),"ha":幅度(deg),"A_up":阈值(deg),"A_dn":阈值(deg),"phase":相位(0=STANCE,1=SWING),"phase_dur":相位持续时间(ms),"Ts":摆动平均周期(s),"t_swing":当前摆动时长(s),"s":摆动进度(0-1),"theta_ref":踝参考角(deg),"theta_target":S曲线目标角(deg),"assist":助力因子(0-1),"comp_state":顺从状态(0=NORMAL,1=COMPLIANT,2=HOLD,3=FAULT_SAFE),"iq":电流(mA),"speed_factor":速度因子(0-1)}
-  if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized && swingProgress.initialized && ankleAssist.initialized && complianceCtrl.initialized) {
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f,\"hf\":%.2f,\"hv\":%.2f,\"hvf\":%.2f,\"hm\":%.2f,\"ha\":%.2f,\"A_up\":%.2f,\"A_dn\":%.2f,\"phase\":%d,\"phase_dur\":%lu,\"Ts\":%.3f,\"t_swing\":%.3f,\"s\":%.3f,\"theta_ref\":%.2f,\"theta_target\":%.2f,\"assist\":%.3f,\"comp_state\":%d,\"iq\":%d,\"speed_factor\":%.2f}\n",
+  // 格式：{"t":时间戳(ms),"h":髋角度原始值(deg),"hf":滤波髋角(deg),"hvf":滤波髋速度(deg/s),"phase":相位(0=STANCE,1=SWING),"s":摆动进度(0-1)}
+  if (hipProcessor.initialized && gaitPhaseDetector.initialized && swingProgress.initialized) {
+    // 所有必需模块已初始化，输出完整数据
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":%d,\"s\":%.3f}\n",
+                  millis(),
+                  hipStatus.angleDeg,  // hip_raw
+                  hipProcessor.hip_f,  // hip_f
+                  hipProcessor.hip_vel_f,  // hip_vel_f
+                  gaitPhaseDetector.currentPhase,  // phase
+                  swingProgress.swing_progress);  // swing_progress
+  } else if (hipProcessor.initialized && gaitPhaseDetector.initialized) {
+    // 如果信号处理器和相位识别已初始化但摆动进度未初始化
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":%d,\"s\":0.0}\n",
                   millis(),
                   hipStatus.angleDeg,
-                  ankleStatus.angleDeg,
                   hipProcessor.hip_f,
-                  hipProcessor.hip_vel,
                   hipProcessor.hip_vel_f,
-                  adaptiveThreshold.hip_mean,
-                  adaptiveThreshold.hip_amp,
-                  adaptiveThreshold.A_up,
-                  adaptiveThreshold.A_dn,
-                  gaitPhaseDetector.currentPhase,
-                  getCurrentPhaseDurationMs(),
-                  swingProgress.Ts,
-                  swingProgress.t_swing,
-                  swingProgress.swing_progress,
-                  ankleAssist.theta_ref,
-                  ankleAssist.theta_target,
-                  ankleAssist.assist_factor,
-                  complianceCtrl.currentState,
-                  ankleStatus.iq,
-                  complianceCtrl.maxSpeedFactor);
-  } else if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized) {
-    // 如果信号处理器、阈值和相位识别已初始化但摆动进度未初始化
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f,\"hf\":%.2f,\"hv\":%.2f,\"hvf\":%.2f,\"hm\":%.2f,\"ha\":%.2f,\"A_up\":%.2f,\"A_dn\":%.2f,\"phase\":%d,\"phase_dur\":%lu}\n",
-                  millis(),
-                  hipStatus.angleDeg,
-                  ankleStatus.angleDeg,
-                  hipProcessor.hip_f,
-                  hipProcessor.hip_vel,
-                  hipProcessor.hip_vel_f,
-                  adaptiveThreshold.hip_mean,
-                  adaptiveThreshold.hip_amp,
-                  adaptiveThreshold.A_up,
-                  adaptiveThreshold.A_dn,
-                  gaitPhaseDetector.currentPhase,
-                  getCurrentPhaseDurationMs());
-  } else if (hipProcessor.initialized && adaptiveThreshold.initialized) {
-    // 如果信号处理器和阈值已初始化但相位识别未初始化
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f,\"hf\":%.2f,\"hv\":%.2f,\"hvf\":%.2f,\"hm\":%.2f,\"ha\":%.2f,\"A_up\":%.2f,\"A_dn\":%.2f}\n",
-                  millis(),
-                  hipStatus.angleDeg,
-                  ankleStatus.angleDeg,
-                  hipProcessor.hip_f,
-                  hipProcessor.hip_vel,
-                  hipProcessor.hip_vel_f,
-                  adaptiveThreshold.hip_mean,
-                  adaptiveThreshold.hip_amp,
-                  adaptiveThreshold.A_up,
-                  adaptiveThreshold.A_dn);
+                  gaitPhaseDetector.currentPhase);
   } else if (hipProcessor.initialized) {
-    // 如果信号处理器已初始化但自适应阈值未初始化，只发送信号处理数据
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f,\"hf\":%.2f,\"hv\":%.2f,\"hvf\":%.2f}\n",
+    // 如果信号处理器已初始化但相位识别未初始化
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":0,\"s\":0.0}\n",
                   millis(),
                   hipStatus.angleDeg,
-                  ankleStatus.angleDeg,
                   hipProcessor.hip_f,
-                  hipProcessor.hip_vel,
                   hipProcessor.hip_vel_f);
   } else {
     // 如果信号处理器未初始化，只发送基本数据
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"a\":%.2f}\n",
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":0.0,\"phase\":0,\"s\":0.0}\n",
                   millis(),
                   hipStatus.angleDeg,
-                  ankleStatus.angleDeg);
+                  hipStatus.angleDeg);  // 如果未初始化，使用原始值作为滤波值
   }
 }
 
