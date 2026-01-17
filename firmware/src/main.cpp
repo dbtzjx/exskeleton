@@ -1842,45 +1842,55 @@ GaitDataCollection gaitCollection = {false, 0, 20, 0, 20}; // 默认20ms间隔�
 // 发送步态数据到串口（JSON格式，便于上位机解析）
 // 测试阶段：只输出4个数据：hip_raw(h), hip_f(hf), hip_vel_f(hvf), phase, swing_progress(s)
 void sendGaitData() {
-  // 格式：{"t":时间戳(ms),"h":髋角度原始值(deg),"hf":滤波髋角(deg),"hvf":滤波髋速度(deg/s),"phase":相位(0=STANCE,1=SWING),"s":摆动进度(0-1)}
+  // M2阶段格式：{"t":时间戳(ms),"h":髋角度原始值(deg),"hf":滤波髋角(deg),"hvf":滤波髋速度(deg/s),"phase":相位(0=STANCE,1=SWING),"s":摆动进度(0-1),"a":踝角度(deg),"ar":踝参考角度(deg)}
   // 保持原有逻辑结构，只修改输出字段
   if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized && swingProgress.initialized && ankleAssist.initialized && complianceCtrl.initialized) {
-    // 所有模块已初始化，输出测试阶段需要的4个数据
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":%d,\"s\":%.3f}\n",
+    // 所有模块已初始化，输出M2阶段需要的6个数据
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":%d,\"s\":%.3f,\"a\":%.2f,\"ar\":%.2f}\n",
                   millis(),
                   hipStatus.angleDeg,  // hip_raw
                   hipProcessor.hip_f,  // hip_f
                   hipProcessor.hip_vel_f,  // hip_vel_f
                   gaitPhaseDetector.currentPhase,  // phase
-                  swingProgress.swing_progress);  // swing_progress
+                  swingProgress.swing_progress,  // swing_progress
+                  ankleStatus.angleDeg,  // ankle_deg
+                  getAnkleReferenceAngle());  // ankle_ref (theta_ref)
   } else if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized) {
     // 如果信号处理器、阈值和相位识别已初始化但摆动进度未初始化
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":%d,\"s\":0.0}\n",
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":%d,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f}\n",
                   millis(),
                   hipStatus.angleDeg,
                   hipProcessor.hip_f,
                   hipProcessor.hip_vel_f,
-                  gaitPhaseDetector.currentPhase);
+                  gaitPhaseDetector.currentPhase,
+                  ankleStatus.angleDeg,
+                  getAnkleReferenceAngle());
   } else if (hipProcessor.initialized && adaptiveThreshold.initialized) {
     // 如果信号处理器和阈值已初始化但相位识别未初始化
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":0,\"s\":0.0}\n",
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":0,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f}\n",
                   millis(),
                   hipStatus.angleDeg,
                   hipProcessor.hip_f,
-                  hipProcessor.hip_vel_f);
+                  hipProcessor.hip_vel_f,
+                  ankleStatus.angleDeg,
+                  getAnkleReferenceAngle());
   } else if (hipProcessor.initialized) {
     // 如果信号处理器已初始化但自适应阈值未初始化，只发送信号处理数据
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":0,\"s\":0.0}\n",
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":0,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f}\n",
                   millis(),
                   hipStatus.angleDeg,
                   hipProcessor.hip_f,
-                  hipProcessor.hip_vel_f);
+                  hipProcessor.hip_vel_f,
+                  ankleStatus.angleDeg,
+                  getAnkleReferenceAngle());
   } else {
     // 如果信号处理器未初始化，只发送基本数据
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":0.0,\"phase\":0,\"s\":0.0}\n",
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":0.0,\"phase\":0,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f}\n",
                   millis(),
                   hipStatus.angleDeg,
-                  hipStatus.angleDeg);  // 如果未初始化，使用原始值作为滤波值
+                  hipStatus.angleDeg,  // 如果未初始化，使用原始值作为滤波值
+                  ankleStatus.angleDeg,
+                  getAnkleReferenceAngle());
   }
 }
 

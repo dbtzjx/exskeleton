@@ -77,6 +77,10 @@ class GaitDataCollector:
         self.phase_data = deque(maxlen=MAX_DATA_POINTS)  # 步态相位 (0=STANCE, 1=SWING)
         self.swing_progress_data = deque(maxlen=MAX_DATA_POINTS)  # 摆动进度 (0-1)
         
+        # M2阶段：踝关节数据存储
+        self.ankle_deg_data = deque(maxlen=MAX_DATA_POINTS)  # 踝关节角度 (deg)
+        self.ankle_ref_data = deque(maxlen=MAX_DATA_POINTS)  # 踝关节参考角度 (deg)
+        
         # 步态周期数据（最新一个周期）
         self.gait_cycle_time = []
         self.gait_cycle_hip = []
@@ -318,7 +322,7 @@ class GaitDataCollector:
                 if not self.data_queue.empty():
                     data = self.data_queue.get(timeout=0.1)
                     
-                    # 测试阶段：提取4个数据：hip_raw(h), hip_f(hf), hip_vel_f(hvf), phase, swing_progress(s)
+                    # M2阶段：提取6个数据：hip_raw(h), hip_f(hf), hip_vel_f(hvf), phase, swing_progress(s), ankle_deg(a), ankle_ref(ar)
                     timestamp = data.get('t', 0)  # 毫秒
                     hip_raw = data.get('h', None)   # 髋关节原始角度
                     
@@ -330,6 +334,8 @@ class GaitDataCollector:
                     hip_vel_f = data.get('hvf', None)  # 滤波后的髋速度
                     phase = data.get('phase', 0)  # 步态相位 (0=STANCE, 1=SWING)
                     swing_progress = data.get('s', 0.0)  # 摆动进度 (0-1)
+                    ankle_deg = data.get('a', None)  # 踝关节角度 (deg)
+                    ankle_ref = data.get('ar', None)  # 踝关节参考角度 (deg)
                     
                     # 存储数据（确保所有数据长度一致）
                     self.time_data.append(timestamp)
@@ -345,9 +351,13 @@ class GaitDataCollector:
                     self.phase_data.append(phase)
                     self.swing_progress_data.append(swing_progress)
                     
+                    # M2阶段：存储踝关节数据（确保长度一致）
+                    self.ankle_deg_data.append(ankle_deg if ankle_deg is not None else None)
+                    self.ankle_ref_data.append(ankle_ref if ankle_ref is not None else None)
+                    
                     # 如果步态模块未启用，也需要存储踝关节数据（如果存在）
                     if not self.gait_module_enabled:
-                        ankle_angle = data.get('a', 0.0)  # 度（测试阶段可能不存在）
+                        ankle_angle = ankle_deg if ankle_deg is not None else 0.0  # 度（测试阶段可能不存在）
                         self.ankle_data.append(ankle_angle)
                 else:
                     time.sleep(0.01)  # 队列为空时稍作等待
@@ -607,14 +617,14 @@ class GaitDataCollector:
     
     def get_realtime_data(self):
         """获取实时数据（用于绘图）"""
-        # 测试阶段：只返回hip_raw和hip_f用于绘图，phase和swing_progress单独获取
+        # M2阶段：返回hip_raw、hip_f和ankle_deg用于绘图，phase、swing_progress和ankle_ref单独获取
         if len(self.time_data) == 0 or len(self.hip_data) == 0:
-            return [], [], []
+            return [], [], [], []
         
         # 确保数据长度一致（取所有相关数据的最小长度）
-        min_len = min(len(self.time_data), len(self.hip_data), len(self.hip_filtered_data))
+        min_len = min(len(self.time_data), len(self.hip_data), len(self.hip_filtered_data), len(self.ankle_deg_data))
         if min_len == 0:
-            return [], [], []
+            return [], [], [], []
         
         # 转换为相对时间（从最新数据往前）
         latest_time = self.time_data[-1]
@@ -629,13 +639,22 @@ class GaitDataCollector:
             else:
                 hip_filtered.append(None)
         
-        return relative_time, hip_data, hip_filtered
+        # 提取踝关节角度（确保长度一致）
+        ankle_deg = []
+        for i in range(min_len):
+            if i < len(self.ankle_deg_data):
+                ankle_deg.append(self.ankle_deg_data[i])
+            else:
+                ankle_deg.append(None)
+        
+        return relative_time, hip_data, hip_filtered, ankle_deg
     
     def get_phase_and_progress(self):
-        """获取最新的相位和摆动进度数据（用于数字显示）"""
-        if len(self.phase_data) > 0 and len(self.swing_progress_data) > 0:
-            return self.phase_data[-1], self.swing_progress_data[-1]
-        return 0, 0.0
+        """获取最新的相位、摆动进度和踝关节参考角度数据（用于数字显示）"""
+        phase = self.phase_data[-1] if len(self.phase_data) > 0 else 0
+        swing_progress = self.swing_progress_data[-1] if len(self.swing_progress_data) > 0 else 0.0
+        ankle_ref = self.ankle_ref_data[-1] if len(self.ankle_ref_data) > 0 and self.ankle_ref_data[-1] is not None else 0.0
+        return phase, swing_progress, ankle_ref
     
     def get_signal_processing_data(self):
         """获取信号处理数据（用于调试窗口）"""
@@ -860,21 +879,27 @@ class GaitDataCollectorGUI:
         main_frame.columnconfigure(1, weight=1)
         main_frame.rowconfigure(0, weight=1)
         
-        # 测试阶段：添加状态显示区域（显示phase和swing_progress）
+        # M2阶段：添加状态显示区域（显示phase、swing_progress和ankle_ref，三个控件放在一行，调小尺寸）
         status_frame = ttk.Frame(plot_frame)
         status_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
         
-        # 步态相位显示
-        ttk.Label(status_frame, text="步态相位:", font=('', 12, 'bold')).grid(row=0, column=0, padx=10, pady=5)
-        self.phase_label = tk.Label(status_frame, text="STANCE", font=('Arial', 24, 'bold'), 
-                                     bg='#E0E0E0', fg='#0066CC', width=12, relief=tk.RAISED, bd=3)
-        self.phase_label.grid(row=0, column=1, padx=10, pady=5)
+        # 步态相位显示（调小尺寸）
+        ttk.Label(status_frame, text="步态相位:", font=('', 10, 'bold')).grid(row=0, column=0, padx=5, pady=3)
+        self.phase_label = tk.Label(status_frame, text="STANCE", font=('Arial', 16, 'bold'), 
+                                     bg='#E0E0E0', fg='#0066CC', width=8, relief=tk.RAISED, bd=2)
+        self.phase_label.grid(row=0, column=1, padx=5, pady=3)
         
-        # 摆动进度显示
-        ttk.Label(status_frame, text="摆动进度:", font=('', 12, 'bold')).grid(row=0, column=2, padx=10, pady=5)
-        self.swing_progress_label = tk.Label(status_frame, text="0.000", font=('Arial', 24, 'bold'), 
-                                              bg='#E0E0E0', fg='#CC6600', width=12, relief=tk.RAISED, bd=3)
-        self.swing_progress_label.grid(row=0, column=3, padx=10, pady=5)
+        # 摆动进度显示（调小尺寸）
+        ttk.Label(status_frame, text="摆动进度:", font=('', 10, 'bold')).grid(row=0, column=2, padx=5, pady=3)
+        self.swing_progress_label = tk.Label(status_frame, text="0.000", font=('Arial', 16, 'bold'), 
+                                              bg='#E0E0E0', fg='#CC6600', width=8, relief=tk.RAISED, bd=2)
+        self.swing_progress_label.grid(row=0, column=3, padx=5, pady=3)
+        
+        # 踝关节参考角度显示（调小尺寸）
+        ttk.Label(status_frame, text="踝参考角:", font=('', 10, 'bold')).grid(row=0, column=4, padx=5, pady=3)
+        self.ankle_ref_label = tk.Label(status_frame, text="0.00", font=('Arial', 16, 'bold'), 
+                                         bg='#E0E0E0', fg='#006600', width=8, relief=tk.RAISED, bd=2)
+        self.ankle_ref_label.grid(row=0, column=5, padx=5, pady=3)
         
         # 创建matplotlib图表
         self.fig = Figure(figsize=(10, 8), dpi=100)
@@ -1473,27 +1498,30 @@ class GaitDataCollectorGUI:
             # 兼容性：如果尚未创建，则创建一次
             self.ax1_right = self.ax1.twinx()
         
-        # 测试阶段：更新相位和摆动进度显示
-        phase, swing_progress = self.collector.get_phase_and_progress()
+        # M2阶段：更新相位、摆动进度和ankle_ref显示
+        phase, swing_progress, ankle_ref = self.collector.get_phase_and_progress()
         if hasattr(self, 'phase_label'):
             phase_text = "SWING" if phase == 1 else "STANCE"
             phase_color = '#CC6600' if phase == 1 else '#0066CC'
             self.phase_label.config(text=phase_text, fg=phase_color)
         if hasattr(self, 'swing_progress_label'):
             self.swing_progress_label.config(text=f"{swing_progress:.3f}")
+        if hasattr(self, 'ankle_ref_label'):
+            self.ankle_ref_label.config(text=f"{ankle_ref:.2f}")
         
-        # 测试阶段：只显示hip_raw和hip_f
-        time_data, hip_data, hip_filtered = self.collector.get_realtime_data()
+        # M2阶段：显示hip_raw、hip_f和ankle_deg
+        time_data, hip_data, hip_filtered, ankle_deg = self.collector.get_realtime_data()
         
         # 调试：检查数据长度
         if len(time_data) > 0:
             # 确保数据长度一致
-            min_len = min(len(time_data), len(hip_data), len(hip_filtered) if hip_filtered else 0)
+            min_len = min(len(time_data), len(hip_data), len(hip_filtered) if hip_filtered else 0, len(ankle_deg) if ankle_deg else 0)
             if min_len > 0:
                 # 截取到最小长度
                 time_data = time_data[:min_len]
                 hip_data = hip_data[:min_len]
                 hip_filtered = hip_filtered[:min_len] if hip_filtered else []
+                ankle_deg = ankle_deg[:min_len] if ankle_deg else []
                 
                 # 绘制原始髋关节角度
                 self.ax1.plot(time_data, hip_data, 'b-', label='髋关节原始(hip_raw)', linewidth=1.5)
@@ -1507,7 +1535,16 @@ class GaitDataCollectorGUI:
                         valid_filtered = [hip_filtered[i] for i in valid_indices]
                         self.ax1.plot(valid_time, valid_filtered, 'r--', label='髋关节滤波(hip_f)', linewidth=1.5, alpha=0.8)
                 
-                self.ax1.set_title('实时数据（髋关节原始值和滤波值）', fontsize=12)
+                # 绘制踝关节角度（如果有有效数据）
+                if len(ankle_deg) > 0:
+                    # 找到有效数据点（不是None）
+                    valid_indices = [i for i, x in enumerate(ankle_deg) if x is not None]
+                    if len(valid_indices) > 0:
+                        valid_time = [time_data[i] for i in valid_indices]
+                        valid_ankle = [ankle_deg[i] for i in valid_indices]
+                        self.ax1.plot(valid_time, valid_ankle, 'g-', label='踝关节角度(ankle_deg)', linewidth=1.5, alpha=0.8)
+                
+                self.ax1.set_title('实时数据（髋关节原始值、滤波值和踝关节角度）', fontsize=12)
                 self.ax1.set_xlabel('时间 (秒)')
                 self.ax1.set_ylabel('角度 (度)', color='black')
                 self.ax1.grid(True)
