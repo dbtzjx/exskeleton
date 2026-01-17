@@ -288,8 +288,11 @@ void updateGaitPhaseDetector() {
   float V_dn = adaptiveThreshold.V_dn;
   
   // 检查相位转换条件
-  bool swingConditionMet = (hip_vel_f > V_up) && (hip_f > hip_mean + A_up);
-  bool stanceConditionMet = (hip_vel_f < V_dn) && (hip_f < hip_mean - A_dn);
+  // 修正：swing和stance的条件判断反了，需要互换
+  // STANCE（支撑相）：脚在地面上，髋关节向前摆动，角度增大、速度为正
+  // SWING（摆动相）：脚在空中，髋关节向后摆动，角度减小、速度为负
+  bool swingConditionMet = (hip_vel_f < V_dn) && (hip_f < hip_mean - A_dn);  // 速度小且角度小 -> SWING
+  bool stanceConditionMet = (hip_vel_f > V_up) && (hip_f > hip_mean + A_up);  // 速度大且角度大 -> STANCE
   
   // 根据当前相位和条件，更新防抖计时器
   if (gaitPhaseDetector.currentPhase == PHASE_STANCE) {
@@ -1108,16 +1111,16 @@ void handleCanMessage(const CAN_message_t &msg) {
         }
         
         // 简化输出：只显示角度数据
-        if (motor->id == 1) {
-          Serial.printf("Hip: %.2f deg\n", status->angleDeg);
-        } else {
-          if (ankle_zero_calibrated) {
-            Serial.printf("Ankle: %.2f deg (calibrated, offset=%lld)\n", 
-                         status->angleDeg, static_cast<long long>(ankle_zero_offset));
-          } else {
-            Serial.printf("Ankle: %.2f deg (raw, NOT calibrated!)\n", status->angleDeg);
-          }
-        }
+        // if (motor->id == 1) {
+        //   Serial.printf("Hip: %.2f deg\n", status->angleDeg);
+        // } else {
+        //   if (ankle_zero_calibrated) {
+        //     Serial.printf("Ankle: %.2f deg (calibrated, offset=%lld)\n", 
+        //                  status->angleDeg, static_cast<long long>(ankle_zero_offset));
+        //   } else {
+        //     Serial.printf("Ankle: %.2f deg (raw, NOT calibrated!)\n", status->angleDeg);
+        //   }
+        // }
       }
       else if (cmd == CMD_READ_STATUS1) {
         // 读取电机状态1回复（0x9A）
@@ -2144,16 +2147,17 @@ void processSerialCommand() {
         float V_up = adaptiveThreshold.V_up;
         float V_dn = adaptiveThreshold.V_dn;
         
-        bool swingConditionMet = (hip_vel_f > V_up) && (hip_f > hip_mean + A_up);
-        bool stanceConditionMet = (hip_vel_f < V_dn) && (hip_f < hip_mean - A_dn);
+        // 修正：swing和stance的条件判断反了，需要互换
+        bool swingConditionMet = (hip_vel_f < V_dn) && (hip_f < hip_mean - A_dn);  // 速度小且角度小 -> SWING
+        bool stanceConditionMet = (hip_vel_f > V_up) && (hip_f > hip_mean + A_up);  // 速度大且角度大 -> STANCE
         
         Serial.printf(">>>   Current hip_f: %.2f deg\n", hip_f);
         Serial.printf(">>>   Current hip_vel_f: %.2f deg/s\n", hip_vel_f);
         Serial.printf(">>>   hip_mean: %.2f deg\n", hip_mean);
-        Serial.printf(">>>   Swing condition (vel>%.1f && angle>%.2f): %s\n", 
-                     V_up, hip_mean + A_up, swingConditionMet ? "YES" : "NO");
-        Serial.printf(">>>   Stance condition (vel<%.1f && angle<%.2f): %s\n", 
-                     V_dn, hip_mean - A_dn, stanceConditionMet ? "YES" : "NO");
+        Serial.printf(">>>   Swing condition (vel<%.1f && angle<%.2f): %s\n", 
+                     V_dn, hip_mean - A_dn, swingConditionMet ? "YES" : "NO");
+        Serial.printf(">>>   Stance condition (vel>%.1f && angle>%.2f): %s\n", 
+                     V_up, hip_mean + A_up, stanceConditionMet ? "YES" : "NO");
       }
       // 显示摆动进度信息
       if (swingProgress.initialized) {
