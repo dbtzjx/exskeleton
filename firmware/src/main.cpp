@@ -464,7 +464,7 @@ float getCurrentSwingDuration() {
 
 // 辅助策略参数
 #define ANKLE_THETA_LOW  2.0f   // 背屈窗口下限（度）
-#define ANKLE_THETA_HIGH 8.0f   // 背屈窗口上限（度）
+#define ANKLE_THETA_HIGH 6.0f   // 背屈窗口上限（度）
 #define ANKLE_THETA_MIN  -15.0f // 安全限位下限（跖屈，度）
 #define ANKLE_THETA_MAX  15.0f  // 安全限位上限（背屈，度）
 
@@ -1023,6 +1023,7 @@ void sendPositionCommandWithSpeed(const MotorConfig &motor, float targetDeg, uin
   //               motor.name, targetDeg, maxSpeed);
   // Serial.printf(">>> %s: target = %.2f deg (%ld units), maxSpeed = %u dps (CMD=0xA4)\n", 
   //               motor.name, targetDeg, static_cast<long>(targetUnits), maxSpeed);
+
 }
 
 // ============================================================================
@@ -1938,6 +1939,17 @@ void updateGaitCollection() {
 // 主循环控制函数前向声明
 // ============================================================================
 
+// 控制循环状态结构体（提前定义，供processSerialCommand使用）
+struct ControlLoop {
+  uint32_t lastControlMs;      // 上次控制循环时间（毫秒）
+  uint32_t controlIntervalMs;  // 控制周期（毫秒），100Hz = 10ms
+  bool controlEnabled;          // 是否启用控制循环
+  uint32_t controlCount;        // 控制循环计数（用于调试）
+};
+
+// 控制循环变量（提前声明，定义在后面）
+extern ControlLoop controlLoop;
+
 void setControlLoopEnabled(bool enabled);
 void updateControlLoop();
 
@@ -2394,6 +2406,13 @@ void processSerialCommand() {
     Serial.println("Control Loop: ctrlon / ctrloff (enable/disable 100Hz control loop)");
     Serial.println("Help:    h, help");
   }
+  else if (cmd == "p") {
+    Serial.println("=== System Status ===");
+    Serial.printf("Control Loop: %s\n", controlLoop.controlEnabled ? "ON" : "OFF");
+    Serial.printf("Ankle Assist: %s\n", ankleAssist.enabled ? "ON" : "OFF");
+    Serial.printf("Hip Angle: %.2f deg\n", hipStatus.angleDeg);
+    Serial.printf("Ankle Angle: %.2f deg\n", ankleStatus.angleDeg);
+  }
   else {
     Serial.printf("Unknown command: %s (type 'h' for help)\n", cmd.c_str());
   }
@@ -2440,14 +2459,7 @@ void setup() {
 // 主循环控制（100Hz控制频率）
 // ============================================================================
 
-// 控制循环状态
-struct ControlLoop {
-  uint32_t lastControlMs;      // 上次控制循环时间（毫秒）
-  uint32_t controlIntervalMs;  // 控制周期（毫秒），100Hz = 10ms
-  bool controlEnabled;          // 是否启用控制循环
-  uint32_t controlCount;        // 控制循环计数（用于调试）
-};
-
+// 控制循环变量定义（结构体定义已移到前面）
 ControlLoop controlLoop = {
   0,        // lastControlMs
   10,       // controlIntervalMs (100Hz = 10ms)
