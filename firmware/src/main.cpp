@@ -27,27 +27,88 @@ struct MotorConfig {
 MotorConfig hipMotor { 1, 3600.0f, "Hip" };
 MotorConfig ankleMotor { 2, 1000.0f, "Ankle" };
 
+// ============================================================================
+// 角度接口层：明确区分原始角和逻辑角
+// ============================================================================
+// 原始角（只在驱动层出现）：
+//   - raw_units: 协议单位（int64_t，单位 0.01°/LSB）
+//   - raw_deg_motor: 电机端角度（度，未考虑减速比）
+// 逻辑角（上层唯一允许使用）：
+//   - ankle_deg: 解剖角（0=90°中立位，背屈为正）
+//   - hip_deg: 髋逻辑角（0=定义的参考姿态）
+
 // 电机状态结构体（用于存储反馈数据）
 struct MotorStatus {
-  int64_t multiTurnAngle;  // 多圈角度（协议单位，int64_t，单位 0.01°/LSB）
-  float angleDeg;          // 转换为角度（度）
-  int16_t speed;           // 速度（dps）
-  int16_t iq;              // 电流（q轴电流，mA，用于阻力检测）
-  int8_t temperature;      // 温度（℃）
-  uint8_t motorState;      // 电机状态（0x00=开启，0x10=关闭）
-  uint8_t errorState;      // 错误状态
-  bool enabled;            // 是否使能
-  uint32_t lastUpdateMs;   // 最后更新时间
+  // ========== 原始角（驱动层） ==========
+  int64_t raw_units;           // 原始协议单位（int64_t，单位 0.01°/LSB）
+  float raw_deg_motor;         // 电机端角度（度，未考虑减速比和零点偏移）
+  
+  // ========== 逻辑角（上层接口） ==========
+  float hip_deg;               // 髋逻辑角（度，0=参考姿态）- 仅用于髋关节
+  float ankle_deg;             // 踝解剖角（度，0=90°中立位，背屈为正）- 仅用于踝关节
+  
+  // ========== 其他状态 ==========
+  int16_t speed;               // 速度（dps）
+  int16_t iq;                  // 电流（q轴电流，mA，用于阻力检测）
+  int8_t temperature;          // 温度（℃）
+  uint8_t motorState;          // 电机状态（0x00=开启，0x10=关闭）
+  uint8_t errorState;          // 错误状态
+  bool enabled;                // 是否使能
+  uint32_t lastUpdateMs;       // 最后更新时间
+  
+  // ========== 兼容性字段（保留，但标记为废弃） ==========
+  // 注意：这些字段保留用于向后兼容，但新代码应使用逻辑角接口
+  int64_t multiTurnAngle;      // [废弃] 使用 raw_units 替代
+  float angleDeg;              // [废弃] 使用 hip_deg 或 ankle_deg 替代
 };
 
-MotorStatus hipStatus = {0, 0.0f, 0, 0, 0, 0, 0, false, 0};
-MotorStatus ankleStatus = {0, 0.0f, 0, 0, 0, 0, 0, false, 0};
+MotorStatus hipStatus = {0, 0.0f, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0, 0, 0.0f};
+MotorStatus ankleStatus = {0, 0.0f, 0.0f, 0.0f, 0, 0, 0, 0, 0, false, 0, 0, 0.0f};
 
 // 踝关节零点偏移（用于标定）
 // 在用户站立自然中立位时，读取的踝电机多圈编码器角度值
 // 后续踝解剖角计算：ankle_deg = (pos_raw - ankle_zero_offset) * k_deg
 int64_t ankle_zero_offset = 0;  // 协议单位（0.01°/LSB）
 bool ankle_zero_calibrated = false;  // 是否已完成标定
+
+// 髋关节参考姿态偏移（用于定义hip_deg=0的参考位置）
+// 如果需要在特定姿态下定义hip_deg=0，可以设置此偏移
+int64_t hip_reference_offset = 0;  // 协议单位（0.01°/LSB）
+bool hip_reference_set = false;  // 是否已设置参考姿态
+
+// ============================================================================
+// 角度接口层：逻辑角获取函数（上层唯一允许使用的接口）
+// ============================================================================
+
+// 获取髋逻辑角（度，0=参考姿态）
+float getHipDeg() {
+  return hipStatus.hip_deg;
+}
+
+// 获取踝解剖角（度，0=90°中立位，背屈为正）
+float getAnkleDeg() {
+  return ankleStatus.ankle_deg;
+}
+
+// 获取髋原始协议单位（仅驱动层使用）
+int64_t getHipRawUnits() {
+  return hipStatus.raw_units;
+}
+
+// 获取踝原始协议单位（仅驱动层使用）
+int64_t getAnkleRawUnits() {
+  return ankleStatus.raw_units;
+}
+
+// 获取髋电机端角度（度，仅驱动层使用）
+float getHipRawDegMotor() {
+  return hipStatus.raw_deg_motor;
+}
+
+// 获取踝电机端角度（度，仅驱动层使用）
+float getAnkleRawDegMotor() {
+  return ankleStatus.raw_deg_motor;
+}
 
 // ============================================================================
 // 髋关节信号预处理（用于步态相位识别）
@@ -856,10 +917,41 @@ void resetComplianceFault() {
 // 工具函数
 // ============================================================================
 
-// 角度（deg）转换为协议单位（int32）
-// 协议单位：0.01°/LSB，即 1° = 100 单位
+// ============================================================================
+// 角度接口层：逻辑角转换为原始协议单位（用于控制命令）
+// ============================================================================
+// 注意：控制命令输入统一使用逻辑角（hip_deg或ankle_deg）
+// 此函数将逻辑角转换为协议单位，用于发送控制命令
+
+// 逻辑角（deg）转换为协议单位（int32）
+// 对于髋关节：逻辑角 -> 协议单位（考虑参考偏移）
+// 对于踝关节：逻辑角（解剖角） -> 协议单位（考虑零点偏移）
+int32_t logicalAngleToUnits(const MotorConfig &m, float logicalDeg) {
+  int64_t offset;
+  if (m.id == 1) {
+    // 髋关节：逻辑角 + 参考偏移 -> 协议单位
+    offset = hip_reference_offset;
+  } else if (m.id == 2) {
+    // 踝关节：逻辑角（解剖角） + 零点偏移 -> 协议单位
+    offset = ankle_zero_calibrated ? ankle_zero_offset : 0;
+  } else {
+    offset = 0;
+  }
+  
+  // 逻辑角转换为协议单位：units = logicalDeg * unitsPerDeg + offset
+  int64_t units = static_cast<int64_t>(logicalDeg * m.unitsPerDeg) + offset;
+  
+  // 限制在int32范围内
+  if (units > INT32_MAX) units = INT32_MAX;
+  if (units < INT32_MIN) units = INT32_MIN;
+  
+  return static_cast<int32_t>(units);
+}
+
+// [兼容性] 角度（deg）转换为协议单位（int32）- 保留用于向后兼容
+// 注意：新代码应使用logicalAngleToUnits()，此函数假设输入为逻辑角
 int32_t angleDegToUnits(const MotorConfig &m, float deg) {
-  return static_cast<int32_t>(deg * m.unitsPerDeg);
+  return logicalAngleToUnits(m, deg);
 }
 
 // 协议单位转换为角度（deg）
@@ -974,13 +1066,20 @@ void clearMotorError(const MotorConfig &motor) {
 // 协议格式：DATA[0]=0xA3, DATA[1-3]=NULL, DATA[4-7]=位置控制值（int32，小端序）
 // 位置控制值单位：0.01°/LSB，即 36000 代表 360°
 void sendPositionCommand(const MotorConfig &motor, float targetDeg) {
-  // 将角度转换为协议单位（根据用户文档的比例）
-  int32_t targetUnits = angleDegToUnits(motor, targetDeg);
+  // 输入：targetDeg为逻辑角（hip_deg或ankle_deg）
+  // 将逻辑角转换为协议单位（考虑零点偏移）
+  int32_t targetUnits = logicalAngleToUnits(motor, targetDeg);
   
-  // 获取当前角度（用于调试）
-  MotorStatus *status = (motor.id == 1) ? &hipStatus : &ankleStatus;
-  float currentDeg = status->angleDeg;
-  int64_t currentUnits = status->multiTurnAngle;
+  // 获取当前角度（用于调试）- 使用逻辑角接口
+  float currentDeg;
+  int64_t currentUnits;
+  if (motor.id == 1) {
+    currentDeg = getHipDeg();
+    currentUnits = getHipRawUnits();
+  } else {
+    currentDeg = getAnkleDeg();
+    currentUnits = getAnkleRawUnits();
+  }
   float diffDeg = targetDeg - currentDeg;
   
   // 协议格式：DATA[0]=0xA3, DATA[1-3]=NULL(0x00), DATA[4-7]=位置控制值(int32，小端序)
@@ -1004,7 +1103,9 @@ void sendPositionCommand(const MotorConfig &motor, float targetDeg) {
 // 发送位置控制指令（带速度限制，多圈位置闭环控制命令2，0xA4）
 // 协议格式：DATA[0]=0xA4, DATA[1]=NULL, DATA[2-3]=速度限制（uint16，小端序），DATA[4-7]=位置控制值（int32，小端序）
 void sendPositionCommandWithSpeed(const MotorConfig &motor, float targetDeg, uint16_t maxSpeed) {
-  int32_t targetUnits = angleDegToUnits(motor, targetDeg);
+  // 输入：targetDeg为逻辑角（hip_deg或ankle_deg）
+  // 将逻辑角转换为协议单位（考虑零点偏移）
+  int32_t targetUnits = logicalAngleToUnits(motor, targetDeg);
   
   // 协议格式：DATA[0]=0xA4, DATA[1]=NULL(0x00), DATA[2-3]=速度限制(uint16，小端序), DATA[4-7]=位置控制值(int32，小端序)
   uint8_t data[7];
@@ -1070,24 +1171,45 @@ void handleCanMessage(const CAN_message_t &msg) {
           angle |= ((int64_t)0xFF) << 56;
         }
         
-        status->multiTurnAngle = angle;
+        // ========== 角度接口层：更新原始角和逻辑角 ==========
+        // 1. 更新原始角（驱动层）
+        status->raw_units = angle;
+        status->raw_deg_motor = static_cast<float>(angle) / 100.0f;  // 协议单位转电机端角度（0.01°/LSB）
         
-        // 对于踝关节，如果已标定，使用零点偏移计算解剖角度
-        if (motor->id == 2 && ankle_zero_calibrated) {
-          // 踝解剖角 = (pos_raw - ankle_zero_offset) * k_deg
-          // k_deg = 1.0 / unitsPerDeg（将协议单位转换为关节角度）
-          int64_t offsetAngle = angle - ankle_zero_offset;
-          status->angleDeg = unitsToAngleDeg(*motor, offsetAngle);
+        // 2. 更新逻辑角（上层接口）
+        if (motor->id == 1) {
+          // 髋关节：计算髋逻辑角
+          // hip_deg = (raw_units - hip_reference_offset) / unitsPerDeg
+          int64_t offsetAngle = angle - hip_reference_offset;
+          status->hip_deg = unitsToAngleDeg(*motor, offsetAngle);
+          status->ankle_deg = 0.0f;  // 髋关节不使用此字段
+        } else if (motor->id == 2) {
+          // 踝关节：计算踝解剖角
+          if (ankle_zero_calibrated) {
+            // 已标定：ankle_deg = (raw_units - ankle_zero_offset) / unitsPerDeg
+            // 0 = 90°中立位，背屈为正
+            int64_t offsetAngle = angle - ankle_zero_offset;
+            status->ankle_deg = unitsToAngleDeg(*motor, offsetAngle);
+          } else {
+            // 未标定：使用原始角度（但这不是真正的解剖角）
+            status->ankle_deg = unitsToAngleDeg(*motor, angle);
+          }
+          status->hip_deg = 0.0f;  // 踝关节不使用此字段
+        }
+        
+        // ========== 兼容性字段（向后兼容） ==========
+        status->multiTurnAngle = status->raw_units;
+        if (motor->id == 1) {
+          status->angleDeg = status->hip_deg;
         } else {
-          // 未标定或髋关节，使用原始角度
-          status->angleDeg = unitsToAngleDeg(*motor, angle);
+          status->angleDeg = status->ankle_deg;
         }
         
         status->lastUpdateMs = millis();
         
         // 对于髋关节，更新信号预处理、自适应阈值、步态相位识别和摆动进度
         if (motor->id == 1) {
-          updateHipSignalProcessor(status->angleDeg);
+          updateHipSignalProcessor(status->hip_deg);
           // 使用滤波后的髋角更新自适应阈值
           if (hipProcessor.initialized) {
             updateAdaptiveThreshold(hipProcessor.hip_f);
@@ -1100,12 +1222,12 @@ void handleCanMessage(const CAN_message_t &msg) {
                 (millis() - ankleStatus.lastUpdateMs) < 200) {  // 确保踝关节数据是新鲜的
               GaitPhase currentPhase = getCurrentGaitPhase();
               float swing_progress = getSwingProgress();
-              updateAnkleAssistStrategy(ankleStatus.angleDeg, currentPhase, swing_progress);
+              updateAnkleAssistStrategy(getAnkleDeg(), currentPhase, swing_progress);
               
               // 更新顺从控制状态机（需要参考角度、电流、温度、通讯状态）
               float theta_ref = getAnkleReferenceAngle();
               bool commOk = (millis() - ankleStatus.lastUpdateMs) < COMM_TIMEOUT_MS;
-              updateComplianceController(ankleStatus.angleDeg, theta_ref, ankleStatus.iq, 
+              updateComplianceController(getAnkleDeg(), theta_ref, ankleStatus.iq, 
                                          ankleStatus.temperature, commOk);
             }
           }
@@ -1210,7 +1332,12 @@ void startSwing(SwingState &swing, const MotorConfig &motor, float amplitudeDeg)
 
   
   swing.motor = &motor;
-  swing.centerAngle = status->angleDeg;  // 以当前角度为中心
+  // 以当前逻辑角为中心
+  if (motor.id == 1) {
+    swing.centerAngle = getHipDeg();
+  } else {
+    swing.centerAngle = getAnkleDeg();
+  }
   swing.amplitude = amplitudeDeg;
   swing.currentAngle = swing.centerAngle;
   swing.direction = true;  // 先向右
@@ -1741,16 +1868,16 @@ void startGaitPlayback(float frequencyHz, float maxSpeedDps) {
     }
   }
   
-  // 保存当前位置作为摆动中心
-  gaitPlayback.centerHipAngle = hipStatus.angleDeg;
-  gaitPlayback.centerAnkleAngle = ankleStatus.angleDeg;
+  // 保存当前位置作为摆动中心（使用逻辑角）
+  gaitPlayback.centerHipAngle = getHipDeg();
+  gaitPlayback.centerAnkleAngle = getAnkleDeg();
   
   // 初始化速度平滑器
-  gaitPlayback.hipSmoother.currentPosition = hipStatus.angleDeg;
+  gaitPlayback.hipSmoother.currentPosition = getHipDeg();
   gaitPlayback.hipSmoother.currentVelocity = 0.0f;
   gaitPlayback.hipSmoother.lastUpdateMs = 0;  // 标记为未初始化
   
-  gaitPlayback.ankleSmoother.currentPosition = ankleStatus.angleDeg;
+  gaitPlayback.ankleSmoother.currentPosition = getAnkleDeg();
   gaitPlayback.ankleSmoother.currentVelocity = 0.0f;
   gaitPlayback.ankleSmoother.lastUpdateMs = 0;  // 标记为未初始化
   
@@ -1849,48 +1976,48 @@ void sendGaitData() {
     // 所有模块已初始化，输出M2阶段需要的6个数据
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":%d,\"s\":%.3f,\"a\":%.2f,\"ar\":%.2f}\n",
                   millis(),
-                  hipStatus.angleDeg,  // hip_raw
+                  getHipDeg(),  // hip_deg (逻辑角)
                   hipProcessor.hip_f,  // hip_f
                   hipProcessor.hip_vel_f,  // hip_vel_f
                   gaitPhaseDetector.currentPhase,  // phase
                   swingProgress.swing_progress,  // swing_progress
-                  ankleStatus.angleDeg,  // ankle_deg
+                  getAnkleDeg(),  // ankle_deg (逻辑角)
                   getAnkleReferenceAngle());  // ankle_ref (theta_ref)
   } else if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized) {
     // 如果信号处理器、阈值和相位识别已初始化但摆动进度未初始化
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":%d,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f}\n",
                   millis(),
-                  hipStatus.angleDeg,
+                  getHipDeg(),
                   hipProcessor.hip_f,
                   hipProcessor.hip_vel_f,
                   gaitPhaseDetector.currentPhase,
-                  ankleStatus.angleDeg,
+                  getAnkleDeg(),
                   getAnkleReferenceAngle());
   } else if (hipProcessor.initialized && adaptiveThreshold.initialized) {
     // 如果信号处理器和阈值已初始化但相位识别未初始化
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":0,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f}\n",
                   millis(),
-                  hipStatus.angleDeg,
+                  getHipDeg(),
                   hipProcessor.hip_f,
                   hipProcessor.hip_vel_f,
-                  ankleStatus.angleDeg,
+                  getAnkleDeg(),
                   getAnkleReferenceAngle());
   } else if (hipProcessor.initialized) {
     // 如果信号处理器已初始化但自适应阈值未初始化，只发送信号处理数据
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":0,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f}\n",
                   millis(),
-                  hipStatus.angleDeg,
+                  getHipDeg(),
                   hipProcessor.hip_f,
                   hipProcessor.hip_vel_f,
-                  ankleStatus.angleDeg,
+                  getAnkleDeg(),
                   getAnkleReferenceAngle());
   } else {
     // 如果信号处理器未初始化，只发送基本数据
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":0.0,\"phase\":0,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f}\n",
                   millis(),
-                  hipStatus.angleDeg,
-                  hipStatus.angleDeg,  // 如果未初始化，使用原始值作为滤波值
-                  ankleStatus.angleDeg,
+                  getHipDeg(),
+                  getHipDeg(),  // 如果未初始化，使用逻辑角作为滤波值
+                  getAnkleDeg(),
                   getAnkleReferenceAngle());
   }
 }
@@ -2021,17 +2148,17 @@ void processSerialCommand() {
   // 显示状态
   else if (cmd == "s" || cmd == "status") {
     Serial.println("\n=== Motor Status ===");
-    Serial.printf("Hip:   angle=%.2f deg (%lld units), speed=%d dps, enabled=%d, state=0x%02X\n",
-                  hipStatus.angleDeg, static_cast<long long>(hipStatus.multiTurnAngle),
+    Serial.printf("Hip:   angle=%.2f deg (logical, raw=%lld units), speed=%d dps, enabled=%d, state=0x%02X\n",
+                  getHipDeg(), static_cast<long long>(getHipRawUnits()),
                   hipStatus.speed, hipStatus.enabled, hipStatus.motorState);
-    Serial.printf("Ankle: angle=%.2f deg (%lld units), speed=%d dps, enabled=%d, state=0x%02X\n",
-                  ankleStatus.angleDeg, static_cast<long long>(ankleStatus.multiTurnAngle),
+    Serial.printf("Ankle: angle=%.2f deg (logical, raw=%lld units), speed=%d dps, enabled=%d, state=0x%02X\n",
+                  getAnkleDeg(), static_cast<long long>(getAnkleRawUnits()),
                   ankleStatus.speed, ankleStatus.enabled, ankleStatus.motorState);
     
     // 显示髋关节信号预处理状态
     if (hipProcessor.initialized) {
       Serial.println("\n=== Hip Signal Processing ===");
-      Serial.printf("Raw angle:     %.2f deg\n", hipStatus.angleDeg);
+      Serial.printf("Raw angle:     %.2f deg (logical)\n", getHipDeg());
       Serial.printf("Filtered:      %.2f deg\n", hipProcessor.hip_f);
       Serial.printf("Velocity:      %.2f deg/s\n", hipProcessor.hip_vel);
       Serial.printf("Vel filtered:  %.2f deg/s\n", hipProcessor.hip_vel_f);
@@ -2225,7 +2352,7 @@ void processSerialCommand() {
       Serial.printf(">>>     θ_min:  %.2f deg (safety limit)\n", ANKLE_THETA_MIN);
       Serial.printf(">>>     θ_max:  %.2f deg (safety limit)\n", ANKLE_THETA_MAX);
       Serial.printf(">>>   Current Values:\n");
-      Serial.printf(">>>     Current Ankle Angle: %.2f deg\n", ankleStatus.angleDeg);
+      Serial.printf(">>>     Current Ankle Angle: %.2f deg (logical)\n", getAnkleDeg());
       Serial.printf(">>>     Target Angle (S-curve): %.2f deg\n", ankleAssist.theta_target);
       Serial.printf(">>>     Reference Angle: %.2f deg\n", ankleAssist.theta_ref);
       Serial.printf(">>>     Assist Factor: %.3f (%.1f%%)\n", 
@@ -2271,9 +2398,9 @@ void processSerialCommand() {
       Serial.printf(">>>     E2 (位置误差2): %.1f deg\n", COMPLIANCE_E2);
       Serial.printf(">>>     T_resist: %lu ms\n", COMPLIANCE_T_RESIST);
       Serial.printf(">>>   Current Values:\n");
-      Serial.printf(">>>     Ankle Angle: %.2f deg\n", ankleStatus.angleDeg);
+      Serial.printf(">>>     Ankle Angle: %.2f deg (logical)\n", getAnkleDeg());
       Serial.printf(">>>     Reference Angle: %.2f deg\n", getAnkleReferenceAngle());
-      float posError = fabsf(getAnkleReferenceAngle() - ankleStatus.angleDeg);
+      float posError = fabsf(getAnkleReferenceAngle() - getAnkleDeg());
       Serial.printf(">>>     Position Error: %.2f deg\n", posError);
       Serial.printf(">>>     Current (iq): %d mA\n", ankleStatus.iq);
       float iq_abs = fabsf((float)ankleStatus.iq);
@@ -2410,8 +2537,8 @@ void processSerialCommand() {
     Serial.println("=== System Status ===");
     Serial.printf("Control Loop: %s\n", controlLoop.controlEnabled ? "ON" : "OFF");
     Serial.printf("Ankle Assist: %s\n", ankleAssist.enabled ? "ON" : "OFF");
-    Serial.printf("Hip Angle: %.2f deg\n", hipStatus.angleDeg);
-    Serial.printf("Ankle Angle: %.2f deg\n", ankleStatus.angleDeg);
+    Serial.printf("Hip Angle: %.2f deg (logical)\n", getHipDeg());
+    Serial.printf("Ankle Angle: %.2f deg (logical)\n", getAnkleDeg());
   }
   else {
     Serial.printf("Unknown command: %s (type 'h' for help)\n", cmd.c_str());
@@ -2552,7 +2679,7 @@ void updateControlLoop() {
     } else if (compState == STATE_FAULT_SAFE) {
       // 故障状态：不发送控制命令（或发送停止命令）
       // 这里可以选择不发送命令，或者发送当前位置保持命令
-      theta_ref = ankleStatus.angleDeg;  // 保持当前位置
+      theta_ref = getAnkleDeg();  // 保持当前位置（使用逻辑角）
     }
     
     // 限制参考角度在安全范围内（双重保险）
