@@ -30,7 +30,7 @@ struct MotorConfig {
 //   - 逻辑角 * dir * unitsPerDeg -> 协议单位
 //   - 协议单位 / unitsPerDeg * dir -> 逻辑角
 MotorConfig hipMotor { 1, 3600.0f, +1, "Hip" };
-MotorConfig ankleMotor { 2, 1000.0f, +1, "Ankle" };  // 默认+1，可根据实际电机方向调整
+MotorConfig ankleMotor { 2, 1000.0f, -1, "Ankle" };  // 默认+1，可根据实际电机方向调整
 
 // ============================================================================
 // 角度接口层：明确区分原始角和逻辑角
@@ -1130,10 +1130,9 @@ void sendPositionCommandWithSpeed(const MotorConfig &motor, float targetDeg, uin
   data[6] = (targetUnits >> 24) & 0xFF;  // DATA[7] = 位置控制值高字节
   
   sendCanCommand(motor.id, CMD_POSITION_CTRL2, data, 7);
-  // Serial.printf(">>> Sending position command with speed: %s, target=%.2f deg, maxSpeed=%u dps\n", 
-  //               motor.name, targetDeg, maxSpeed);
-  // Serial.printf(">>> %s: target = %.2f deg (%ld units), maxSpeed = %u dps (CMD=0xA4)\n", 
-  //               motor.name, targetDeg, static_cast<long>(targetUnits), maxSpeed);
+   Serial.printf(">>> Sending position command with speed: %s, target=%.2f deg, maxSpeed=%u dps\n", 
+                 motor.name, targetDeg, maxSpeed);
+
 
 }
 
@@ -1962,19 +1961,65 @@ void updateGaitPlayback() {
 }
 
 // ============================================================================
-// 步态数据采集功能
+// 传感器轮询定时器（独立于数据采集，负责喂数据给状态机）
+// ============================================================================
+
+// 传感器轮询状态
+struct SensorPollingTimer {
+  bool enabled;              // 是否启用轮询（在ctrlon开启时自动启用）
+  uint32_t lastPollMs;      // 上次轮询的时间
+  uint32_t pollIntervalMs;  // 轮询间隔（毫秒），建议 10-20ms
+};
+
+SensorPollingTimer sensorPolling = {false, 0, 20}; // 默认20ms间隔（50Hz）
+
+// 启动传感器轮询（在ctrlon开启时调用）
+void startSensorPolling(uint32_t intervalMs = 20) {
+  sensorPolling.enabled = true;
+  sensorPolling.pollIntervalMs = intervalMs;
+  sensorPolling.lastPollMs = millis();
+  Serial.printf(">>> Sensor polling STARTED (interval: %lu ms, %.1f Hz)\n", 
+                intervalMs, 1000.0f / intervalMs);
+}
+
+// 停止传感器轮询（在ctrloff时调用）
+void stopSensorPolling() {
+  sensorPolling.enabled = false;
+  Serial.println(">>> Sensor polling STOPPED");
+}
+
+// 更新传感器轮询（在loop中调用）
+// 负责定期请求角度和状态2，喂数据给状态机
+void updateSensorPolling() {
+  if (!sensorPolling.enabled) return;
+  
+  uint32_t now = millis();
+  
+  // 定期请求角度和状态（固定频率轮询）
+  if (now - sensorPolling.lastPollMs >= sensorPolling.pollIntervalMs) {
+    sensorPolling.lastPollMs = now;
+    
+    // 请求两个电机的角度
+    requestMotorAngle(hipMotor);
+    requestMotorAngle(ankleMotor);
+    
+    // 请求踝关节状态2（获取电流数据，用于顺从控制）
+    sendCanCommand(ankleMotor.id, CMD_READ_STATUS2, nullptr, 0, false);
+  }
+}
+
+// ============================================================================
+// 步态数据采集功能（只负责输出JSON，不再承担喂数据的职责）
 // ============================================================================
 
 // 步态数据采集状态
 struct GaitDataCollection {
-  bool enabled;              // 是否启用采集
-  uint32_t lastRequestMs;   // 上次请求角度的时间
-  uint32_t requestIntervalMs; // 请求间隔（毫秒），建议 10-50ms
+  bool enabled;              // 是否启用采集（只控制是否输出JSON）
   uint32_t lastSendMs;      // 上次发送数据的时间
   uint32_t sendIntervalMs;  // 发送间隔（毫秒），建议 10-50ms
 };
 
-GaitDataCollection gaitCollection = {false, 0, 20, 0, 20}; // 默认20ms间隔（50Hz）
+GaitDataCollection gaitCollection = {false, 0, 20}; // 默认20ms间隔（50Hz）
 
 
 // 发送步态数据到串口（JSON格式，便于上位机解析）
@@ -2032,16 +2077,15 @@ void sendGaitData() {
   }
 }
 
-// 启动/停止步态数据采集
+// 启动/停止步态数据采集（只控制是否输出JSON）
 void startGaitCollection(uint32_t intervalMs = 20) {
   gaitCollection.enabled = true;
-  gaitCollection.requestIntervalMs = intervalMs;
   gaitCollection.sendIntervalMs = intervalMs;
-  gaitCollection.lastRequestMs = 0;
   gaitCollection.lastSendMs = 0;
-  Serial.println(">>> Gait data collection STARTED");
-  Serial.printf(">>> Collection interval: %lu ms (%.1f Hz)\n", 
+  Serial.println(">>> Gait data collection STARTED (JSON output only)");
+  Serial.printf(">>> Output interval: %lu ms (%.1f Hz)\n", 
                 intervalMs, 1000.0f / intervalMs);
+  Serial.println(">>> Note: Sensor polling should be enabled separately (via ctrlon)");
 }
 
 void stopGaitCollection() {
@@ -2050,17 +2094,11 @@ void stopGaitCollection() {
 }
 
 // 更新步态数据采集（在loop中调用）
+// 只负责输出JSON，不再承担喂数据的职责
 void updateGaitCollection() {
   if (!gaitCollection.enabled) return;
   
   uint32_t now = millis();
-  
-  // 定期请求角度（如果距离上次请求超过间隔）
-  if (now - gaitCollection.lastRequestMs >= gaitCollection.requestIntervalMs) {
-    gaitCollection.lastRequestMs = now;
-    requestMotorAngle(hipMotor);
-    requestMotorAngle(ankleMotor);
-  }
   
   // 定期发送数据到串口（如果距离上次发送超过间隔，且有新数据）
   if (now - gaitCollection.lastSendMs >= gaitCollection.sendIntervalMs) {
@@ -2157,6 +2195,42 @@ void processSerialCommand() {
   }
   // 显示状态
   else if (cmd == "s" || cmd == "status") {
+    // 1. 主动请求读取两个电机当前角度和状态
+    requestMotorAngle(hipMotor);
+    requestMotorAngle(ankleMotor);
+
+    // 等待最多100ms以确保收到CAN回复（每10ms检查一次）
+    const uint32_t statusTimeoutMs = 100;
+    uint32_t t_start = millis();
+    bool hipOk = false, ankleOk = false;
+    while (millis() - t_start < statusTimeoutMs) {
+      // 处理CAN消息队列
+      CAN_message_t inMsg;
+      while (can1.read(inMsg)) {
+        handleCanMessage(inMsg);
+      }
+      // 检查数据新鲜性
+      uint32_t now = millis();
+      hipOk = (hipStatus.lastUpdateMs > 0) && ((now - hipStatus.lastUpdateMs) < 300);
+      ankleOk = (ankleStatus.lastUpdateMs > 0) && ((now - ankleStatus.lastUpdateMs) < 300);
+      if (hipOk && ankleOk) break;
+      delay(10);
+    }
+
+    // 再次确认
+    uint32_t now = millis();
+    hipOk = (hipStatus.lastUpdateMs > 0) && ((now - hipStatus.lastUpdateMs) < 300);
+    ankleOk = (ankleStatus.lastUpdateMs > 0) && ((now - ankleStatus.lastUpdateMs) < 300);
+
+    if (!hipOk || !ankleOk) {
+      Serial.println("\n[ERROR] Failed to get latest motor status! (try again)");
+      if (!hipOk) Serial.println(" - Hip motor data is NOT up to date.");
+      if (!ankleOk) Serial.println(" - Ankle motor data is NOT up to date.");
+      Serial.println("Aborted status display.");
+      return;
+    }
+
+    // 数据新鲜，输出信息
     Serial.println("\n=== Motor Status ===");
     Serial.printf("Hip:   angle=%.2f deg (logical, raw=%lld units), speed=%d dps, enabled=%d, state=0x%02X\n",
                   getHipDeg(), static_cast<long long>(getHipRawUnits()),
@@ -2164,7 +2238,7 @@ void processSerialCommand() {
     Serial.printf("Ankle: angle=%.2f deg (logical, raw=%lld units), speed=%d dps, enabled=%d, state=0x%02X\n",
                   getAnkleDeg(), static_cast<long long>(getAnkleRawUnits()),
                   ankleStatus.speed, ankleStatus.enabled, ankleStatus.motorState);
-    
+
     // 显示髋关节信号预处理状态
     if (hipProcessor.initialized) {
       Serial.println("\n=== Hip Signal Processing ===");
@@ -2176,7 +2250,7 @@ void processSerialCommand() {
       Serial.println("\n=== Hip Signal Processing ===");
       Serial.println("Not initialized (need hip angle data)");
     }
-    
+
     // 显示踝关节标定状态
     Serial.println("\n=== Ankle Calibration ===");
     if (ankle_zero_calibrated) {
@@ -2599,7 +2673,7 @@ void setup() {
 // 控制循环变量定义（结构体定义已移到前面）
 ControlLoop controlLoop = {
   0,        // lastControlMs
-  10,       // controlIntervalMs (100Hz = 10ms)
+  100,       // controlIntervalMs (100Hz = 10ms)
   false,    // controlEnabled
   0         // controlCount
 };
@@ -2611,8 +2685,12 @@ void setControlLoopEnabled(bool enabled) {
     controlLoop.lastControlMs = millis();
     controlLoop.controlCount = 0;
     Serial.println(">>> Control loop ENABLED (100Hz)");
+    // 自动启动传感器轮询（喂数据给状态机）
+    startSensorPolling(20);  // 默认20ms间隔（50Hz）
   } else {
     Serial.println(">>> Control loop DISABLED");
+    // 停止传感器轮询
+    stopSensorPolling();
   }
 }
 
@@ -2629,13 +2707,13 @@ void updateControlLoop() {
   if (elapsed < controlLoop.controlIntervalMs) {
     return;  // 还没到时间，跳过本次控制
   }
-  
+
   // 更新控制时间戳
   controlLoop.lastControlMs = now;
   controlLoop.controlCount++;
   
   // ========================================================================
-  // 1. 传感器更新（已在handleCanMessage中完成，这里确保数据新鲜）
+  // 1. 传感器更新（由传感器轮询定时器统一处理，这里只检查数据新鲜性）
   // ========================================================================
   // 检查传感器数据是否新鲜（500ms内）
   bool hipDataOk = (hipStatus.lastUpdateMs > 0) && 
@@ -2643,15 +2721,8 @@ void updateControlLoop() {
   bool ankleDataOk = (ankleStatus.lastUpdateMs > 0) && 
                      ((now - ankleStatus.lastUpdateMs) < COMM_TIMEOUT_MS);
   
-  // 如果数据不新鲜，请求更新
-  if (!hipDataOk) {
-    requestMotorAngle(hipMotor);
-  }
-  if (!ankleDataOk) {
-    requestMotorAngle(ankleMotor);
-    // 同时请求状态2以获取电流数据
-    sendCanCommand(ankleMotor.id, CMD_READ_STATUS2, nullptr, 0, false);
-  }
+  // 注意：传感器轮询由 updateSensorPolling() 统一处理，这里不再请求
+  // 如果数据不新鲜，说明传感器轮询可能有问题，但这里不处理（避免重复请求）
   
   // ========================================================================
   // 2. 相位识别（已在handleCanMessage中更新，这里确保已初始化）
@@ -2735,6 +2806,13 @@ void updateControlLoop() {
 }
 
 void loop() {
+  // static uint32_t lastBeat=0, cnt=0;
+  // cnt++;
+  // if (millis()-lastBeat>=1000){
+  //   Serial.printf("loopHz=%lu\n", cnt);
+  //   cnt=0; lastBeat=millis();
+  // }
+
   // 处理串口命令（非阻塞）
   processSerialCommand();
   
@@ -2745,6 +2823,9 @@ void loop() {
       handleCanMessage(inMsg);
     }
   }
+  
+  // 更新传感器轮询（在ctrlon开启时自动运行，喂数据给状态机）
+  updateSensorPolling();
   
   // 100Hz控制循环（仅在启用时执行）
   updateControlLoop();
