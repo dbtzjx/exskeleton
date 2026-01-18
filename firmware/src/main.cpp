@@ -1003,6 +1003,23 @@ bool sendCanCommand(uint8_t motorId, uint8_t cmd, const uint8_t *data = nullptr,
   
   // 字节0：命令字节
   msg.buf[0] = cmd;
+  // CAN总线通信保护：同一个控制器ID发送间隔需大于0.25ms
+
+  // 静态变量用于记录每个motorId上次发送时间
+  static uint32_t lastSendUs[256] = {0}; // 用于微秒级别限制
+
+  uint8_t id = CAN_CMD_BASE_ID + motorId; // 即msg.id，CAN总线控制器ID
+
+  uint32_t nowUs = micros();
+  uint32_t intervalUs = nowUs - lastSendUs[id];
+
+  // 仅对同一控制器做保护（不同控制器不检查）
+  if (lastSendUs[id] != 0 && intervalUs < 250) {
+    // 若距离上次发给同一控制器不到0.25ms（250us），则等待直到足够
+    delayMicroseconds(250 - intervalUs);
+    nowUs = micros();
+  }
+  lastSendUs[id] = nowUs;
   
   // 字节1-7：命令数据（如果有）
   if (data != nullptr && dataLen > 0) {
@@ -1010,6 +1027,7 @@ bool sendCanCommand(uint8_t motorId, uint8_t cmd, const uint8_t *data = nullptr,
     memcpy(&msg.buf[1], data, copyLen);
   }
   
+  // 尝试发送 CAN 消息，如果发送队列满则返回 false
   if (can1.write(msg)) {
     if (printDebug) {
       Serial.printf("[TX] Motor %d, CMD=0x%02X, ID=0x%03X, Data: ", motorId, cmd, msg.id);
@@ -1020,8 +1038,13 @@ bool sendCanCommand(uint8_t motorId, uint8_t cmd, const uint8_t *data = nullptr,
     }
     return true;
   } else {
-    if (printDebug) {
-      Serial.printf("[TX ERROR] Motor %d, CMD=0x%02X failed\n", motorId, cmd);
+    // 发送失败（通常是发送队列满），记录错误但不阻塞
+    static uint32_t lastErrorMs = 0;
+    uint32_t now = millis();
+    // 限制错误输出频率（每1秒最多输出一次），避免串口阻塞
+    if (now - lastErrorMs >= 1000) {
+      Serial.printf("[TX ERROR] Motor %d, CMD=0x%02X failed (TX queue full?)\n", motorId, cmd);
+      lastErrorMs = now;
     }
     return false;
   }
@@ -1062,8 +1085,9 @@ void stopMotor(const MotorConfig &motor) {
 }
 
 // 读取电机多圈角度（命令 0x92）
-void requestMotorAngle(const MotorConfig &motor) {
-  sendCanCommand(motor.id, CMD_READ_MULTI_ANGLE, nullptr, 0, false);  // 查询命令不输出TX调试信息
+// 返回：true=发送成功，false=发送失败（CAN队列满）
+bool requestMotorAngle(const MotorConfig &motor) {
+  return sendCanCommand(motor.id, CMD_READ_MULTI_ANGLE, nullptr, 0, false);  // 查询命令不输出TX调试信息
 }
 
 // 清除电机错误标志（命令 0x9B）
@@ -1112,7 +1136,8 @@ void sendPositionCommand(const MotorConfig &motor, float targetDeg) {
 
 // 发送位置控制指令（带速度限制，多圈位置闭环控制命令2，0xA4）
 // 协议格式：DATA[0]=0xA4, DATA[1]=NULL, DATA[2-3]=速度限制（uint16，小端序），DATA[4-7]=位置控制值（int32，小端序）
-void sendPositionCommandWithSpeed(const MotorConfig &motor, float targetDeg, uint16_t maxSpeed) {
+// 返回：true=发送成功，false=发送失败（CAN队列满）
+bool sendPositionCommandWithSpeed(const MotorConfig &motor, float targetDeg, uint16_t maxSpeed) {
   // 输入：targetDeg为逻辑角（hip_deg或ankle_deg）
   // 将逻辑角转换为协议单位（考虑零点偏移）
   int32_t targetUnits = logicalAngleToUnits(motor, targetDeg);
@@ -1129,11 +1154,9 @@ void sendPositionCommandWithSpeed(const MotorConfig &motor, float targetDeg, uin
   data[5] = (targetUnits >> 16) & 0xFF;   // DATA[6]
   data[6] = (targetUnits >> 24) & 0xFF;  // DATA[7] = 位置控制值高字节
   
-  sendCanCommand(motor.id, CMD_POSITION_CTRL2, data, 7);
-   Serial.printf(">>> Sending position command with speed: %s, target=%.2f deg, maxSpeed=%u dps\n", 
-                 motor.name, targetDeg, maxSpeed);
-
-
+  return sendCanCommand(motor.id, CMD_POSITION_CTRL2, data, 7);
+  //  Serial.printf(">>> Sending position command with speed: %s, target=%.2f deg, maxSpeed=%u dps\n", 
+  //                motor.name, targetDeg, maxSpeed);
 }
 
 // ============================================================================
@@ -1233,11 +1256,11 @@ void handleCanMessage(const CAN_message_t &msg) {
               float swing_progress = getSwingProgress();
               updateAnkleAssistStrategy(getAnkleDeg(), currentPhase, swing_progress);
               
-              // 更新顺从控制状态机（需要参考角度、电流、温度、通讯状态）
-              float theta_ref = getAnkleReferenceAngle();
-              bool commOk = (millis() - ankleStatus.lastUpdateMs) < COMM_TIMEOUT_MS;
-              updateComplianceController(getAnkleDeg(), theta_ref, ankleStatus.iq, 
-                                         ankleStatus.temperature, commOk);
+              // // 更新顺从控制状态机（需要参考角度、电流、温度、通讯状态）
+              // float theta_ref = getAnkleReferenceAngle();
+              // bool commOk = (millis() - ankleStatus.lastUpdateMs) < COMM_TIMEOUT_MS;
+              // updateComplianceController(getAnkleDeg(), theta_ref, ankleStatus.iq, 
+              //                            ankleStatus.temperature, commOk);
             }
           }
         }
@@ -1285,8 +1308,8 @@ void handleCanMessage(const CAN_message_t &msg) {
         status->iq = iq;  // 保存q轴电流（mA）
         status->lastUpdateMs = millis();
         
-        Serial.printf("[RX] %s: temp=%d℃, iq=%d, speed=%d dps, encoder=%u, ID=0x%03X, CMD=0x%02X\n",
-                      motor->name, temperature, iq, speed, encoder, msg.id, cmd);
+        // Serial.printf("[RX] %s: temp=%d℃, iq=%d, speed=%d dps, encoder=%u, ID=0x%03X, CMD=0x%02X\n",
+        //               motor->name, temperature, iq, speed, encoder, msg.id, cmd);
       }
       // else {
       //   // 其他回复帧
@@ -1999,12 +2022,21 @@ void updateSensorPolling() {
   if (now - sensorPolling.lastPollMs >= sensorPolling.pollIntervalMs) {
     sensorPolling.lastPollMs = now;
     
-    // 请求两个电机的角度
-    requestMotorAngle(hipMotor);
-    requestMotorAngle(ankleMotor);
+    // 请求两个电机的角度（检查发送是否成功）
+    // 如果发送失败（CAN队列满），跳过本次轮询，避免阻塞
+    if (!requestMotorAngle(ankleMotor)) {
+      // 发送失败，跳过本次轮询
+      return;
+    }
+    if (!requestMotorAngle(hipMotor)) {
+      // 发送失败，跳过本次轮询
+      return;
+    }
     
     // 请求踝关节状态2（获取电流数据，用于顺从控制）
-    sendCanCommand(ankleMotor.id, CMD_READ_STATUS2, nullptr, 0, false);
+    if (!sendCanCommand(ankleMotor.id, CMD_READ_STATUS2, nullptr, 0, false)) {
+      // 发送失败，但前两个已发送，继续执行
+    }
   }
 }
 
@@ -2086,6 +2118,7 @@ void startGaitCollection(uint32_t intervalMs = 20) {
   Serial.printf(">>> Output interval: %lu ms (%.1f Hz)\n", 
                 intervalMs, 1000.0f / intervalMs);
   Serial.println(">>> Note: Sensor polling should be enabled separately (via ctrlon)");
+  startSensorPolling(intervalMs);
 }
 
 void stopGaitCollection() {
@@ -2736,6 +2769,11 @@ void updateControlLoop() {
   
   // ========================================================================
   // 4. 安全检查（顺从控制状态机已在updateComplianceController中完成）
+  // 更新顺从控制状态机（需要参考角度、电流、温度、通讯状态）
+  float theta_ref = getAnkleReferenceAngle();
+  bool commOk = (millis() - ankleStatus.lastUpdateMs) < COMM_TIMEOUT_MS;
+  updateComplianceController(getAnkleDeg(), theta_ref, ankleStatus.iq, 
+                             ankleStatus.temperature, commOk);
   // ========================================================================
   // 安全检查已完成，获取当前状态
   ComplianceState compState = getComplianceState();
@@ -2751,7 +2789,7 @@ void updateControlLoop() {
       complianceCtrl.initialized) {
     
     // 获取参考角度
-    float theta_ref = getAnkleReferenceAngle();
+    // float theta_ref = getAnkleReferenceAngle();
     
     // 根据顺从控制状态调整参考角度
     if (compState == STATE_HOLD) {
@@ -2795,7 +2833,16 @@ void updateControlLoop() {
     }
     
     // 发送位置控制命令（带速度限制）
-    sendPositionCommandWithSpeed(ankleMotor, theta_ref, motorSpeed);
+    // 如果发送失败（CAN队列满），记录错误但不阻塞
+    if (!sendPositionCommandWithSpeed(ankleMotor, theta_ref, motorSpeed)) {
+      // 发送失败，记录错误（限制输出频率）
+      static uint32_t lastCtrlErrorMs = 0;
+      uint32_t now = millis();
+      if (now - lastCtrlErrorMs >= 1000) {
+        Serial.printf("[CTRL ERROR] Failed to send position command (TX queue full?)\n");
+        lastCtrlErrorMs = now;
+      }
+    }
     
     // 调试输出（每100次控制循环输出一次，避免串口阻塞）
     if (controlLoop.controlCount % 100 == 0) {
@@ -2817,11 +2864,16 @@ void loop() {
   processSerialCommand();
   
   // 轮询接收 CAN 帧（非阻塞）
+  // 限制每次循环最多处理的消息数量，避免阻塞其他任务
   {
     CAN_message_t inMsg;
-    while (can1.read(inMsg)) {
+    uint8_t msgCount = 0;
+    const uint8_t MAX_MSG_PER_LOOP = 10;  // 每次循环最多处理10条消息
+    while (can1.read(inMsg) && msgCount < MAX_MSG_PER_LOOP) {
       handleCanMessage(inMsg);
+      msgCount++;
     }
+    // 如果还有未处理的消息，在下次循环中处理（避免阻塞）
   }
   
   // 更新传感器轮询（在ctrlon开启时自动运行，喂数据给状态机）
