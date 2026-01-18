@@ -2059,6 +2059,16 @@ GaitDataCollection gaitCollection = {false, 0, 20}; // 默认20ms间隔（50Hz�
 void sendGaitData() {
   // M2阶段格式：{"t":时间戳(ms),"h":髋角度原始值(deg),"hf":滤波髋角(deg),"hvf":滤波髋速度(deg/s),"phase":相位(0=STANCE,1=SWING),"s":摆动进度(0-1),"a":踝角度(deg),"ar":踝参考角度(deg)}
   // 保持原有逻辑结构，只修改输出字段
+  
+  // 获取摆动进度值（如果已初始化则使用实际值，否则为0.0）
+  float swing_progress_value = swingProgress.initialized ? swingProgress.swing_progress : 0.0f;
+  
+  // 获取相位值（如果已初始化则使用实际值，否则为0）
+  int phase_value = gaitPhaseDetector.initialized ? gaitPhaseDetector.currentPhase : 0;
+  
+  // 获取踝参考角度值（如果已初始化则使用实际值，否则为0.0）
+  float ankle_ref_value = ankleAssist.initialized ? getAnkleReferenceAngle() : 0.0f;
+  
   if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized && swingProgress.initialized && ankleAssist.initialized && complianceCtrl.initialized) {
     // 所有模块已初始化，输出M2阶段需要的6个数据
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":%d,\"s\":%.3f,\"a\":%.2f,\"ar\":%.2f}\n",
@@ -2066,10 +2076,22 @@ void sendGaitData() {
                   getHipDeg(),  // hip_deg (逻辑角)
                   hipProcessor.hip_f,  // hip_f
                   hipProcessor.hip_vel_f,  // hip_vel_f
-                  gaitPhaseDetector.currentPhase,  // phase
-                  swingProgress.swing_progress,  // swing_progress
+                  phase_value,  // phase
+                  swing_progress_value,  // swing_progress
                   getAnkleDeg(),  // ankle_deg (逻辑角)
-                  getAnkleReferenceAngle());  // ankle_ref (theta_ref)
+                  ankle_ref_value);  // ankle_ref (theta_ref)
+  } else if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized && swingProgress.initialized && ankleAssist.initialized) {
+    // 如果信号处理器、阈值、相位识别、摆动进度和踝辅助已初始化，但顺从控制未初始化
+    // 仍然输出实际的摆动进度值
+    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":%d,\"s\":%.3f,\"a\":%.2f,\"ar\":%.2f}\n",
+                  millis(),
+                  getHipDeg(),
+                  hipProcessor.hip_f,
+                  hipProcessor.hip_vel_f,
+                  phase_value,
+                  swing_progress_value,  // 使用实际的摆动进度值
+                  getAnkleDeg(),
+                  ankle_ref_value);
   } else if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized) {
     // 如果信号处理器、阈值和相位识别已初始化但摆动进度未初始化
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":%d,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f}\n",
@@ -2077,9 +2099,9 @@ void sendGaitData() {
                   getHipDeg(),
                   hipProcessor.hip_f,
                   hipProcessor.hip_vel_f,
-                  gaitPhaseDetector.currentPhase,
+                  phase_value,
                   getAnkleDeg(),
-                  getAnkleReferenceAngle());
+                  ankle_ref_value);
   } else if (hipProcessor.initialized && adaptiveThreshold.initialized) {
     // 如果信号处理器和阈值已初始化但相位识别未初始化
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":0,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f}\n",
@@ -2088,7 +2110,7 @@ void sendGaitData() {
                   hipProcessor.hip_f,
                   hipProcessor.hip_vel_f,
                   getAnkleDeg(),
-                  getAnkleReferenceAngle());
+                  ankle_ref_value);
   } else if (hipProcessor.initialized) {
     // 如果信号处理器已初始化但自适应阈值未初始化，只发送信号处理数据
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"phase\":0,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f}\n",
@@ -2097,7 +2119,7 @@ void sendGaitData() {
                   hipProcessor.hip_f,
                   hipProcessor.hip_vel_f,
                   getAnkleDeg(),
-                  getAnkleReferenceAngle());
+                  ankle_ref_value);
   } else {
     // 如果信号处理器未初始化，只发送基本数据
     Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":0.0,\"phase\":0,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f}\n",
@@ -2105,7 +2127,7 @@ void sendGaitData() {
                   getHipDeg(),
                   getHipDeg(),  // 如果未初始化，使用逻辑角作为滤波值
                   getAnkleDeg(),
-                  getAnkleReferenceAngle());
+                  ankle_ref_value);
   }
 }
 
