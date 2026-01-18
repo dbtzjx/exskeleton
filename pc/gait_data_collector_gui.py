@@ -918,11 +918,26 @@ class GaitDataCollectorGUI:
         self.toolbar.update()
         self.toolbar.pack(side=tk.LEFT, fill=tk.X)
         
-        # 添加清除数据按钮
-        clear_btn = ttk.Button(toolbar_frame, text="清除数据", command=self.clear_data)
-        clear_btn.pack(side=tk.RIGHT, padx=5)
+        # 添加功能按钮
+        button_frame = ttk.Frame(toolbar_frame)
+        button_frame.pack(side=tk.RIGHT, padx=5)
         
-        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=1)
+        # 显示全部按钮（重置缩放）
+        reset_zoom_btn = ttk.Button(button_frame, text="显示全部", command=self.reset_zoom)
+        reset_zoom_btn.pack(side=tk.LEFT, padx=2)
+        
+        # 清除数据按钮
+        clear_btn = ttk.Button(button_frame, text="清除数据", command=self.clear_data)
+        clear_btn.pack(side=tk.LEFT, padx=2)
+        
+        # 获取Tkinter widget并绑定滚轮事件（优先级最高）
+        canvas_widget = self.canvas.get_tk_widget()
+        canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=1)
+        
+        # 绑定滚轮事件到Tkinter widget（Windows/Linux）
+        canvas_widget.bind('<MouseWheel>', self.on_tk_scroll)
+        canvas_widget.bind('<Button-4>', self.on_tk_scroll)  # Linux向上
+        canvas_widget.bind('<Button-5>', self.on_tk_scroll)  # Linux向下
         
         # 初始化图表
         self.setup_plots()
@@ -1118,6 +1133,23 @@ class GaitDataCollectorGUI:
             messagebox.showerror("错误", error_msg)
             self.add_history(error_msg, "信息")
     
+    def reset_zoom(self):
+        """重置图表缩放，显示全部曲线"""
+        # 重置第一个图表（实时数据）
+        self.ax1.relim()
+        self.ax1.autoscale()
+        if hasattr(self, "ax1_right") and self.ax1_right is not None:
+            self.ax1_right.relim()
+            self.ax1_right.autoscale()
+        
+        # 重置第二个图表（步态周期）
+        self.ax2.relim()
+        self.ax2.autoscale()
+        
+        # 更新图表显示
+        self.canvas.draw()
+        self.add_history("图表已重置为显示全部", "信息")
+    
     def clear_data(self):
         """清除所有采集的数据和曲线"""
         # 确认操作
@@ -1126,6 +1158,8 @@ class GaitDataCollectorGUI:
             self.collector.clear_all_data()
             # 重置周期长度缓存
             self._last_cycle_len = -1
+            # 重置缩放
+            self.reset_zoom()
             # 异步更新图表（避免阻塞主线程）
             self.root.after(0, self._force_update_plots)
             self.add_history("已清除所有采集数据", "信息")
@@ -1353,7 +1387,7 @@ class GaitDataCollectorGUI:
         self.fig.tight_layout()
     
     def setup_plot_interactions(self):
-        """设置图表交互功能（水平方向缩放和移动）"""
+        """设置图表交互功能（缩放和移动）"""
         # 鼠标状态
         self.pan_active = False
         self.zoom_active = False
@@ -1362,14 +1396,11 @@ class GaitDataCollectorGUI:
         self.xlim_backup = None
         self.ylim_backup = None
         
-        # 连接鼠标事件
+        # 连接鼠标事件（优先级高于工具栏默认行为）
+        self.scroll_cid = self.canvas.mpl_connect('scroll_event', self.on_scroll)
         self.canvas.mpl_connect('button_press_event', self.on_press)
         self.canvas.mpl_connect('button_release_event', self.on_release)
         self.canvas.mpl_connect('motion_notify_event', self.on_motion)
-        self.canvas.mpl_connect('scroll_event', self.on_scroll)
-        
-        # 启用鼠标移动事件
-        self.canvas.mpl_connect('axes_enter_event', lambda e: self.canvas.mpl_connect('motion_notify_event', self.on_motion))
     
     def on_press(self, event):
         """鼠标按下事件"""
@@ -1425,54 +1456,194 @@ class GaitDataCollectorGUI:
         
         self.canvas.draw_idle()
     
-    def on_scroll(self, event):
-        """鼠标滚轮事件（用于水平缩放）"""
-        if event.inaxes is None:
+    def on_tk_scroll(self, event):
+        """Tkinter滚轮事件处理（直接绑定到widget）"""
+        # 获取Tkinter widget
+        canvas_widget = self.canvas.get_tk_widget()
+        
+        # 获取鼠标在canvas中的坐标（相对于canvas widget）
+        x = event.x
+        y = event.y
+        
+        # 确定鼠标在哪个轴上
+        # 将Tkinter坐标转换为matplotlib display坐标
+        # 获取figure的bbox（display坐标）
+        fig_bbox = self.fig.bbox
+        if fig_bbox is None:
             return
         
-        # 获取当前X轴范围
-        if event.inaxes == self.ax1:
-            xlim = self.ax1.get_xlim()
-            ax = self.ax1
-        elif event.inaxes == self.ax2:
-            xlim = self.ax2.get_xlim()
-            ax = self.ax2
+        # 获取canvas widget的尺寸
+        widget_width = canvas_widget.winfo_width()
+        widget_height = canvas_widget.winfo_height()
+        
+        if widget_width == 1 or widget_height == 1:  # 未初始化
+            return
+        
+        # 计算figure在widget中的位置和缩放
+        fig_width = fig_bbox.width
+        fig_height = fig_bbox.height
+        
+        # 转换为figure的display坐标（像素，相对于figure左下角）
+        # 注意：Tkinter的y坐标是从上到下，matplotlib的display坐标是从下到上
+        fig_x = (x / widget_width) * fig_width
+        fig_y = fig_height - (y / widget_height) * fig_height  # 翻转y坐标
+        
+        # 检查在哪个axes中（使用axes的bbox来检查）
+        ax = None
+        ax1_bbox = self.ax1.bbox
+        ax2_bbox = self.ax2.bbox
+        
+        if ax1_bbox and ax2_bbox:
+            # 检查点是否在ax1的bbox内
+            ax1_x0, ax1_y0 = ax1_bbox.x0, ax1_bbox.y0
+            ax1_x1, ax1_y1 = ax1_bbox.x1, ax1_bbox.y1
+            
+            # 检查点是否在ax2的bbox内
+            ax2_x0, ax2_y0 = ax2_bbox.x0, ax2_bbox.y0
+            ax2_x1, ax2_y1 = ax2_bbox.x1, ax2_bbox.y1
+            
+            if ax1_x0 <= fig_x <= ax1_x1 and ax1_y0 <= fig_y <= ax1_y1:
+                ax = self.ax1
+            elif ax2_x0 <= fig_x <= ax2_x1 and ax2_y0 <= fig_y <= ax2_y1:
+                ax = self.ax2
+            else:
+                return
         else:
             return
         
-        # 计算缩放中心点（鼠标位置）
+        # 将display坐标转换为数据坐标
+        inv = ax.transData.inverted()
+        xdata, ydata = inv.transform((fig_x, fig_y))
+        
+        # 获取当前轴范围
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        
+        # 确定滚动方向
+        # Windows: event.delta (正数=向上, 负数=向下)
+        # Linux: event.num (4=向上, 5=向下)
+        if hasattr(event, 'delta'):
+            if event.delta > 0:
+                scale_factor = 1.15  # 放大
+            elif event.delta < 0:
+                scale_factor = 1.0 / 1.15  # 缩小
+            else:
+                return
+        elif hasattr(event, 'num'):
+            if event.num == 4:
+                scale_factor = 1.15  # 放大
+            elif event.num == 5:
+                scale_factor = 1.0 / 1.15  # 缩小
+            else:
+                return
+        else:
+            return
+        
+        # X轴缩放（以鼠标位置为中心）
+        x_range = xlim[1] - xlim[0]
+        if x_range <= 0:
+            return
+        new_x_range = x_range * scale_factor
+        center_ratio_x = (xdata - xlim[0]) / x_range
+        new_xlim = (
+            xdata - center_ratio_x * new_x_range,
+            xdata + (1 - center_ratio_x) * new_x_range
+        )
+        
+        # Y轴缩放（以鼠标位置为中心）
+        y_range = ylim[1] - ylim[0]
+        if y_range <= 0:
+            return
+        new_y_range = y_range * scale_factor
+        center_ratio_y = (ydata - ylim[0]) / y_range
+        new_ylim = (
+            ydata - center_ratio_y * new_y_range,
+            ydata + (1 - center_ratio_y) * new_y_range
+        )
+        
+        # 应用新的轴范围
+        ax.set_xlim(new_xlim)
+        ax.set_ylim(new_ylim)
+        
+        # 立即更新显示
+        self.canvas.draw_idle()
+    
+    def on_scroll(self, event):
+        """matplotlib滚轮事件处理（备用）"""
+        # 如果不在图表区域内，忽略
+        if event.inaxes is None:
+            return
+        
+        # 如果工具栏处于缩放或平移模式，让工具栏处理
+        if hasattr(self.toolbar, '_active') and self.toolbar._active in ['ZOOM', 'PAN']:
+            return
+        
+        # 获取当前轴
+        if event.inaxes == self.ax1:
+            ax = self.ax1
+            xlim = self.ax1.get_xlim()
+            ylim = self.ax1.get_ylim()
+        elif event.inaxes == self.ax2:
+            ax = self.ax2
+            xlim = self.ax2.get_xlim()
+            ylim = self.ax2.get_ylim()
+        else:
+            return
+        
+        # 获取鼠标位置
         xdata = event.xdata
-        if xdata is None:
+        ydata = event.ydata
+        if xdata is None or ydata is None:
             return
         
         # 计算缩放比例（向上滚动放大，向下滚动缩小）
-        scale_factor = 1.1 if event.button == 'up' else 0.9
+        # event.step: 正数=向上, 负数=向下 (更可靠的方式)
+        # event.button: 4=向上, 5=向下 (备用方式)
+        if hasattr(event, 'step'):
+            if event.step > 0:
+                scale_factor = 1.15  # 放大
+            elif event.step < 0:
+                scale_factor = 1.0 / 1.15  # 缩小
+            else:
+                return
+        elif event.button == 'up' or event.button == 4:
+            scale_factor = 1.15  # 放大
+        elif event.button == 'down' or event.button == 5:
+            scale_factor = 1.0 / 1.15  # 缩小
+        else:
+            return
         
-        # 计算新的X轴范围（以鼠标位置为中心缩放）
+        # X轴缩放（以鼠标位置为中心）
         x_range = xlim[1] - xlim[0]
+        if x_range <= 0:
+            return
         new_x_range = x_range * scale_factor
-        
-        # 计算缩放中心点相对于当前范围的位置
-        center_ratio = (xdata - xlim[0]) / x_range
-        
-        # 计算新的范围
+        center_ratio_x = (xdata - xlim[0]) / x_range
         new_xlim = (
-            xdata - center_ratio * new_x_range,
-            xdata + (1 - center_ratio) * new_x_range
+            xdata - center_ratio_x * new_x_range,
+            xdata + (1 - center_ratio_x) * new_x_range
         )
         
-        # 应用新的X轴范围
+        # Y轴缩放（以鼠标位置为中心）
+        y_range = ylim[1] - ylim[0]
+        if y_range <= 0:
+            return
+        new_y_range = y_range * scale_factor
+        center_ratio_y = (ydata - ylim[0]) / y_range
+        new_ylim = (
+            ydata - center_ratio_y * new_y_range,
+            ydata + (1 - center_ratio_y) * new_y_range
+        )
+        
+        # 应用新的轴范围
         ax.set_xlim(new_xlim)
+        ax.set_ylim(new_ylim)
         
-        # Y轴保持不变
-        if event.inaxes == self.ax1:
-            ylim = self.ax1.get_ylim()
-            self.ax1.set_ylim(ylim)
-        elif event.inaxes == self.ax2:
-            ylim = self.ax2.get_ylim()
-            self.ax2.set_ylim(ylim)
-        
+        # 立即更新显示
         self.canvas.draw_idle()
+        
+        # 阻止事件继续传播（避免工具栏的默认处理）
+        return True
     
     def update_plots(self):
         """更新图表（统一数据采集，根据显示模式切换内容）"""
