@@ -532,7 +532,7 @@ float getCurrentSwingDuration() {
 #define ANKLE_THETA_LOW  2.0f   // 背屈窗口下限（度）
 #define ANKLE_THETA_HIGH 6.0f   // 背屈窗口上限（度）
 #define ANKLE_THETA_MIN  -15.0f // 安全限位下限（跖屈，度）
-#define ANKLE_THETA_MAX  15.0f  // 安全限位上限（背屈，度）
+#define ANKLE_THETA_MAX  40.0f  // 安全限位上限（背屈，度）- swing相时背屈角度为40度
 
 // 踝背屈辅助状态
 struct AnkleAssistController {
@@ -1014,9 +1014,9 @@ bool sendCanCommand(uint8_t motorId, uint8_t cmd, const uint8_t *data = nullptr,
   uint32_t intervalUs = nowUs - lastSendUs[id];
 
   // 仅对同一控制器做保护（不同控制器不检查）
-  if (lastSendUs[id] != 0 && intervalUs < 250) {
+  if (lastSendUs[id] != 0 && intervalUs < 350) {
     // 若距离上次发给同一控制器不到0.25ms（250us），则等待直到足够
-    delayMicroseconds(250 - intervalUs);
+    delayMicroseconds(350 - intervalUs);
     nowUs = micros();
   }
   lastSendUs[id] = nowUs;
@@ -1153,10 +1153,21 @@ bool sendPositionCommandWithSpeed(const MotorConfig &motor, float targetDeg, uin
   data[4] = (targetUnits >> 8) & 0xFF;    // DATA[5]
   data[5] = (targetUnits >> 16) & 0xFF;   // DATA[6]
   data[6] = (targetUnits >> 24) & 0xFF;  // DATA[7] = 位置控制值高字节
+
+  // INSERT_YOUR_CODE
+  // 以1Hz频率打印A4指令和目标角度、速度
+  {
+    static uint32_t lastA4PrintMs = 0;
+    uint32_t now = millis();
+    if (now - lastA4PrintMs >= 1000) {
+      lastA4PrintMs = now;
+      Serial.printf("[A4 CMD] %s: target=%.2f deg, speed=%u dps\n", 
+                    motor.name, targetDeg, maxSpeed);
+    }
+  }
   
   return sendCanCommand(motor.id, CMD_POSITION_CTRL2, data, 7);
-  //  Serial.printf(">>> Sending position command with speed: %s, target=%.2f deg, maxSpeed=%u dps\n", 
-  //                motor.name, targetDeg, maxSpeed);
+  
 }
 
 // ============================================================================
@@ -2175,6 +2186,8 @@ struct ControlLoop {
   uint32_t controlIntervalMs;  // 控制周期（毫秒），100Hz = 10ms
   bool controlEnabled;          // 是否启用控制循环
   uint32_t controlCount;        // 控制循环计数（用于调试）
+  bool ankleTorqueReleased;    // 当前是否已经在 stance 里 STOP 过
+  GaitPhase prevPhase;          // 用于检测相位边沿
 };
 
 // 控制循环变量（提前声明，定义在后面）
@@ -2306,6 +2319,15 @@ void processSerialCommand() {
       Serial.println("Not initialized (need hip angle data)");
     }
 
+    // 显示髋关节标定状态
+    Serial.println("\n=== Hip Calibration ===");
+    if (hip_reference_set) {
+      Serial.printf("Calibrated: YES (offset=%lld units)\n", 
+                   static_cast<long long>(hip_reference_offset));
+    } else {
+      Serial.println("Calibrated: NO (use 'hz' command to calibrate)");
+    }
+
     // 显示踝关节标定状态
     Serial.println("\n=== Ankle Calibration ===");
     if (ankle_zero_calibrated) {
@@ -2391,6 +2413,34 @@ void processSerialCommand() {
       Serial.println(">>> 0 deg = foot at 90° to shank (neutral position)");
     } else {
       Serial.println("ERROR: Failed to read ankle angle. Please try again.");
+    }
+  }
+  // 髋关节零点标定命令：hz（hip zero）
+  // 在用户站立自然中立位时执行，将当前髋关节角度设为0度（参考姿态）
+  else if (cmd == "hz" || cmd == "hipzero") {
+    // 先读取当前髋关节角度
+    requestMotorAngle(hipMotor);
+    delay(50);  // 等待回复
+    {
+      CAN_message_t inMsg;
+      while (can1.read(inMsg)) {
+        handleCanMessage(inMsg);
+      }
+    }
+    
+    // 如果成功读取到角度，保存为参考姿态偏移
+    if (hipStatus.lastUpdateMs > 0 && 
+        (millis() - hipStatus.lastUpdateMs) < 200) {  // 确保数据是新鲜的
+      hip_reference_offset = hipStatus.raw_units;
+      hip_reference_set = true;
+      Serial.println(">>> Hip zero calibration SUCCESS");
+      Serial.printf(">>> Reference offset: %lld units (%.2f deg)\n", 
+                   static_cast<long long>(hip_reference_offset),
+                   unitsToAngleDeg(hipMotor, hip_reference_offset));
+      Serial.println(">>> Hip angle will now be calculated relative to this reference position");
+      Serial.println(">>> 0 deg = reference posture");
+    } else {
+      Serial.println("ERROR: Failed to read hip angle. Please try again.");
     }
   }
   // 自适应阈值调试命令：th（threshold）
@@ -2662,6 +2712,7 @@ void processSerialCommand() {
     Serial.println("Gait Playback: gp <freq> <speed>, gps (gait playback start/stop)");
     Serial.println("Load Gait: loadgait (load trajectory from JSON)");
     Serial.println("Ankle Zero: az (ankle zero calibration)");
+    Serial.println("Hip Zero:   hz (hip zero calibration)");
     Serial.println("Threshold:  th (show adaptive threshold status)");
     Serial.println("Gait Phase: phase (show gait phase detection status)");
     Serial.println("Swing Progress: swing (show swing progress status)");
@@ -2728,9 +2779,11 @@ void setup() {
 // 控制循环变量定义（结构体定义已移到前面）
 ControlLoop controlLoop = {
   0,        // lastControlMs
-  100,       // controlIntervalMs (100Hz = 10ms)
+  10,       // controlIntervalMs (100Hz = 10ms)
   false,    // controlEnabled
-  0         // controlCount
+  0,        // controlCount
+  false,    // ankleTorqueReleased
+  PHASE_STANCE  // prevPhase
 };
 
 // 启用/禁用控制循环
@@ -2780,9 +2833,28 @@ void updateControlLoop() {
   // 如果数据不新鲜，说明传感器轮询可能有问题，但这里不处理（避免重复请求）
   
   // ========================================================================
-  // 2. 相位识别（已在handleCanMessage中更新，这里确保已初始化）
+  // 2. 相位识别和相位边沿检测（相位门控）
   // ========================================================================
-  // 相位识别在handleCanMessage中自动更新，这里只需要检查是否已初始化
+  // 获取当前相位
+  GaitPhase currentPhase = gaitPhaseDetector.initialized ? 
+                           gaitPhaseDetector.currentPhase : PHASE_STANCE;
+  
+  // 相位边沿处理：检测相位变化
+  if (currentPhase != controlLoop.prevPhase) {
+    // 相位发生变化
+    if (currentPhase == PHASE_STANCE && controlLoop.prevPhase == PHASE_SWING) {
+      // 从 SWING 进入 STANCE：发送 STOP，释放力矩
+      stopMotor(ankleMotor);
+      controlLoop.ankleTorqueReleased = true;
+      Serial.printf("[PHASE] SWING -> STANCE: STOP sent, torque released\n");
+    } else if (currentPhase == PHASE_SWING && controlLoop.prevPhase == PHASE_STANCE) {
+      // 从 STANCE 进入 SWING：重置标志，准备恢复 A4 控制
+      controlLoop.ankleTorqueReleased = false;
+      Serial.printf("[PHASE] STANCE -> SWING: torque release flag reset, A4 ready\n");
+    }
+    // 更新上一相位
+    controlLoop.prevPhase = currentPhase;
+  }
   
   // ========================================================================
   // 3. 辅助计算（已在handleCanMessage中更新）
@@ -2800,16 +2872,59 @@ void updateControlLoop() {
   // 安全检查已完成，获取当前状态
   ComplianceState compState = getComplianceState();
   float speedFactor = getComplianceSpeedFactor();
+
+  // ========================================================================
+  // 状态打印（1Hz频率）
+  // ========================================================================
+  {
+    static uint32_t lastStatusPrintMs = 0;
+    uint32_t now = millis();
+    if (now - lastStatusPrintMs >= 1000) {  // 1Hz = 1000ms
+      lastStatusPrintMs = now;
+      
+      // 获取相位字符串
+      const char* phaseStr = gaitPhaseDetector.initialized ? 
+        (gaitPhaseDetector.currentPhase == PHASE_SWING ? "SWING" : "STANCE") : "UNKNOWN";
+      
+      // 获取状态字符串
+      const char* stateStr;
+      switch (compState) {
+        case STATE_NORMAL: stateStr = "NORMAL"; break;
+        case STATE_COMPLIANT: stateStr = "COMPLIANT"; break;
+        case STATE_HOLD: stateStr = "HOLD"; break;
+        case STATE_FAULT_SAFE: stateStr = "FAULT_SAFE"; break;
+        default: stateStr = "UNKNOWN"; break;
+      }
+      
+      // 计算位置误差
+      float ankle_deg = getAnkleDeg();
+      float err = ankle_deg - theta_ref;
+      
+      // 打印状态
+      Serial.printf("[STATUS] phase=%s, ankle_ref=%.2f, ankle_deg=%.2f, err=%.2f, iq=%d, "
+                    "ctrlon=%d, ankleOk=%d, hipOk=%d, enabled=%d, init=%d, state=%s, factor=%.2f\n",
+                    phaseStr, theta_ref, ankle_deg, err, ankleStatus.iq,
+                    controlLoop.controlEnabled ? 1 : 0,
+                    ankleDataOk ? 1 : 0,
+                    hipDataOk ? 1 : 0,
+                    ankleAssist.enabled ? 1 : 0,
+                    complianceCtrl.initialized ? 1 : 0,
+                    stateStr, speedFactor);
+    }
+  }
   
   // ========================================================================
   // 5. 下发控制命令（仅在辅助启用且数据有效时）
   // ========================================================================
-  if (ankleAssist.enabled && ankleAssist.initialized && 
-      ankleDataOk && hipDataOk &&
-      hipProcessor.initialized && adaptiveThreshold.initialized &&
-      gaitPhaseDetector.initialized && swingProgress.initialized &&
-      complianceCtrl.initialized) {
-    
+  // 相位门控：STANCE 时不发 A4（如果已经 STOP 过）
+  bool shouldSendA4 = ankleAssist.enabled && ankleAssist.initialized && 
+                       ankleDataOk && hipDataOk &&
+                       hipProcessor.initialized && adaptiveThreshold.initialized &&
+                       gaitPhaseDetector.initialized && swingProgress.initialized &&
+                       complianceCtrl.initialized &&
+                       !controlLoop.ankleTorqueReleased;  // STANCE 时已 STOP，不再发 A4
+  
+  if (shouldSendA4) {
     // 获取参考角度
     // float theta_ref = getAnkleReferenceAngle();
     
@@ -2854,7 +2969,7 @@ void updateControlLoop() {
       motorSpeed = 5;
     }
     
-    // 发送位置控制命令（带速度限制）
+    // 发送位置控制命令（带速度限制，A4）
     // 如果发送失败（CAN队列满），记录错误但不阻塞
     if (!sendPositionCommandWithSpeed(ankleMotor, theta_ref, motorSpeed)) {
       // 发送失败，记录错误（限制输出频率）

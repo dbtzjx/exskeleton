@@ -720,7 +720,6 @@ class GaitDataCollectorGUI:
         
         # 按钮状态跟踪
         self.gait_collection_enabled = False  # 步态采集状态
-        self.assist_enabled = False  # 辅助启用状态
         self.control_loop_enabled = False  # 控制循环启用状态
         
         # 创建界面
@@ -816,11 +815,9 @@ class GaitDataCollectorGUI:
         self.gait_collection_btn.grid(row=1, column=0, padx=2, pady=2)
         
         # 第二行：新增按钮
-        ttk.Button(cmd_frame, text="踝关节零点", command=lambda: self.send_command_text("az"), width=10).grid(row=1, column=1, padx=2, pady=2)
-        self.assist_btn = ttk.Button(cmd_frame, text="启用辅助", command=self.toggle_assist, width=10)
-        self.assist_btn.grid(row=1, column=2, padx=2, pady=2)
+        ttk.Button(cmd_frame, text="站立初始化", command=self.send_stand_init, width=10).grid(row=1, column=1, padx=2, pady=2)
         self.control_loop_btn = ttk.Button(cmd_frame, text="启用控制循环", command=self.toggle_control_loop, width=12)
-        self.control_loop_btn.grid(row=1, column=3, padx=2, pady=2)
+        self.control_loop_btn.grid(row=1, column=2, padx=2, pady=2)
         
         # 第三行：重置故障
         ttk.Button(cmd_frame, text="重置故障", command=lambda: self.send_command_text("resetfault"), width=10).grid(row=2, column=0, padx=2, pady=2)
@@ -1885,36 +1882,29 @@ class GaitDataCollectorGUI:
                 self.add_history(error_msg, "信息")
                 messagebox.showerror("错误", str(e))
     
-    def toggle_assist(self):
-        """切换辅助启用/禁用"""
+    def send_stand_init(self):
+        """发送站立初始化指令（hz 和 az）"""
         if not self.collector.is_connected():
             messagebox.showerror("错误", "请先连接串口")
             return
         
-        if self.assist_enabled:
-            # 禁用辅助
-            try:
-                self.collector.send_command("assistoff")
-                self.assist_enabled = False
-                self.assist_btn.config(text="启用辅助")
-                self.add_history("assistoff", "TX")
-                self.add_history("辅助已禁用", "信息")
-            except Exception as e:
-                error_msg = f"禁用辅助失败: {str(e)}"
-                self.add_history(error_msg, "信息")
-                messagebox.showerror("错误", str(e))
-        else:
-            # 启用辅助
-            try:
-                self.collector.send_command("assiston")
-                self.assist_enabled = True
-                self.assist_btn.config(text="禁用辅助")
-                self.add_history("assiston", "TX")
-                self.add_history("辅助已启用", "信息")
-            except Exception as e:
-                error_msg = f"启用辅助失败: {str(e)}"
-                self.add_history(error_msg, "信息")
-                messagebox.showerror("错误", str(e))
+        try:
+            # 发送髋关节零点指令
+            self.collector.send_command("hz")
+            self.add_history("hz", "TX")
+            
+            # 短暂延时后发送踝关节零点指令
+            import time
+            time.sleep(0.1)
+            
+            self.collector.send_command("az")
+            self.add_history("az", "TX")
+            
+            self.add_history("站立初始化完成", "信息")
+        except Exception as e:
+            error_msg = f"站立初始化失败: {str(e)}"
+            self.add_history(error_msg, "信息")
+            messagebox.showerror("错误", str(e))
     
     def toggle_control_loop(self):
         """切换控制循环启用/禁用"""
