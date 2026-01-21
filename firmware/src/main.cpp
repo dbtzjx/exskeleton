@@ -351,10 +351,11 @@ struct GaitPhaseDetector {
   uint32_t conditionHoldMs;        // 条件持续满足的时间（毫秒）
   bool initialized;                // 是否已初始化
   uint32_t lastUpdateMs;            // 上次更新时间
+  float hip_max;                   // 当前SWING周期内探测到的最大髋关节角度
 };
 
 GaitPhaseDetector gaitPhaseDetector = {
-  PHASE_STANCE, 0, 0, false, 0
+  PHASE_STANCE, 0, 0, false, 0, 0.0f
 };
 
 // 更新步态相位识别
@@ -389,6 +390,13 @@ void updateGaitPhaseDetector() {
   float hip_vel_f = hipProcessor.hip_vel_f;
   float V_up = adaptiveThreshold.V_up;
   
+  // 在SWING内实时更新本周期的最大髋角，作为空间进度分母的自适应上限
+  if (gaitPhaseDetector.currentPhase == PHASE_SWING) {
+    if (hip_f > gaitPhaseDetector.hip_max) {
+      gaitPhaseDetector.hip_max = hip_f;
+    }
+  }
+
   // ========== 基于零点的绝对+趋势判定 ==========
   // SWING条件：腿向前迈出（hip_f > 5.0°）且带有向前的速度（hip_vel_f > V_up）
   // 立刻判定为SWING，提前踝关节背屈辅助时机，有效防止拖地
@@ -413,6 +421,7 @@ void updateGaitPhaseDetector() {
       gaitPhaseDetector.currentPhase = PHASE_SWING;
       gaitPhaseDetector.phaseStartMs = now;
       gaitPhaseDetector.conditionHoldMs = 0;  // 重置计时器
+      gaitPhaseDetector.hip_max = (hip_f > 0.0f) ? hip_f : 0.0f;  // 进入SWING时重置本周期最大值
     }
   } else {
     // 当前是摆动相，检查是否满足进入支撑相的条件
@@ -428,6 +437,7 @@ void updateGaitPhaseDetector() {
       gaitPhaseDetector.currentPhase = PHASE_STANCE;
       gaitPhaseDetector.phaseStartMs = now;
       gaitPhaseDetector.conditionHoldMs = 0;  // 重置计时器
+      gaitPhaseDetector.hip_max = 0.0f;  // 退出SWING时清零，为下次周期重新探测
     }
   }
   
@@ -521,33 +531,18 @@ void updateSwingProgress() {
   GaitPhase currentPhase = gaitPhaseDetector.currentPhase;
   bool phaseChanged = (currentPhase != swingProgress.lastPhase);
   
-  // 检测相位切换（在更新t_swing之前，先保存上一次的值）
-  float lastSwingDurationSec = 0.0f;
-  if (phaseChanged && swingProgress.lastPhase == PHASE_SWING) {
-    // 如果从SWING切换到其他相位，保存当前的t_swing值
-    // 注意：此时t_swing还是上一次SWING的值（因为还没有更新）
-    lastSwingDurationSec = swingProgress.t_swing;
-  }
-  
   // 计算当前摆动进度
   if (currentPhase == PHASE_SWING) {
     // 当前是摆动相，计算进度
     uint32_t swingDurationMs = getCurrentPhaseDurationMs();
     swingProgress.t_swing = swingDurationMs / 1000.0f;  // 转换为秒
-    
-    // 计算进度：s = clamp(t_swing / Ts, 0, 1)
-    if (swingProgress.Ts > 0.001f) {  // 避免除零
-      float progress = swingProgress.t_swing / swingProgress.Ts;
-      if (progress < 0.0f) {
-        swingProgress.swing_progress = 0.0f;
-      } else if (progress > 1.0f) {
-        swingProgress.swing_progress = 1.0f;
-      } else {
-        swingProgress.swing_progress = progress;
-      }
-    } else {
-      swingProgress.swing_progress = 0.0f;
-    }
+
+    // 空间映射进度：s = hip_f / max(hip_max, 20.0f)
+    float hip_f = hipProcessor.hip_f;
+    float hip_max = gaitPhaseDetector.hip_max;
+    float denom = (hip_max > 20.0f) ? hip_max : 20.0f;  // 默认最小分母20度，避免起步初期未更新
+    float s = hip_f / denom;
+    swingProgress.swing_progress = constrain(s, 0.0f, 1.0f);
   } else {
     // 当前是支撑相，进度为0
     swingProgress.t_swing = 0.0f;
@@ -557,22 +552,6 @@ void updateSwingProgress() {
   // 处理相位切换（在更新t_swing之后）
   if (phaseChanged) {
     // 相位切换了
-    if (swingProgress.lastPhase == PHASE_SWING && currentPhase == PHASE_STANCE) {
-      // 从摆动相切换到支撑相：使用保存的摆动时长来更新平均周期
-      // 只有当摆动时长合理时才更新平均周期（避免初始化时的错误更新）
-      if (lastSwingDurationSec > 0.01f && lastSwingDurationSec < 2.0f) {  // 至少10ms，最多2s
-        // 更新平均周期：Ts = 0.8 * Ts + 0.2 * t_swing
-        swingProgress.Ts = 0.8f * swingProgress.Ts + 0.2f * lastSwingDurationSec;
-        
-        // 限制Ts在合理范围内（0.1s ~ 2.0s）
-        if (swingProgress.Ts < 0.1f) {
-          swingProgress.Ts = 0.1f;
-        } else if (swingProgress.Ts > 2.0f) {
-          swingProgress.Ts = 2.0f;
-        }
-      }
-    }
-    
     // 更新上次相位
     swingProgress.lastPhase = currentPhase;
   }

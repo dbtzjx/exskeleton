@@ -1,0 +1,32 @@
+曲线不显示问题 - 修复完成
+
+问题根源：
+--------
+update_plots() 中的绘制阈值太高（> 50个数据点）
+而实际数据更新速率每次只增长 ~13 个点
+导致 need_draw 始终为 False，canvas.draw_idle() 从不被调用
+
+修复内容：
+---------
+1. 在初始化完成后立即调用 canvas.draw_idle()
+   位置：gait_data_collector_gui.py L1813-1814
+   作用：确保首次绘制的数据能显示出来
+
+2. 降低后续更新的阈值：50 → 15
+   位置：gait_data_collector_gui.py L757, L1939
+   作用：支持低速率数据的及时更新
+
+运行方法：
+---------
+python gait_data_collector_gui.py
+
+预期结果：
+---------
+1. 终端输出："[update_plots] ✓ 首次绘制完成，已调用 draw_idle()"
+2. 图表上应显示实时曲线（蓝色线）
+3. 后续数据每增加15个点自动更新一次绘制
+
+诊断日志：
+---------
+[update_plots] 绘制决策: need_draw=True, data增量=17, cycle_changed=False, _plot_initialized=True
+                                                ↑ 数据增量 > 15 时才会重绘
