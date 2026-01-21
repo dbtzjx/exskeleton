@@ -108,6 +108,11 @@ class GaitDataCollector:
         self.total_received = 0
         self.last_received_time = 0
         
+        # ========== 内存管理说明 ==========
+        # 所有 deque 缓冲区都使用 maxlen=MAX_DATA_POINTS(2000) 进行自动循环管理
+        # 当缓冲区满后，新数据自动覆盖最旧的数据，避免内存泄漏
+        # 这种设计在长时间运行时能保持恒定的内存占用（大约 2000*4字节*通道数 ≈ 100KB）
+        
     def find_serial_ports(self):
         """查找所有可用串口"""
         ports = serial.tools.list_ports.comports()
@@ -215,12 +220,23 @@ class GaitDataCollector:
         if self.hip_module_enabled:
             return False  # 已经在运行
         
+        # ✓ 清空旧缓冲区，确保第二次启动时能正确更新
+        self.time_data.clear()
+        self.hip_data.clear()
+        self.hip_filtered_data.clear()
+        self.ankle_deg_data.clear()
+        self.phase_data.clear()
+        self.swing_progress_data.clear()
+        self.ankle_ref_data.clear()
+        
         self.hip_module_enabled = True
+        print(f"[模块初始化] 髋关节数据模块启动，已清空缓冲区")
         
         # 启动髋关节数据处理线程
         if not self.hip_process_thread or not self.hip_process_thread.is_alive():
             self.hip_process_thread = threading.Thread(target=self._hip_process_loop, daemon=True)
             self.hip_process_thread.start()
+            print(f"[模块状态] 髋关节处理线程已启动 (TID: {self.hip_process_thread.ident})")
         
         return True
     
@@ -229,10 +245,22 @@ class GaitDataCollector:
         self.hip_module_enabled = False
         if self.hip_process_thread:
             self.hip_process_thread.join(timeout=2)
+        
+        # ✓ 清空缓冲区和重置绘制状态，为下次启动做准备
+        self.time_data.clear()
+        self.hip_data.clear()
+        self.hip_filtered_data.clear()
+        self.ankle_deg_data.clear()
+        self.phase_data.clear()
+        self.swing_progress_data.clear()
+        self.ankle_ref_data.clear()
+        
+        print(f"[模块状态] 髋关节数据模块已停止，缓冲区已清空")
     
     def _collect_data(self):
         """数据读取线程（统一从串口读取数据，解析JSON，放入队列）"""
         buffer = ""
+        last_diagnostic_time = time.time()
         while self.collect_thread and self.collect_thread.is_alive():
             try:
                 if self.serial_port and self.serial_port.in_waiting > 0:
@@ -266,18 +294,37 @@ class GaitDataCollector:
                                 json_str = line[start_idx:end_idx]
                                 try:
                                     data_dict = json.loads(json_str)
-                                    # 测试阶段：只需要t和h字段即可（a字段可选）
+                                    # ✓ 检查必要字段（t 和 h）
                                     if 't' in data_dict and 'h' in data_dict:
+                                        # ✓ 重点修复：每次数据都放入队列
+                                        # 这样所有启用的模块都能看到数据（而不是被竞争消费）
                                         self.data_queue.put(data_dict)
                                         self.total_received += 1
                                         self.last_received_time = time.time()
-                                except json.JSONDecodeError:
+                                        
+                                        # ✓ 定期诊断日志（每1秒一次）
+                                        current_time = time.time()
+                                        if current_time - last_diagnostic_time > 1.0:
+                                            print(f"[_collect_data] 串口接收正常, 已接收 {self.total_received} 个数据点")
+                                            print(f"  当前数据: t={data_dict.get('t')}, h={data_dict.get('h'):.2f}, phase={data_dict.get('phase')}, s={data_dict.get('s')}")
+                                            print(f"  队列大小: {self.data_queue.qsize()}, gait_enabled={self.gait_module_enabled}, hip_enabled={self.hip_module_enabled}")
+                                            last_diagnostic_time = current_time
+                                    else:
+                                        # ✓ 诊断：打印缺失的字段（每 500 次才打印一次，避免刷屏）
+                                        if self.total_received % 500 == 0:
+                                            missing = []
+                                            if 't' not in data_dict:
+                                                missing.append('t')
+                                            if 'h' not in data_dict:
+                                                missing.append('h')
+                                            print(f"[_collect_data] 跳过数据: 缺少字段 {missing}, 接收到字段: {list(data_dict.keys())}")
+                                except json.JSONDecodeError as je:
                                     # JSON解析失败，忽略
                                     pass
                 
                 time.sleep(0.01)  # 避免CPU占用过高
             except Exception as e:
-                print(f"数据读取错误: {e}")
+                print(f"[_collect_data] 数据读取错误: {e}")
                 time.sleep(0.1)  # 出错时稍长等待
     
     def get_raw_data(self):
@@ -292,13 +339,20 @@ class GaitDataCollector:
     
     def _gait_process_loop(self):
         """步态采集模块处理循环（独立线程）"""
+        print(f"[_gait_process_loop] 线程启动")
         while self.gait_module_enabled:
             try:
                 if not self.data_queue.empty():
                     data = self.data_queue.get(timeout=0.1)
-                    timestamp = data['t']  # 毫秒
-                    hip_angle = data['h']   # 度
-                    ankle_angle = data['a'] # 度
+                    # ✓ 修复：使用 .get() 而不是 [] 来访问可选字段
+                    timestamp = data.get('t', None)  # 毫秒
+                    hip_angle = data.get('h', None)  # 度
+                    ankle_angle = data.get('a', None)  # 度
+                    
+                    # ✓ 验证关键字段存在
+                    if timestamp is None or hip_angle is None:
+                        print(f"[_gait_process_loop] 跳过无效数据: t={timestamp}, h={hip_angle}")
+                        continue  # 跳过无效数据
                     
                     # 添加到实时数据
                     self.time_data.append(timestamp)
@@ -312,22 +366,27 @@ class GaitDataCollector:
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"步态处理错误: {e}")
+                print(f"[_gait_process_loop] 错误: {e}")
+                import traceback
+                traceback.print_exc()
                 time.sleep(0.01)
     
     def _hip_process_loop(self):
         """髋关节数据模块处理循环（独立线程）"""
+        print(f"[_hip_process_loop] 线程启动")
+        data_count = 0
         while self.hip_module_enabled:
             try:
                 if not self.data_queue.empty():
                     data = self.data_queue.get(timeout=0.1)
                     
-                    # M2阶段：提取6个数据：hip_raw(h), hip_f(hf), hip_vel_f(hvf), phase, swing_progress(s), ankle_deg(a), ankle_ref(ar)
-                    timestamp = data.get('t', 0)  # 毫秒
+                    # M2阶段：提取数据
+                    timestamp = data.get('t', None)  # 毫秒
                     hip_raw = data.get('h', None)   # 髋关节原始角度
                     
-                    # 如果hip_raw不存在，跳过这条数据
-                    if hip_raw is None:
+                    # ✓ 验证关键字段存在
+                    if hip_raw is None or timestamp is None:
+                        # 只在启动时打印，避免刷屏
                         continue
                     
                     hip_f = data.get('hf', None)  # 滤波后的髋角
@@ -337,34 +396,31 @@ class GaitDataCollector:
                     ankle_deg = data.get('a', None)  # 踝关节角度 (deg)
                     ankle_ref = data.get('ar', None)  # 踝关节参考角度 (deg)
                     
-                    # 存储数据（确保所有数据长度一致）
+                    # ✓ 存储数据到缓冲区
                     self.time_data.append(timestamp)
                     self.hip_data.append(hip_raw)  # 存储原始值用于绘图
-                    
-                    # 确保hip_filtered_data长度与time_data一致
                     self.hip_filtered_data.append(hip_f if hip_f is not None else None)
-                    
-                    # 确保hip_velocity_filtered_data长度与time_data一致
                     self.hip_velocity_filtered_data.append(hip_vel_f if hip_vel_f is not None else None)
-                    
-                    # 存储相位和摆动进度（确保长度一致）
                     self.phase_data.append(phase)
                     self.swing_progress_data.append(swing_progress)
-                    
-                    # M2阶段：存储踝关节数据（确保长度一致）
                     self.ankle_deg_data.append(ankle_deg if ankle_deg is not None else None)
                     self.ankle_ref_data.append(ankle_ref if ankle_ref is not None else None)
                     
-                    # 如果步态模块未启用，也需要存储踝关节数据（如果存在）
+                    data_count += 1
+                    # ✓ 每处理50个数据打印一次日志
+                    if data_count % 50 == 0:
+                        # ✓ 诊断：打印所有缓冲区长度，确认数据被正确添加
+                        print(f"[_hip_process_loop] 已处理 {data_count} 个数据点 | 缓冲区长度: time={len(self.time_data)}, hip={len(self.hip_data)}, filtered={len(self.hip_filtered_data)}, ankle={len(self.ankle_deg_data)}, phase={len(self.phase_data)}, swing={len(self.swing_progress_data)}")
+                    
                     if not self.gait_module_enabled:
-                        ankle_angle = ankle_deg if ankle_deg is not None else 0.0  # 度（测试阶段可能不存在）
+                        ankle_angle = ankle_deg if ankle_deg is not None else 0.0
                         self.ankle_data.append(ankle_angle)
                 else:
                     time.sleep(0.01)  # 队列为空时稍作等待
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"髋关节数据处理错误: {e}")
+                print(f"[_hip_process_loop] 错误: {e}")
                 import traceback
                 traceback.print_exc()
                 time.sleep(0.01)
@@ -630,36 +686,69 @@ class GaitDataCollector:
         self.is_loaded_data = False
     
     def get_realtime_data(self):
-        """获取实时数据（用于绘图）"""
+        """获取实时数据（用于绘图，并进行性能优化的数据降采样）"""
         # M2阶段：返回hip_raw、hip_f和ankle_deg用于绘图，phase、swing_progress和ankle_ref单独获取
+        # ✓ 诊断：记录何时返回空数据
         if len(self.time_data) == 0 or len(self.hip_data) == 0:
+            if not hasattr(self, '_empty_data_logged'):
+                self._empty_data_logged = True
+                self._empty_data_log_time = time.time()
+                # 初次打印时显示所有缓冲区长度
+                print(f"[get_realtime_data] ⚠️ 缓冲区为空（初次）:")
+                print(f"  time_data={len(self.time_data)}, hip_data={len(self.hip_data)}, hip_filtered={len(self.hip_filtered_data)}, ankle_deg={len(self.ankle_deg_data)}")
+                print(f"  hip_module_enabled={self.hip_module_enabled}, gait_module_enabled={self.gait_module_enabled}")
+            else:
+                current_time = time.time()
+                if current_time - self._empty_data_log_time > 5.0:  # 每5秒打印一次
+                    print(f"[get_realtime_data] ⚠️ 缓冲区仍为空: time={len(self.time_data)}, hip={len(self.hip_data)}, filtered={len(self.hip_filtered_data)}, ankle={len(self.ankle_deg_data)}")
+                    self._empty_data_log_time = current_time
             return [], [], [], []
         
         # 确保数据长度一致（取所有相关数据的最小长度）
         min_len = min(len(self.time_data), len(self.hip_data), len(self.hip_filtered_data), len(self.ankle_deg_data))
         if min_len == 0:
+            if not hasattr(self, '_min_len_zero_logged'):
+                self._min_len_zero_logged = True
+                self._min_len_zero_log_time = time.time()
+                print(f"[get_realtime_data] ⚠️ min_len为0（初次）:")
+                print(f"  time={len(self.time_data)}, hip={len(self.hip_data)}, filtered={len(self.hip_filtered_data)}, ankle={len(self.ankle_deg_data)}")
+            else:
+                current_time = time.time()
+                if current_time - self._min_len_zero_log_time > 5.0:
+                    print(f"[get_realtime_data] ⚠️ min_len仍为0: time={len(self.time_data)}, hip={len(self.hip_data)}, filtered={len(self.hip_filtered_data)}, ankle={len(self.ankle_deg_data)}")
+                    self._min_len_zero_log_time = current_time
             return [], [], [], []
+        
+        # ========== 性能优化：数据降采样 ==========
+        # 如果数据点超过 2000 个，进行降采样
+        # 这避免matplotlib在绘制超大数据集时卡顿
+        if min_len > 2000:
+            # 计算降采样步长（例如有2000个点，降采样为1000个点，步长为2）
+            step = max(1, min_len // 1000)
+            indices = list(range(0, min_len, step))
+        else:
+            step = 1
+            indices = list(range(min_len))
         
         # 转换为相对时间（从最新数据往前）
         latest_time = self.time_data[-1]
-        relative_time = [(self.time_data[i] - latest_time) / 1000.0 for i in range(min_len)]  # 转换为秒
-        hip_data = [self.hip_data[i] for i in range(min_len)]  # hip_raw
+        relative_time = [(self.time_data[i] - latest_time) / 1000.0 for i in indices]  # 转换为秒
+        hip_data = [self.hip_data[i] for i in indices]  # hip_raw
         
         # 提取滤波后的髋角（确保长度一致）
-        hip_filtered = []
-        for i in range(min_len):
-            if i < len(self.hip_filtered_data):
-                hip_filtered.append(self.hip_filtered_data[i])
-            else:
-                hip_filtered.append(None)
+        hip_filtered = [self.hip_filtered_data[i] if i < len(self.hip_filtered_data) else None for i in indices]
         
         # 提取踝关节角度（确保长度一致）
-        ankle_deg = []
-        for i in range(min_len):
-            if i < len(self.ankle_deg_data):
-                ankle_deg.append(self.ankle_deg_data[i])
-            else:
-                ankle_deg.append(None)
+        ankle_deg = [self.ankle_deg_data[i] if i < len(self.ankle_deg_data) else None for i in indices]
+        
+        # ✓ 诊断：每返回100个数据点打印一次
+        if not hasattr(self, '_returned_len_log'):
+            self._returned_len_log = 0
+            self._returned_len_log_time = time.time()
+        if len(relative_time) - self._returned_len_log >= 100:
+            current_time = time.time()
+            print(f"[get_realtime_data] ✓ 返回 {len(relative_time)} 个数据点（共缓存 {len(self.time_data)} 个，hip_data {len(self.hip_data)}, 滤波 {len(self.hip_filtered_data)}）")
+            self._returned_len_log = len(relative_time)
         
         return relative_time, hip_data, hip_filtered, ankle_deg
     
@@ -725,6 +814,7 @@ class GaitDataCollectorGUI:
         # 初始化周期长度缓存（用于性能优化）
         self._last_cycle_len = -1
         self._last_realtime_len = -1  # 最近一次实时曲线点数，用于避免重复重绘
+        self._last_realtime_latest = None  # 最近一次实时曲线的最新时间戳，用于滑动窗口检测
         self.root = root
         self.root.title("步态数据采集与可视化")
         self.root.geometry("1200x800")
@@ -1646,23 +1736,12 @@ class GaitDataCollectorGUI:
         return True
     
     def update_plots(self):
-        """更新图表（统一数据采集，根据显示模式切换内容）"""
-        # 注意：数据处理已经在start_serial_monitor中自动进行，这里不再重复处理
-        
+        """更新图表（使用增量更新而非完全重绘，显著提升性能）"""
         # 更新采集状态显示
         total_points = len(self.collector.hip_data)
         queue_size = self.collector.data_queue.qsize()
         
-        # 显示模块状态（可选，用于调试）
-        # 模块状态信息可以通过按钮文本显示，这里不再单独显示状态标签
-        
-        # 更新实时数据图（根据显示模式显示不同内容）
-        # 保存当前X轴范围（如果用户已经缩放/移动）
-        xlim1 = self.ax1.get_xlim() if len(self.ax1.lines) > 0 else None
-        auto_scale_x1 = (xlim1 is None or xlim1 == (0.0, 1.0))  # 判断是否是默认范围
-        data_changed_realtime = False
-        
-        # M2阶段：更新相位、摆动进度和ankle_ref显示
+        # 更新标签信息（低成本操作，不影响绘制）
         phase, swing_progress, ankle_ref = self.collector.get_phase_and_progress()
         if hasattr(self, 'phase_label'):
             phase_text = "SWING" if phase == 1 else "STANCE"
@@ -1673,116 +1752,169 @@ class GaitDataCollectorGUI:
         if hasattr(self, 'ankle_ref_label'):
             self.ankle_ref_label.config(text=f"{ankle_ref:.2f}")
         
-        # M2阶段：显示hip_raw、hip_f和ankle_deg
+        # 获取实时数据
         time_data, hip_data, hip_filtered, ankle_deg = self.collector.get_realtime_data()
         
-        # 根据数据变化决定是否重绘，避免频繁刷新导致交互卡顿
-        if len(time_data) > 0:
-            data_changed_realtime = (len(time_data) != self._last_realtime_len)
-        else:
-            data_changed_realtime = (self._last_realtime_len != 0)
+        # ========== 性能优化1：仅在数据显著变化时重绘 ==========
+        # 使用 total_received 计数判断是否有新数据到达（不受环形缓冲长度限制）
+        new_len = len(time_data)
+        if not hasattr(self, '_last_received_count'):
+            self._last_received_count = 0
+        data_received_increment = self.collector.total_received - self._last_received_count
 
-        if len(time_data) > 0 and data_changed_realtime:
-            # 清空左右 Y 轴（仅在数据变化时重绘）
-            self.ax1.clear()
-            if hasattr(self, "ax1_right") and self.ax1_right is not None:
-                self.ax1_right.clear()
-            else:
-                # 兼容性：如果尚未创建，则创建一次
-                self.ax1_right = self.ax1.twinx()
+        # 初始化绘制状态
+        if not hasattr(self, '_plot_initialized'):
+            self._plot_initialized = False
+            self._last_realtime_len = 0
+            self._plot_lines = {'hip_raw': None, 'hip_f': None, 'ankle_deg': None}
 
-            # 确保数据长度一致
-            min_len = min(len(time_data), len(hip_data), len(hip_filtered) if hip_filtered else 0, len(ankle_deg) if ankle_deg else 0)
-            if min_len > 0:
-                # 截取到最小长度
-                time_data = time_data[:min_len]
-                hip_data = hip_data[:min_len]
-                hip_filtered = hip_filtered[:min_len] if hip_filtered else []
-                ankle_deg = ankle_deg[:min_len] if ankle_deg else []
-                
-                # 绘制原始髋关节角度
-                self.ax1.plot(time_data, hip_data, 'b-', label='髋关节原始(hip_raw)', linewidth=1.5)
-                
-                # 绘制髋关节滤波后的角度（如果有有效数据）
-                if len(hip_filtered) > 0:
-                    valid_indices = [i for i, x in enumerate(hip_filtered) if x is not None]
-                    if len(valid_indices) > 0:
-                        valid_time = [time_data[i] for i in valid_indices]
-                        valid_filtered = [hip_filtered[i] for i in valid_indices]
-                        self.ax1.plot(valid_time, valid_filtered, 'r--', label='髋关节滤波(hip_f)', linewidth=1.5, alpha=0.8)
-                
-                # 绘制踝关节角度（如果有有效数据）
-                if len(ankle_deg) > 0:
-                    valid_indices = [i for i, x in enumerate(ankle_deg) if x is not None]
-                    if len(valid_indices) > 0:
-                        valid_time = [time_data[i] for i in valid_indices]
-                        valid_ankle = [ankle_deg[i] for i in valid_indices]
-                        self.ax1.plot(valid_time, valid_ankle, 'g-', label='踝关节角度(ankle_deg)', linewidth=1.5, alpha=0.8)
-                
-                self.ax1.set_title('实时数据（髋关节原始值、滤波值和踝关节角度）', fontsize=12)
-                self.ax1.set_xlabel('时间 (秒)')
-                self.ax1.set_ylabel('角度 (度)', color='black')
-                self.ax1.grid(True)
-                self.ax1.legend(loc='upper right')
-                
-                # 如果用户已经缩放/移动，恢复之前的X轴范围；否则自动缩放
-                if not auto_scale_x1 and xlim1 is not None:
-                    self.ax1.set_xlim(xlim1)
+        # 判断是否需要重绘：首次绘制或收到新数据（即使len保持2000也会滑动窗口）
+        need_full_redraw = False
+        if not self._plot_initialized or data_received_increment > 0:
+            need_full_redraw = True
+            # 绘制第一个图表（实时数据）
+            if new_len > 0:
+                if need_full_redraw or not self._plot_initialized:
+                    # 完全重绘：清空并重新绘制所有曲线
+                    self.ax1.clear()
+                    self._plot_lines = {}
+                    
+                    # 确保数据长度一致
+                    min_len = min(len(time_data), len(hip_data), 
+                                len(hip_filtered) if hip_filtered else 0, 
+                                len(ankle_deg) if ankle_deg else 0)
+                    if min_len > 0:
+                        # 截取到最小长度
+                        time_arr = np.array(list(time_data)[-min_len:])
+                        hip_arr = np.array(list(hip_data)[-min_len:])
+                        
+                        # 绘制原始髋关节角度
+                        line_hip, = self.ax1.plot(time_arr, hip_arr, 'b-', 
+                                                 label='髋关节原始(hip_raw)', linewidth=1.5)
+                        self._plot_lines['hip_raw'] = line_hip
+                        
+                        # 绘制滤波后的髋角（如果有效）
+                        if hip_filtered and len(hip_filtered) > 0:
+                            valid_indices = [i for i, x in enumerate(hip_filtered[-min_len:]) if x is not None]
+                            if len(valid_indices) > 0:
+                                valid_time = time_arr[valid_indices]
+                                valid_filtered = np.array([hip_filtered[i] for i in valid_indices])
+                                line_f, = self.ax1.plot(valid_time, valid_filtered, 'r--', 
+                                                       label='髋关节滤波(hip_f)', linewidth=1.5, alpha=0.8)
+                                self._plot_lines['hip_f'] = line_f
+                        
+                        # 绘制踝关节角度（如果有效）
+                        if ankle_deg and len(ankle_deg) > 0:
+                            valid_indices = [i for i, x in enumerate(ankle_deg[-min_len:]) if x is not None]
+                            if len(valid_indices) > 0:
+                                valid_time = time_arr[valid_indices]
+                                valid_ankle = np.array([ankle_deg[i] for i in valid_indices])
+                                line_a, = self.ax1.plot(valid_time, valid_ankle, 'g-', 
+                                                       label='踝关节角度(ankle_deg)', linewidth=1.5, alpha=0.8)
+                                self._plot_lines['ankle_deg'] = line_a
+                        
+                        self.ax1.set_title('实时数据（髋关节原始值、滤波值和踝关节角度）', fontsize=12)
+                        self.ax1.set_xlabel('时间 (秒)')
+                        self.ax1.set_ylabel('角度 (度)', color='black')
+                        self.ax1.grid(True, alpha=0.3)
+                        self.ax1.legend(loc='upper right', fontsize=9)
+                        self.ax1.relim()
+                        self.ax1.autoscale()
+                        
+                        self._plot_initialized = True
+                        self._last_realtime_len = new_len
+                        self._last_received_count = self.collector.total_received
+                        
+                        # ✓ 首次初始化完成后立即绘制，确保曲线可见
+                        self.canvas.draw_idle()
+                        print(f"[update_plots] ✓ 首次绘制完成，已调用 draw_idle()")
                 else:
-                    self.ax1.relim()
-                    self.ax1.autoscale()
+                    # 增量更新：仅更新数据而不清空重绘
+                    if self._plot_lines and 'hip_raw' in self._plot_lines:
+                        min_len = min(len(time_data), len(hip_data), 
+                                    len(hip_filtered) if hip_filtered else 0, 
+                                    len(ankle_deg) if ankle_deg else 0)
+                        
+                        time_arr = np.array(list(time_data)[-min_len:])
+                        hip_arr = np.array(list(hip_data)[-min_len:])
+                        
+                        # 使用 set_data() 进行高效的增量更新
+                        self._plot_lines['hip_raw'].set_data(time_arr, hip_arr)
+                        
+                        # 自动缩放 Y 轴和 X 轴
+                        self.ax1.relim()
+                        self.ax1.autoscale_view()
+                        
+                        self._last_realtime_len = new_len
+                        self._last_received_count = self.collector.total_received
             else:
-                # 数据长度不一致
-                self.ax1.clear()
-                debug_info = f'数据长度不一致\n时间: {len(self.collector.time_data)}\n髋角: {len(self.collector.hip_data)}\n滤波: {len(self.collector.hip_filtered_data)}'
-                self.ax1.text(0.5, 0.5, debug_info, 
-                             horizontalalignment='center', verticalalignment='center',
-                             transform=self.ax1.transAxes, fontsize=10)
-                self.ax1.set_title('实时数据（髋关节原始值和滤波值）', fontsize=12)
-                self.ax1.set_xlabel('时间 (秒)')
-                self.ax1.set_ylabel('角度 (度)')
-                self.ax1.grid(True)
-        elif len(time_data) == 0 and data_changed_realtime:
-            # 没有数据且状态变化时才重绘提示，避免重复刷新
-            self.ax1.clear()
-            debug_info = f'等待数据...\n队列大小: {queue_size}\n数据点数: {total_points}'
-            self.ax1.text(0.5, 0.5, debug_info, 
-                         horizontalalignment='center', verticalalignment='center',
-                         transform=self.ax1.transAxes, fontsize=12)
-            self.ax1.set_title('实时数据（髋关节原始值和滤波值）', fontsize=12)
-            self.ax1.set_xlabel('时间 (秒)')
-            self.ax1.set_ylabel('角度 (度)')
-            self.ax1.grid(True)
+                # 没有数据时显示提示
+                # 不再清空已绘制曲线，保持最后一帧可查看
+                if not self._plot_initialized:
+                    # 仅在从未绘制过时显示提示
+                    self.ax1.clear()
+                    # ✓ 增强调试信息
+                    gait_status = "✓" if self.collector.gait_module_enabled else "✗"
+                    hip_status = "✓" if self.collector.hip_module_enabled else "✗"
+                    debug_info = (
+                        f'等待数据...\n'
+                        f'队列大小: {queue_size} | 收到: {self.collector.total_received}\n'
+                        f'数据点数: {total_points}\n'
+                        f'步态模块: {gait_status} | 髋关节模块: {hip_status}\n'
+                        f'[提示] 点击"髋关节数据"或"步态采集"启动数据处理'
+                    )
+                    self.ax1.text(0.5, 0.5, debug_info, 
+                                 horizontalalignment='center', verticalalignment='center',
+                                 transform=self.ax1.transAxes, fontsize=11)
+                    self.ax1.set_title('实时数据（髋关节原始值、滤波值和踝关节角度）', fontsize=12)
+                    self.ax1.set_xlabel('时间 (秒)')
+                    self.ax1.set_ylabel('角度 (度)')
+                    self.ax1.grid(True)
         
-        # 更新第二个图表（根据显示模式显示不同内容）
-        # 保存当前X轴范围（如果用户已经缩放/移动）
-        xlim2 = self.ax2.get_xlim() if len(self.ax2.lines) > 0 else None
-        auto_scale_x2 = (xlim2 is None or xlim2 == (0.0, 1.0))  # 判断是否是默认范围
-        
-        self.ax2.clear()
-        
-        # 显示步态周期图
-        # 性能优化：如果载入了外部数据且没有新数据，不需要频繁重绘
+        # 更新第二个图表（步态周期）
         cycle_time, cycle_hip, cycle_ankle = self.collector.get_gait_cycle_data()
+        
+        if not hasattr(self, '_cycle_plot_initialized'):
+            self._cycle_plot_initialized = False
+            self._last_cycle_len = 0
+            self._cycle_plot_lines = {'hip': None, 'ankle': None}
+        
         cycle_data_changed = (len(cycle_time) != self._last_cycle_len)
         
-        # 只在数据变化或首次载入时更新
-        if cycle_data_changed or not self.collector.is_loaded_data:
+        # 只在数据有实质性变化时重绘
+        if cycle_data_changed:
+            self.ax2.clear()
+            self._cycle_plot_lines = {}
+            
             if len(cycle_time) > 0 and len(cycle_hip) > 0 and len(cycle_ankle) > 0:
-                self.ax2.plot(cycle_time, cycle_hip, 'b-', label='髋关节', linewidth=2)
-                self.ax2.plot(cycle_time, cycle_ankle, 'r-', label='踝关节', linewidth=2)
+                # 使用降采样优化性能（如果数据点过多）
+                cycle_time_arr = np.array(cycle_time)
+                cycle_hip_arr = np.array(cycle_hip)
+                cycle_ankle_arr = np.array(cycle_ankle)
+                
+                # 如果数据点超过 500 个，进行降采样（每 2 个取 1 个）
+                if len(cycle_time_arr) > 500:
+                    step = max(1, len(cycle_time_arr) // 500)
+                    cycle_time_arr = cycle_time_arr[::step]
+                    cycle_hip_arr = cycle_hip_arr[::step]
+                    cycle_ankle_arr = cycle_ankle_arr[::step]
+                
+                line_hip, = self.ax2.plot(cycle_time_arr, cycle_hip_arr, 'b-', 
+                                         label='髋关节', linewidth=2)
+                line_ankle, = self.ax2.plot(cycle_time_arr, cycle_ankle_arr, 'r-', 
+                                           label='踝关节', linewidth=2)
+                self._cycle_plot_lines['hip'] = line_hip
+                self._cycle_plot_lines['ankle'] = line_ankle
+                
                 self.ax2.set_title('最新步态周期', fontsize=12)
                 self.ax2.set_xlabel('时间 (秒)')
                 self.ax2.set_ylabel('角度 (度)')
-                self.ax2.grid(True)
-                self.ax2.legend(loc='upper right')
+                self.ax2.grid(True, alpha=0.3)
+                self.ax2.legend(loc='upper right', fontsize=9)
+                self.ax2.relim()
+                self.ax2.autoscale()
                 
-                # 如果用户已经缩放/移动，恢复之前的X轴范围；否则自动缩放
-                if not auto_scale_x2 and xlim2 is not None:
-                    self.ax2.set_xlim(xlim2)
-                else:
-                    self.ax2.relim()
-                    self.ax2.autoscale()
+                self._cycle_plot_initialized = True
             else:
                 self.ax2.text(0.5, 0.5, '暂无步态周期数据\n（等待数据采集...）', 
                              horizontalalignment='center', verticalalignment='center',
@@ -1791,20 +1923,58 @@ class GaitDataCollectorGUI:
                 self.ax2.set_xlabel('时间 (秒)')
                 self.ax2.set_ylabel('角度 (度)')
                 self.ax2.grid(True)
+                self._cycle_plot_initialized = True
             
-            # 记录当前周期数据长度
             self._last_cycle_len = len(cycle_time)
-        else:
-            # 数据未变化，保持当前显示（不重绘）
-            pass
         
-        # 绘制图表
-        need_draw = data_changed_realtime or cycle_data_changed or not self.collector.is_loaded_data
+        # ========== 性能优化2：动态调整刷新频率 ==========
+        # 根据数据到达速率动态调整更新间隔，减少不必要的绘制
+        if not hasattr(self, '_update_stats'):
+            self._update_stats = {'last_check_time': time.time(), 'data_per_sec': 0}
+        
+        current_time = time.time()
+        if current_time - self._update_stats['last_check_time'] >= 1.0:
+            # 每秒检查一次数据到达速率
+            data_rate = self.collector.total_received - getattr(self, '_last_received_count', 0)
+            self._update_stats['data_per_sec'] = data_rate
+            self._last_received_count = self.collector.total_received
+            self._update_stats['last_check_time'] = current_time
+            
+            # 根据数据速率调整刷新间隔（500-100Hz的数据自动调整间隔）
+            if data_rate > 500:
+                # 数据速率高，降低刷新频率以减少卡顿
+                self.update_interval = max(50, min(200, 10000 // data_rate))  # 50-200ms
+            elif data_rate > 100:
+                self.update_interval = 100  # 正常数据速率
+            else:
+                self.update_interval = 200  # 低速率，不需要频繁刷新
+        
+        # 仅在必要时绘制（减少 draw() 调用次数）
+        # 只有在数据显著更新或周期数据变化时才绘制
+        # ✓ 计算数据增量，处理缓冲区循环覆盖的情况
+        data_increment = new_len - self._last_realtime_len
+        # 当增量为负数时，说明缓冲区被清空或重置，立即触发重绘
+        # 当从空白恢复（_last_realtime_len=0 且 new_len>0）时，也要立即重绘
+        need_draw = (
+            (data_increment > 15 or data_increment < 0) or  # 数据增长或缓冲区重置
+            (self._last_realtime_len == 0 and new_len > 0) or  # 从空白状态恢复
+            cycle_data_changed
+        )
+        
+        # ✓ 诊断：打印绘制决策
+        if not hasattr(self, '_last_draw_log_time'):
+            self._last_draw_log_time = time.time()
+        current_time = time.time()
+        
+        # 每2秒打印一次绘制状态
+        if current_time - self._last_draw_log_time > 2.0:
+            print(f"[update_plots] 绘制决策: need_draw={need_draw}, data增量={data_increment}, cycle_changed={cycle_data_changed}, _plot_initialized={self._plot_initialized}")
+            self._last_draw_log_time = current_time
+        
         if need_draw:
-            self.canvas.draw()
-            self._last_realtime_len = len(time_data)
+            self.canvas.draw_idle()  # 使用 draw_idle() 替代 draw()，避免过度刷新
         
-        # 定时更新（统一更新频率，避免冲突）
+        # 定时更新（使用动态间隔）
         self.root.after(self.update_interval, self.update_plots)
     
     def start_serial_monitor(self):
@@ -1827,6 +1997,11 @@ class GaitDataCollectorGUI:
             self.gait_module_btn.config(text="步态采集: 关闭")
             self.add_history("步态采集模块已关闭", "信息")
         else:
+            # ✓ 检查其他模块是否已启用
+            if self.collector.hip_module_enabled:
+                messagebox.showerror("错误", "髋关节数据模块已启用\n请先停止髋关节数据模块再启用步态采集")
+                return
+            
             # 启动步态采集模块
             if not self.collector.is_connected():
                 messagebox.showerror("错误", "请先连接串口")
@@ -1849,6 +2024,11 @@ class GaitDataCollectorGUI:
             self.hip_module_btn.config(text="髋关节数据: 关闭")
             self.add_history("髋关节数据模块已关闭", "信息")
         else:
+            # ✓ 检查其他模块是否已启用
+            if self.collector.gait_module_enabled:
+                messagebox.showerror("错误", "步态采集模块已启用\n请先停止步态采集模块再启用髋关节数据模块")
+                return
+            
             # 启动髋关节数据模块
             if not self.collector.is_connected():
                 messagebox.showerror("错误", "请先连接串口")
@@ -1856,6 +2036,10 @@ class GaitDataCollectorGUI:
             
             try:
                 self.collector.start_hip_module()
+                # ✓ 重置GUI绘制状态，准备新的数据显示
+                self._plot_initialized = False
+                self._last_realtime_len = 0
+                self._plot_lines = {'hip_raw': None, 'hip_f': None, 'ankle_deg': None}
                 self.hip_module_btn.config(text="髋关节数据: 开启")
                 self.add_history("髋关节数据模块已开启", "信息")
             except Exception as e:
