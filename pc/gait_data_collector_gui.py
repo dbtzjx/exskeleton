@@ -556,6 +556,10 @@ class GaitDataCollector:
             # 标记为载入的数据（用于性能优化）
             self.is_loaded_data = True
             
+            # 载入外部数据时，重置上次绘制长度，确保只重绘一次
+            self._last_cycle_len = -1
+            self._last_realtime_len = -1
+            
             return True
         except Exception as e:
             raise Exception(f"载入步态周期数据失败: {e}")
@@ -579,12 +583,22 @@ class GaitDataCollector:
                 self.time_data.clear()
                 self.hip_data.clear()
                 self.ankle_data.clear()
+                # 清空并填充与时间对齐的缓存，避免绘图时长度为0
+                self.hip_filtered_data.clear()
+                self.ankle_deg_data.clear()
                 
                 for i, rel_time in enumerate(time_list):
                     timestamp = base_time + int(rel_time * 1000) - start_offset
                     self.time_data.append(timestamp)
                     self.hip_data.append(data.get('hip_angle', [])[i])
                     self.ankle_data.append(data.get('ankle_angle', [])[i])
+                    # 载入的历史数据缺少滤波/踝度量时，用None占位保持长度一致
+                    self.hip_filtered_data.append(None)
+                    self.ankle_deg_data.append(data.get('ankle_angle', [])[i] if 'ankle_angle' in data else None)
+            
+            # 标记为已载入数据，避免反复重绘导致卡顿
+            self.is_loaded_data = True
+            # 仅标记，不在此处操作GUI缓存
             
             return True
         except Exception as e:
@@ -710,6 +724,7 @@ class GaitDataCollectorGUI:
     def __init__(self, root):
         # 初始化周期长度缓存（用于性能优化）
         self._last_cycle_len = -1
+        self._last_realtime_len = -1  # 最近一次实时曲线点数，用于避免重复重绘
         self.root = root
         self.root.title("步态数据采集与可视化")
         self.root.geometry("1200x800")
@@ -1026,23 +1041,30 @@ class GaitDataCollectorGUI:
             return  # 用户取消
         
         try:
-            cycle_file = os.path.join(folder_path, "gait_cycle.json")
+            # 支持两种命名：gait_cycle.json（新）和 gait_cycle_data.json（旧）
+            cycle_candidates = [
+                os.path.join(folder_path, "gait_cycle.json"),
+                os.path.join(folder_path, "gait_cycle_data.json")
+            ]
             realtime_file = os.path.join(folder_path, "realtime_data.json")
             
             loaded_files = []
             
-            # 载入步态周期数据
-            if os.path.exists(cycle_file):
+            # 载入步态周期数据（优先使用新文件名，找不到再尝试旧文件名）
+            cycle_file = next((f for f in cycle_candidates if os.path.exists(f)), None)
+            if cycle_file:
                 self.collector.load_gait_cycle(cycle_file)
-                loaded_files.append("步态周期数据")
+                loaded_files.append(f"步态周期数据 ({os.path.basename(cycle_file)})")
             
             # 载入实时数据
             if os.path.exists(realtime_file):
                 self.collector.load_realtime_data(realtime_file)
                 loaded_files.append("实时数据")
+                # 重置实时绘制长度缓存，确保仅首次重绘
+                self._last_realtime_len = -1
             
             if not loaded_files:
-                messagebox.showwarning("警告", f"文件夹中没有找到数据文件:\n{gait_cycle.json}\n或\nrealtime_data.json")
+                messagebox.showwarning("警告", "文件夹中没有找到数据文件:\n- gait_cycle.json 或 gait_cycle_data.json\n- realtime_data.json")
                 return
             
             # 显示载入成功信息
@@ -1547,20 +1569,12 @@ class GaitDataCollectorGUI:
             xdata + (1 - center_ratio_x) * new_x_range
         )
         
-        # Y轴缩放（以鼠标位置为中心）
-        y_range = ylim[1] - ylim[0]
-        if y_range <= 0:
-            return
-        new_y_range = y_range * scale_factor
-        center_ratio_y = (ydata - ylim[0]) / y_range
-        new_ylim = (
-            ydata - center_ratio_y * new_y_range,
-            ydata + (1 - center_ratio_y) * new_y_range
-        )
-        
-        # 应用新的轴范围
+        # 应用新的X轴范围
         ax.set_xlim(new_xlim)
-        ax.set_ylim(new_ylim)
+        
+        # Y轴根据数据自适应（重新计算）
+        ax.relim()
+        ax.autoscale_view(scalex=False, scaley=True)
         
         # 立即更新显示
         self.canvas.draw_idle()
@@ -1579,18 +1593,15 @@ class GaitDataCollectorGUI:
         if event.inaxes == self.ax1:
             ax = self.ax1
             xlim = self.ax1.get_xlim()
-            ylim = self.ax1.get_ylim()
         elif event.inaxes == self.ax2:
             ax = self.ax2
             xlim = self.ax2.get_xlim()
-            ylim = self.ax2.get_ylim()
         else:
             return
         
         # 获取鼠标位置
         xdata = event.xdata
-        ydata = event.ydata
-        if xdata is None or ydata is None:
+        if xdata is None:
             return
         
         # 计算缩放比例（向上滚动放大，向下滚动缩小）
@@ -1621,20 +1632,12 @@ class GaitDataCollectorGUI:
             xdata + (1 - center_ratio_x) * new_x_range
         )
         
-        # Y轴缩放（以鼠标位置为中心）
-        y_range = ylim[1] - ylim[0]
-        if y_range <= 0:
-            return
-        new_y_range = y_range * scale_factor
-        center_ratio_y = (ydata - ylim[0]) / y_range
-        new_ylim = (
-            ydata - center_ratio_y * new_y_range,
-            ydata + (1 - center_ratio_y) * new_y_range
-        )
-        
-        # 应用新的轴范围
+        # 应用新的X轴范围
         ax.set_xlim(new_xlim)
-        ax.set_ylim(new_ylim)
+        
+        # Y轴根据数据自适应（重新计算）
+        ax.relim()
+        ax.autoscale_view(scalex=False, scaley=True)
         
         # 立即更新显示
         self.canvas.draw_idle()
@@ -1657,14 +1660,7 @@ class GaitDataCollectorGUI:
         # 保存当前X轴范围（如果用户已经缩放/移动）
         xlim1 = self.ax1.get_xlim() if len(self.ax1.lines) > 0 else None
         auto_scale_x1 = (xlim1 is None or xlim1 == (0.0, 1.0))  # 判断是否是默认范围
-        
-        # 清空左右 Y 轴
-        self.ax1.clear()
-        if hasattr(self, "ax1_right") and self.ax1_right is not None:
-            self.ax1_right.clear()
-        else:
-            # 兼容性：如果尚未创建，则创建一次
-            self.ax1_right = self.ax1.twinx()
+        data_changed_realtime = False
         
         # M2阶段：更新相位、摆动进度和ankle_ref显示
         phase, swing_progress, ankle_ref = self.collector.get_phase_and_progress()
@@ -1680,8 +1676,21 @@ class GaitDataCollectorGUI:
         # M2阶段：显示hip_raw、hip_f和ankle_deg
         time_data, hip_data, hip_filtered, ankle_deg = self.collector.get_realtime_data()
         
-        # 调试：检查数据长度
+        # 根据数据变化决定是否重绘，避免频繁刷新导致交互卡顿
         if len(time_data) > 0:
+            data_changed_realtime = (len(time_data) != self._last_realtime_len)
+        else:
+            data_changed_realtime = (self._last_realtime_len != 0)
+
+        if len(time_data) > 0 and data_changed_realtime:
+            # 清空左右 Y 轴（仅在数据变化时重绘）
+            self.ax1.clear()
+            if hasattr(self, "ax1_right") and self.ax1_right is not None:
+                self.ax1_right.clear()
+            else:
+                # 兼容性：如果尚未创建，则创建一次
+                self.ax1_right = self.ax1.twinx()
+
             # 确保数据长度一致
             min_len = min(len(time_data), len(hip_data), len(hip_filtered) if hip_filtered else 0, len(ankle_deg) if ankle_deg else 0)
             if min_len > 0:
@@ -1696,7 +1705,6 @@ class GaitDataCollectorGUI:
                 
                 # 绘制髋关节滤波后的角度（如果有有效数据）
                 if len(hip_filtered) > 0:
-                    # 找到有效数据点（不是None）
                     valid_indices = [i for i, x in enumerate(hip_filtered) if x is not None]
                     if len(valid_indices) > 0:
                         valid_time = [time_data[i] for i in valid_indices]
@@ -1705,7 +1713,6 @@ class GaitDataCollectorGUI:
                 
                 # 绘制踝关节角度（如果有有效数据）
                 if len(ankle_deg) > 0:
-                    # 找到有效数据点（不是None）
                     valid_indices = [i for i, x in enumerate(ankle_deg) if x is not None]
                     if len(valid_indices) > 0:
                         valid_time = [time_data[i] for i in valid_indices]
@@ -1726,6 +1733,7 @@ class GaitDataCollectorGUI:
                     self.ax1.autoscale()
             else:
                 # 数据长度不一致
+                self.ax1.clear()
                 debug_info = f'数据长度不一致\n时间: {len(self.collector.time_data)}\n髋角: {len(self.collector.hip_data)}\n滤波: {len(self.collector.hip_filtered_data)}'
                 self.ax1.text(0.5, 0.5, debug_info, 
                              horizontalalignment='center', verticalalignment='center',
@@ -1734,8 +1742,9 @@ class GaitDataCollectorGUI:
                 self.ax1.set_xlabel('时间 (秒)')
                 self.ax1.set_ylabel('角度 (度)')
                 self.ax1.grid(True)
-        else:
-            # 没有数据
+        elif len(time_data) == 0 and data_changed_realtime:
+            # 没有数据且状态变化时才重绘提示，避免重复刷新
+            self.ax1.clear()
             debug_info = f'等待数据...\n队列大小: {queue_size}\n数据点数: {total_points}'
             self.ax1.text(0.5, 0.5, debug_info, 
                          horizontalalignment='center', verticalalignment='center',
@@ -1790,7 +1799,10 @@ class GaitDataCollectorGUI:
             pass
         
         # 绘制图表
-        self.canvas.draw()
+        need_draw = data_changed_realtime or cycle_data_changed or not self.collector.is_loaded_data
+        if need_draw:
+            self.canvas.draw()
+            self._last_realtime_len = len(time_data)
         
         # 定时更新（统一更新频率，避免冲突）
         self.root.after(self.update_interval, self.update_plots)

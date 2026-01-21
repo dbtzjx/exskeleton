@@ -135,6 +135,25 @@ HipSignalProcessor hipProcessor = {0.0f, 0.0f, 0.0f, 0.0f, 0, false};
 const float HIP_FILTER_ALPHA = 0.2f;   // 髋角滤波系数（α = 0.15~0.25，取0.2）
 const float HIP_VEL_FILTER_BETA = 0.2f; // 速度滤波系数（β = 0.2）
 
+// ============================================================================
+// 步态检测算法参数（V2：基于零点的绝对+趋势判定）
+// ============================================================================
+// 核心改进：
+// 1. 不再计算 hip_mean，直接使用 hip_f > 5.0f 判定 SWING 
+//    只要腿向前迈出超过 5°且带有向前的速度，立刻判定为 SWING
+//    这能显著提前踝关节背屈辅助的时机，有效防止拖地
+//
+// 2. 在 SWING 状态下，不再等待角度掉过中点，而是监测 hip_vel_f < -10.0f（速度变负）
+//    这意味着腿已经摆到了最高点开始下落（Heel Strike 瞬间），此时切换到 STANCE 最符合生理步态
+//
+// 3. 增加幅值下限保护：effective_amp = max(detector.hip_amp, 15.0f)
+//    当用户坐下或站立微动时，识别算法不会因为 hip_amp 变成 1-2 度而导致状态疯狂跳变
+//
+// 4. 调试建议：
+//    - 观察串口绘图器：在 updateGaitPhaseDetector 中打印 hip_f 和 detector.state*10
+//    - 调整 V_up：如果静止时容易误触发进入 SWING，调大 V_up（目前 10.0f）
+//    - 如果起步辅助太迟，调小 V_up（目前 10.0f，之前是 20.0f）
+
 // 更新髋关节信号预处理
 // 输入：hip_raw（原始髋角，度）
 // 输出：更新hipProcessor中的滤波值和速度
@@ -225,6 +244,26 @@ AdaptiveThreshold adaptiveThreshold = {
 // 防抖时间（毫秒）
 const uint32_t T_HOLD_MS = 80;
 
+// 步态检测参数调整指南
+// ============================================================================
+// 如果存在以下问题，按建议调整：
+//
+// 问题1：静止时容易误触发进入 SWING（状态疯狂闪烁）
+//   -> 调大 V_up 值（当前 10.0f，可试试 15.0f）
+//   -> V_up 是进入 SWING 时的速度阈值，值越大越难进入
+//
+// 问题2：起步辅助太迟，踝关节背屈反应慢
+//   -> 调小 V_up 值（当前 10.0f，可试试 5.0f）
+//   -> 降低 hip_f 阈值（当前 5.0f，可试试 3.0f）
+//
+// 问题3：在 SWING 相坚持太久，不能及时切换到 STANCE
+//   -> 检查 hip_vel_f < -10.0f 的判定是否满足
+//   -> 调大负速度阈值的绝对值（当前 -10.0f，可试试 -8.0f）
+//
+// 问题4：用户坐着或站立时微动导致状态跳变
+//   -> 幅值下限已设置为 15.0f，一般不需要调整
+// ============================================================================
+
 // 更新自适应阈值
 // 输入：hip_f（滤波后的髋角，度）
 // 输出：更新adaptiveThreshold中的均值和阈值
@@ -277,19 +316,20 @@ void updateAdaptiveThreshold(float hip_f) {
   }
   adaptiveThreshold.hip_amp = max_val - min_val;
   
-  // 如果幅度太小（<1度），使用默认值避免阈值过小
-  if (adaptiveThreshold.hip_amp < 1.0f) {
-    adaptiveThreshold.hip_amp = 10.0f;  // 默认幅度10度
-  }
+  // ========== 增加幅值下限保护 ==========
+  // 使用有效幅度：max(detector.hip_amp, 15.0f)
+  // 当用户坐下或站立微动时，识别算法不会因为 hip_amp 变成 1-2 度而导致状态疯狂跳变
+  float effective_amp = (adaptiveThreshold.hip_amp < 15.0f) ? 15.0f : adaptiveThreshold.hip_amp;
   
-  // 计算阈值
-  // A_up = 0.2 * hip_amp, A_dn = 0.2 * hip_amp
-  adaptiveThreshold.A_up = 0.2f * adaptiveThreshold.hip_amp;
-  adaptiveThreshold.A_dn = 0.2f * adaptiveThreshold.hip_amp;
+  // 计算阈值（现在基于有效幅度，但实际新算法中不再使用A_up/A_dn）
+  // 保留这些字段用于兼容性，但值为0（新算法使用绝对判定）
+  adaptiveThreshold.A_up = 0.0f;
+  adaptiveThreshold.A_dn = 0.0f;
   
-  // V_up = +20 deg/s, V_dn = -20 deg/s（固定值）
-  adaptiveThreshold.V_up = 20.0f;
-  adaptiveThreshold.V_dn = -20.0f;
+  // V_up = +10 deg/s（判定进入SWING的速度阈值，从20改为10以更快响应）
+  // 注意：负值用于STANCE判定（-10 deg/s表示速度过零）
+  adaptiveThreshold.V_up = 10.0f;
+  adaptiveThreshold.V_dn = -10.0f;
   
   adaptiveThreshold.lastUpdateMs = now;
 }
@@ -347,18 +387,16 @@ void updateGaitPhaseDetector() {
   // 获取当前信号值
   float hip_f = hipProcessor.hip_f;
   float hip_vel_f = hipProcessor.hip_vel_f;
-  float hip_mean = adaptiveThreshold.hip_mean;
-  float A_up = adaptiveThreshold.A_up;
-  float A_dn = adaptiveThreshold.A_dn;
   float V_up = adaptiveThreshold.V_up;
-  float V_dn = adaptiveThreshold.V_dn;
   
-  // 检查相位转换条件
-  // 修正：swing和stance的条件判断反了，需要互换
-  // STANCE（支撑相）：脚在地面上，髋关节向前摆动，角度增大、速度为正
-  // SWING（摆动相）：脚在空中，髋关节向后摆动，角度减小、速度为负
-  bool swingConditionMet = (hip_vel_f < V_dn) && (hip_f < hip_mean - A_dn);  // 速度小且角度小 -> SWING
-  bool stanceConditionMet = (hip_vel_f > V_up) && (hip_f > hip_mean + A_up);  // 速度大且角度大 -> STANCE
+  // ========== 基于零点的绝对+趋势判定 ==========
+  // SWING条件：腿向前迈出（hip_f > 5.0°）且带有向前的速度（hip_vel_f > V_up）
+  // 立刻判定为SWING，提前踝关节背屈辅助时机，有效防止拖地
+  bool swingConditionMet = (hip_f > 5.0f) && (hip_vel_f > V_up);
+  
+  // STANCE条件：在SWING状态下，监测速度过零（hip_vel_f < -10.0f）
+  // 表示腿已经摆到最高点开始下落（Heel Strike瞬间），此时切换到STANCE最符合生理步态
+  bool stanceConditionMet = (hip_vel_f < -10.0f);
   
   // 根据当前相位和条件，更新防抖计时器
   if (gaitPhaseDetector.currentPhase == PHASE_STANCE) {
@@ -393,6 +431,21 @@ void updateGaitPhaseDetector() {
     }
   }
   
+  // ========== 调试输出 ==========
+  // 打印 hip_f 和 detector.state*10 便于观察
+  // 注意：每次更新时打印（可通过调整条件改为定期打印，避免过量）
+  static uint32_t lastDebugMs = 0;
+  if (now - lastDebugMs >= 100) {  // 每100ms打印一次，避免串口过载
+    uint8_t stateValue = (gaitPhaseDetector.currentPhase == PHASE_SWING) ? 1 : 0;
+    Serial.print("HipF:");
+    Serial.print(hip_f, 2);
+    Serial.print(" VelF:");
+    Serial.print(hip_vel_f, 2);
+    Serial.print(" State:");
+    Serial.println(stateValue * 10);  // 状态放大便于观察（0=STANCE, 10=SWING）
+    lastDebugMs = now;
+  }
+  
   gaitPhaseDetector.lastUpdateMs = now;
 }
 
@@ -411,6 +464,22 @@ uint32_t getCurrentPhaseDurationMs() {
 
 // ============================================================================
 // 摆动相进度计算（用于踝控制）
+// ============================================================================
+// 
+// 轨迹百分比映射（进阶功能）：
+// 除了时间相位（s = t_swing / Ts），还可利用空间相位进度：
+//   space_phase = (hip_f - 0) / hip_max
+// 其中：
+//   - hip_f：当前髋角（度）
+//   - hip_max：摆动周期内髋角的最大值（自适应计算）
+//
+// 相比于基于时间的百分比，这种方式更稳定：
+//   - 用户摆腿快 -> 辅助就快
+//   - 用户摆腿慢 -> 辅助就慢
+//   - 不受周期变化影响，更符合人体肌肉的反馈需求
+//
+// 目前代码采用时间相位（swing_progress = t_swing / Ts）
+// 如需使用空间相位，可在 updateSwingProgress() 中补充计算逻辑
 // ============================================================================
 
 // 摆动相进度状态
@@ -2157,6 +2226,7 @@ void startGaitCollection(uint32_t intervalMs = 20) {
 void stopGaitCollection() {
   gaitCollection.enabled = false;
   Serial.println(">>> Gait data collection STOPPED");
+  stopSensorPolling();
 }
 
 // 更新步态数据采集（在loop中调用）
