@@ -232,13 +232,10 @@ class GaitDataCollector:
         self.act_data.clear()
         
         self.hip_module_enabled = True
-        print(f"[模块初始化] 髋关节数据模块启动，已清空缓冲区")
-        
         # 启动髋关节数据处理线程
         if not self.hip_process_thread or not self.hip_process_thread.is_alive():
             self.hip_process_thread = threading.Thread(target=self._hip_process_loop, daemon=True)
             self.hip_process_thread.start()
-            print(f"[模块状态] 髋关节处理线程已启动 (TID: {self.hip_process_thread.ident})")
         
         return True
     
@@ -250,7 +247,6 @@ class GaitDataCollector:
         
         # ✓ 不再清空缓冲区，保留数据以便用户保存
         # 数据会保留在缓冲区中，直到用户重新启动采集或手动清空
-        print(f"[模块状态] 髋关节数据模块已停止，数据已保留（共 {len(self.time_data)} 个数据点）")
     
     def _collect_data(self):
         """数据读取线程（统一从串口读取数据，解析JSON，放入队列）"""
@@ -297,22 +293,13 @@ class GaitDataCollector:
                                         self.total_received += 1
                                         self.last_received_time = time.time()
                                         
-                                        # ✓ 定期诊断日志（每1秒一次）
+                                        # ✓ 定期更新诊断时间戳
                                         current_time = time.time()
                                         if current_time - last_diagnostic_time > 1.0:
-                                            print(f"[_collect_data] 串口接收正常, 已接收 {self.total_received} 个数据点")
-                                            print(f"  当前数据: t={data_dict.get('t')}, h={data_dict.get('h'):.2f}, phase={data_dict.get('phase')}, s={data_dict.get('s')}")
-                                            print(f"  队列大小: {self.data_queue.qsize()}, gait_enabled={self.gait_module_enabled}, hip_enabled={self.hip_module_enabled}")
                                             last_diagnostic_time = current_time
                                     else:
-                                        # ✓ 诊断：打印缺失的字段（每 500 次才打印一次，避免刷屏）
-                                        if self.total_received % 500 == 0:
-                                            missing = []
-                                            if 't' not in data_dict:
-                                                missing.append('t')
-                                            if 'h' not in data_dict:
-                                                missing.append('h')
-                                            print(f"[_collect_data] 跳过数据: 缺少字段 {missing}, 接收到字段: {list(data_dict.keys())}")
+                                        # ✓ 跳过缺失关键字段的数据
+                                        continue
                                 except json.JSONDecodeError as je:
                                     # JSON解析失败，忽略
                                     pass
@@ -368,7 +355,6 @@ class GaitDataCollector:
     
     def _hip_process_loop(self):
         """髋关节数据模块处理循环（独立线程）"""
-        print(f"[_hip_process_loop] 线程启动")
         data_count = 0
         while self.hip_module_enabled:
             try:
@@ -405,10 +391,7 @@ class GaitDataCollector:
                     
                     data_count += 1
                     # ✓ 每处理50个数据打印一次日志（包含act值）
-                    if data_count % 50 == 0:
-                        # ✓ 诊断：打印所有缓冲区长度，确认数据被正确添加
-                        print(f"[_hip_process_loop] 已处理 {data_count} 个数据点 | 缓冲区长度: time={len(self.time_data)}, hip={len(self.hip_data)}, filtered={len(self.hip_filtered_data)}, ankle={len(self.ankle_deg_data)}, phase={len(self.phase_data)}, swing={len(self.swing_progress_data)}, act={len(self.act_data)}")
-                        print(f"  [最新数据] act={act}, phase={phase}, ankle_deg={ankle_deg}")
+                    # 诊断信息已移除
                     
                     if not self.gait_module_enabled:
                         ankle_angle = ankle_deg if ankle_deg is not None else 0.0
@@ -716,35 +699,13 @@ class GaitDataCollector:
     def get_realtime_data(self):
         """获取实时数据（用于绘图，并进行性能优化的数据降采样）"""
         # M2阶段：返回hip_raw、hip_f和ankle_deg用于绘图，phase、swing_progress和ankle_ref单独获取
-        # ✓ 诊断：记录何时返回空数据
+        # ✓ 缓冲区空值检查已在内部处理
         if len(self.time_data) == 0 or len(self.hip_data) == 0:
-            if not hasattr(self, '_empty_data_logged'):
-                self._empty_data_logged = True
-                self._empty_data_log_time = time.time()
-                # 初次打印时显示所有缓冲区长度
-                print(f"[get_realtime_data] ⚠️ 缓冲区为空（初次）:")
-                print(f"  time_data={len(self.time_data)}, hip_data={len(self.hip_data)}, hip_filtered={len(self.hip_filtered_data)}, ankle_deg={len(self.ankle_deg_data)}")
-                print(f"  hip_module_enabled={self.hip_module_enabled}, gait_module_enabled={self.gait_module_enabled}")
-            else:
-                current_time = time.time()
-                if current_time - self._empty_data_log_time > 5.0:  # 每5秒打印一次
-                    print(f"[get_realtime_data] ⚠️ 缓冲区仍为空: time={len(self.time_data)}, hip={len(self.hip_data)}, filtered={len(self.hip_filtered_data)}, ankle={len(self.ankle_deg_data)}")
-                    self._empty_data_log_time = current_time
             return [], [], [], [], []
         
         # 确保数据长度一致（取所有相关数据的最小长度）
         min_len = min(len(self.time_data), len(self.hip_data), len(self.hip_filtered_data), len(self.ankle_deg_data), len(self.act_data))
         if min_len == 0:
-            if not hasattr(self, '_min_len_zero_logged'):
-                self._min_len_zero_logged = True
-                self._min_len_zero_log_time = time.time()
-                print(f"[get_realtime_data] ⚠️ min_len为0（初次）:")
-                print(f"  time={len(self.time_data)}, hip={len(self.hip_data)}, filtered={len(self.hip_filtered_data)}, ankle={len(self.ankle_deg_data)}")
-            else:
-                current_time = time.time()
-                if current_time - self._min_len_zero_log_time > 5.0:
-                    print(f"[get_realtime_data] ⚠️ min_len仍为0: time={len(self.time_data)}, hip={len(self.hip_data)}, filtered={len(self.hip_filtered_data)}, ankle={len(self.ankle_deg_data)}")
-                    self._min_len_zero_log_time = current_time
             return [], [], [], [], []
         
         # ========== 性能优化：数据降采样 ==========
@@ -771,15 +732,6 @@ class GaitDataCollector:
         
         # 提取act数据（确保长度一致）
         act_data = [self.act_data[i] if i < len(self.act_data) else 0 for i in indices]
-        
-        # ✓ 诊断：每返回100个数据点打印一次
-        if not hasattr(self, '_returned_len_log'):
-            self._returned_len_log = 0
-            self._returned_len_log_time = time.time()
-        if len(relative_time) - self._returned_len_log >= 100:
-            current_time = time.time()
-            print(f"[get_realtime_data] ✓ 返回 {len(relative_time)} 个数据点（共缓存 {len(self.time_data)} 个，hip_data {len(self.hip_data)}, 滤波 {len(self.hip_filtered_data)}）")
-            self._returned_len_log = len(relative_time)
         
         return relative_time, hip_data, hip_filtered, ankle_deg, act_data
     
@@ -955,8 +907,8 @@ class GaitDataCollectorGUI:
         self.control_loop_btn = ttk.Button(cmd_frame, text="启用控制循环", command=self.toggle_control_loop, width=12)
         self.control_loop_btn.grid(row=1, column=2, padx=2, pady=2)
         
-        # 第三行：重置故障
-        ttk.Button(cmd_frame, text="重置故障", command=lambda: self.send_command_text("resetfault"), width=10).grid(row=2, column=0, padx=2, pady=2)
+        # 第三行：电机重置
+        ttk.Button(cmd_frame, text="电机重置", command=self.reset_motors, width=10).grid(row=2, column=0, padx=2, pady=2)
         
         # 分隔线
         ttk.Separator(cmd_frame, orient=tk.HORIZONTAL).grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
@@ -1126,6 +1078,28 @@ class GaitDataCollectorGUI:
         """发送命令文本"""
         self.command_var.set(command)
         self.send_command()
+    
+    def reset_motors(self):
+        """电机重置：向两个电机发送clearerror指令，然后发送enable指令"""
+        if not self.collector.is_connected():
+            messagebox.showerror("错误", "串口未连接")
+            return
+        
+        try:
+            # 清除两个电机的错误标志（发送CAN命令0x9B）
+            self.collector.send_command("ce")
+            self.add_history("ce (clear error)", "TX")
+            time.sleep(0.1)  # 短暂延迟
+            
+            # 使能两个电机（发送CAN命令0x88）
+            self.collector.send_command("e")
+            self.add_history("e (enable)", "TX")
+            
+            messagebox.showinfo("成功", "电机重置完成")
+        except Exception as e:
+            error_msg = f"错误: {str(e)}"
+            self.add_history(error_msg, "信息")
+            messagebox.showerror("错误", str(e))
     
     def send_command(self, event=None):
         """发送命令到串口"""
@@ -1900,7 +1874,6 @@ class GaitDataCollectorGUI:
                         
                         # ✓ 首次初始化完成后立即绘制，确保曲线可见
                         self.canvas.draw_idle()
-                        print(f"[update_plots] ✓ 首次绘制完成，已调用 draw_idle()")
                 else:
                     # 增量更新：仅更新数据而不清空重绘
                     if self._plot_lines and 'hip_raw' in self._plot_lines:
@@ -2056,14 +2029,13 @@ class GaitDataCollectorGUI:
             cycle_data_changed
         )
         
-        # ✓ 诊断：打印绘制决策
+        # ✓ 诊断：绘制决策已在内部处理
         if not hasattr(self, '_last_draw_log_time'):
             self._last_draw_log_time = time.time()
         current_time = time.time()
         
-        # 每2秒打印一次绘制状态
+        # 更新诊断时间戳
         if current_time - self._last_draw_log_time > 2.0:
-            print(f"[update_plots] 绘制决策: need_draw={need_draw}, data增量={data_increment}, cycle_changed={cycle_data_changed}, _plot_initialized={self._plot_initialized}")
             self._last_draw_log_time = current_time
         
         if need_draw:
