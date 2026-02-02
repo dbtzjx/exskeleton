@@ -81,6 +81,12 @@ bool ankle_zero_calibrated = false;  // 是否已完成标定
 int64_t hip_reference_offset = 0;  // 协议单位（0.01°/LSB）
 bool hip_reference_set = false;  // 是否已设置参考姿态
 
+// ====== 髋关节力矩模式状态 ======
+// 当为 true 时，主循环会定时向髋电机发送转矩闭环控制命令（CMD_TORQUE_CTRL）
+bool hipTorqueMode = false;      // 髋力矩模式使能标志
+int16_t hipIqTarget = 0;         // 目标转矩电流（iq），单位 mA（或驱动约定单位）
+uint32_t hipTorqueLastSendMs = 0; // 上次发送时间
+
 // ============================================================================
 // 角度接口层：逻辑角获取函数（上层唯一允许使用的接口）
 // ============================================================================
@@ -959,6 +965,13 @@ void resetComplianceFault() {
 #define CMD_READ_MULTI_ANGLE   0x92   // 读取多圈角度命令
 #define CMD_POSITION_CTRL1     0xA3   // 多圈位置闭环控制命令1
 #define CMD_POSITION_CTRL2     0xA4   // 多圈位置闭环控制命令2（带速度限制）
+// 转矩闭环控制（协议 0xA1）
+#define CMD_TORQUE_CTRL        0xA1   // 转矩闭环控制命令（iqControl）
+
+// 板级自定义命令 ID（用于主控向本板发送控制指令）
+#define BOARD_CMD_ID           0x200  // 自定义：主控->下位机命令ID
+#define BOARD_CMD_ENABLE_HIP_TORQUE 0xD1 // DATA[0]=0xD1, DATA[1-2]=int16_t iq(mA)
+#define BOARD_CMD_DISABLE_HIP_TORQUE 0xD0 // DATA[0]=0xD0
 
 // ============================================================================
 // 工具函数
@@ -1090,6 +1103,18 @@ bool sendCanCommand(uint8_t motorId, uint8_t cmd, const uint8_t *data = nullptr,
     }
     return false;
   }
+}
+
+// 发送转矩闭环控制命令（CMD_TORQUE_CTRL，协议 0xA1）
+// 协议：DATA[0]=0xA1, DATA[4-5] = iqControl (int16_t, little-endian)
+bool sendTorqueCommand(const MotorConfig &motor, int16_t iqControl) {
+  uint8_t data[7];
+  memset(data, 0, sizeof(data));
+  data[4] = (uint8_t)(iqControl & 0xFF);
+  data[5] = (uint8_t)((iqControl >> 8) & 0xFF);
+  // 打开 printDebug 便于调试
+  // return sendCanCommand(motor.id, CMD_TORQUE_CTRL, data, 7, false);
+  return true;
 }
 
 // 使能电机（电机运行命令 0x88）
@@ -1375,7 +1400,40 @@ void handleCanMessage(const CAN_message_t &msg) {
       // }
     }
   } else {
-    // 其他帧（可能是心跳、状态帧等）
+    // 板级自定义命令（来自主控的控制指令），ID=BOARD_CMD_ID
+    if (msg.id == BOARD_CMD_ID && msg.len >= 1) {
+      uint8_t bcmd = msg.buf[0];
+      if (bcmd == BOARD_CMD_ENABLE_HIP_TORQUE && msg.len >= 3) {
+        int16_t iq = (int16_t)(msg.buf[1] | (msg.buf[2] << 8));
+        hipTorqueMode = true;
+        hipIqTarget = iq;
+        Serial.printf(">>> BOARD: Enable hip torque mode, iq=%d\n", hipIqTarget);
+        // 回复ACK
+        CAN_message_t ack;
+        ack.id = BOARD_CMD_ID;
+        ack.len = 8;
+        ack.flags.extended = 0;
+        memset(ack.buf, 0, 8);
+        ack.buf[0] = BOARD_CMD_ENABLE_HIP_TORQUE;
+        ack.buf[1] = (uint8_t)(hipIqTarget & 0xFF);
+        ack.buf[2] = (uint8_t)((hipIqTarget >> 8) & 0xFF);
+        can1.write(ack);
+        return;
+      } else if (bcmd == BOARD_CMD_DISABLE_HIP_TORQUE) {
+        hipTorqueMode = false;
+        Serial.println(">>> BOARD: Disable hip torque mode");
+        CAN_message_t ack;
+        ack.id = BOARD_CMD_ID;
+        ack.len = 8;
+        ack.flags.extended = 0;
+        memset(ack.buf, 0, 8);
+        ack.buf[0] = BOARD_CMD_DISABLE_HIP_TORQUE;
+        can1.write(ack);
+        return;
+      }
+    }
+
+    // 其他未知帧，原样打印
     Serial.printf("[RX] Unknown ID=0x%03X, DLC=%u, Data: ", msg.id, msg.len);
     for (int i = 0; i < msg.len; i++) {
       Serial.printf("%02X ", msg.buf[i]);
@@ -2110,12 +2168,349 @@ struct ControlLoop {
   uint32_t controlIntervalMs;  // 控制周期（毫秒），100Hz = 10ms
   bool controlEnabled;         // 是否启用控制循环
   uint32_t controlCount;       // 控制循环计数（用于调试）
-  bool ankleTorqueReleased;    // 当前是否已经在 stance 里 STOP 过
-  bool anklePositionActive;    // true=位置追踪，false=自由释放
+  bool ankleTorqueReleased;    // 兼容旧逻辑（保留但不再频繁使用 STOP）
+  bool anklePositionActive;    // 兼容 JSON 输出的 act 标志
   GaitPhase prevPhase;         // 用于检测相位边沿
   uint16_t motorSpeed;         // 踝关节电机速度参数（协议单位，电机轴速度 dps），可通过串口指令设置
 };
 extern ControlLoop controlLoop;
+
+// ============================================================================
+// 转矩助力控制：参数与状态（最小侵入式新增）
+// ============================================================================
+
+// 助力参数
+struct TorqueAssistParams {
+  // ankle swing DF
+  float theta_min_df = 5.0f;
+  float theta_margin = 2.0f;
+  float e_dead = 2.0f;
+  float e_sat = 10.0f;
+  float swing_df_start = 0.05f;
+  float swing_df_end   = 0.40f;
+  float swing_unload_s = 0.60f;
+  int16_t iq_df_max = 120;   // +DF
+  // push-off
+  float stance_pf_start = 0.78f;
+  float stance_pf_end   = 0.92f;
+  float hip_ext_th      = -8.0f;
+  float ankle_df_th     = 22.0f;
+  uint32_t tpulse_ms    = 100;
+  int16_t iq_pf_max     = 180; // -PF
+  // hip
+  float hip_win_start   = 0.0f;
+  float hip_win_end     = 0.25f;
+  int16_t iq_hip_flex_max = 70;
+  // slew per 10ms
+  int16_t diq_up_df  = 4,  diq_dn_df  = 8;
+  int16_t diq_up_pf  = 6,  diq_dn_pf  = 10;
+  int16_t diq_up_hip = 3,  diq_dn_hip = 6;
+  // abnormal
+  int16_t iq_small   = 20;
+  float   v_rev      = 5.0f;
+  uint32_t t_no_move_ms = 200;
+  float   v_small    = 3.0f;
+  float   a_small    = 0.5f;
+  uint32_t cooldown_ms  = 500;
+  uint32_t soft_exit_ms = 200;
+  // stance progress
+  float Tst_init = 0.6f; // 初始 stance 周期
+};
+TorqueAssistParams torqueParams;
+
+// 控制杆输入（需在串口/CAN 回调中更新）
+volatile int16_t ankle_cmd_amp = 0; // 踝 push-off / DF 强度
+volatile int16_t hip_cmd_amp   = 0; // 髋屈助力强度
+
+// 踝速度估计
+struct AnkleVelEstimator {
+  bool initialized = false;
+  float last_deg = 0.0f;
+  uint32_t last_ms = 0;
+  float vel = 0.0f;
+  float vel_f = 0.0f;   // EMA 滤波
+};
+AnkleVelEstimator ankleVel;
+
+// STANCE 进度估计
+struct StanceProgress {
+  float Tst_avg = 0.6f;
+  uint32_t phase_start_ms = 0;
+};
+StanceProgress stanceProg;
+
+// Push-off 脉冲状态机
+struct PushOffPulse {
+  bool active = false;
+  uint32_t start_ms = 0;
+  int16_t iq_peak = 0; // 负值（跖屈）
+};
+PushOffPulse pushOff;
+
+// 关节安全状态（斜率限制 + 冷却）
+struct JointSafetyState {
+  int16_t iq_cmd_prev = 0;
+  bool compliant = false;
+  bool in_cooldown = false;
+  uint32_t cooldown_start_ms = 0;
+  uint32_t abnormal_start_ms = 0;
+};
+JointSafetyState ankleSafety;
+JointSafetyState hipSafety;
+
+struct AssistDebugFlags {
+  bool pushOffActive = false;
+  bool dfActive = false;
+  bool unloadActive = false;
+};
+AssistDebugFlags assistFlags;
+
+// 异常原因（仅用于调试）
+enum AbnormalReason {
+  ABN_NONE = 0,
+  ABN_REV_DIR,
+  ABN_NO_MOVE
+};
+AbnormalReason ankleAbn = ABN_NONE;
+
+// ============================================================================
+// 辅助函数：速度估计 / STANCE 进度 / 安全管线 / IQ 计算
+// ============================================================================
+
+void updateAnkleVelEstimator(float ankle_deg, uint32_t nowMs) {
+  if (!ankleVel.initialized) {
+    ankleVel.initialized = true;
+    ankleVel.last_deg = ankle_deg;
+    ankleVel.last_ms = nowMs;
+    ankleVel.vel = 0.0f;
+    ankleVel.vel_f = 0.0f;
+    return;
+  }
+  uint32_t dt_ms = nowMs - ankleVel.last_ms;
+  if (dt_ms == 0) return;
+  float dt = dt_ms / 1000.0f;
+  float vel = (ankle_deg - ankleVel.last_deg) / dt;
+  ankleVel.vel = vel;
+  const float beta = 0.2f; // 与 hip 速度滤波一致
+  ankleVel.vel_f = ankleVel.vel_f + beta * (vel - ankleVel.vel_f);
+  ankleVel.last_deg = ankle_deg;
+  ankleVel.last_ms = nowMs;
+}
+
+void updateStanceProgress(GaitPhase phase, uint32_t nowMs) {
+  static GaitPhase lastPhase = PHASE_STANCE;
+  if (stanceProg.Tst_avg <= 0.05f) stanceProg.Tst_avg = torqueParams.Tst_init;
+
+  if (phase != lastPhase) {
+    if (lastPhase == PHASE_STANCE && phase == PHASE_SWING) {
+      uint32_t dur_ms = nowMs - stanceProg.phase_start_ms;
+      float Tnew = dur_ms / 1000.0f;
+      if (Tnew > 0.1f && Tnew < 3.0f) {
+        stanceProg.Tst_avg = 0.8f * stanceProg.Tst_avg + 0.2f * Tnew;
+      }
+    }
+    stanceProg.phase_start_ms = nowMs;
+    lastPhase = phase;
+  }
+}
+
+float getStancePct(GaitPhase phase, uint32_t nowMs) {
+  if (phase != PHASE_STANCE) return 0.0f;
+  uint32_t dur_ms = nowMs - stanceProg.phase_start_ms;
+  float Tst = (stanceProg.Tst_avg > 0.1f) ? stanceProg.Tst_avg : torqueParams.Tst_init;
+  float pct = (dur_ms / 1000.0f) / Tst;
+  if (pct < 0.0f) pct = 0.0f;
+  if (pct > 1.0f) pct = 1.0f;
+  return pct;
+}
+
+int16_t applySafetyPipeline(JointSafetyState &st,
+                            int16_t iq_target,
+                            int16_t iq_pos_max,
+                            int16_t iq_neg_max,
+                            int16_t diq_up,
+                            int16_t diq_dn,
+                            uint32_t nowMs) {
+  // 冷却期：强制 0
+  if (st.in_cooldown) {
+    if (nowMs - st.cooldown_start_ms >= torqueParams.cooldown_ms) {
+      st.in_cooldown = false;
+    } else {
+      iq_target = 0;
+    }
+  }
+
+  // 幅值限幅（正向 DF / 负向 PF）
+  if (iq_target > iq_pos_max) iq_target = iq_pos_max;
+  if (iq_target < -iq_neg_max) iq_target = -iq_neg_max;
+
+  int16_t iq_prev = st.iq_cmd_prev;
+  int16_t diff = iq_target - iq_prev;
+  if (diff > diq_up) diff = diq_up;
+  if (diff < -diq_dn) diff = -diq_dn;
+  int16_t iq_cmd = iq_prev + diff;
+
+  // 软退出：把 iq 拉回 0，并进入冷却
+  if (st.compliant) {
+    if (iq_cmd > 0) {
+      iq_cmd -= torqueParams.diq_dn_df;
+      if (iq_cmd < 0) iq_cmd = 0;
+    } else if (iq_cmd < 0) {
+      iq_cmd += torqueParams.diq_dn_df;
+      if (iq_cmd > 0) iq_cmd = 0;
+    }
+    if (iq_cmd == 0) {
+      st.compliant = false;
+      st.in_cooldown = true;
+      st.cooldown_start_ms = nowMs;
+    }
+  }
+
+  st.iq_cmd_prev = iq_cmd;
+  return iq_cmd;
+}
+
+void updateAnkleAbnormalDetector(int16_t iq_cmd,
+                                 uint32_t nowMs,
+                                 float ankle_deg,
+                                 float ankle_deg_prev,
+                                 float ankle_vel_f) {
+  static uint32_t rev_counter_ms = 0;
+  static uint32_t no_move_start_ms = 0;
+  static float last_deg_for_no_move = 0.0f;
+
+  ankleAbn = ABN_NONE;
+
+  // D1: 速度反向（50ms 确认）
+  if (abs(iq_cmd) > torqueParams.iq_small) {
+    bool expect_df = iq_cmd > 0;
+    if (expect_df && ankle_vel_f < -torqueParams.v_rev) {
+      rev_counter_ms += 10;
+    } else if (!expect_df && ankle_vel_f > torqueParams.v_rev) {
+      rev_counter_ms += 10;
+    } else {
+      rev_counter_ms = 0;
+    }
+    if (rev_counter_ms >= 50) {
+      ankleAbn = ABN_REV_DIR;
+    }
+  } else {
+    rev_counter_ms = 0;
+  }
+
+  // D2: 无响应卡滞（200ms 窗）
+  if (abs(iq_cmd) > torqueParams.iq_small) {
+    if (no_move_start_ms == 0) {
+      no_move_start_ms = nowMs;
+      last_deg_for_no_move = ankle_deg;
+    } else if (nowMs - no_move_start_ms >= torqueParams.t_no_move_ms) {
+      float ddeg = fabsf(ankle_deg - last_deg_for_no_move);
+      if (fabsf(ankle_vel_f) < torqueParams.v_small &&
+          ddeg < torqueParams.a_small) {
+        ankleAbn = ABN_NO_MOVE;
+      }
+      no_move_start_ms = nowMs;
+      last_deg_for_no_move = ankle_deg;
+    }
+  } else {
+    no_move_start_ms = 0;
+  }
+}
+
+int16_t computeAnkleIqTarget(GaitPhase phase,
+                             float swing_pct,
+                             float stance_pct,
+                             float ankle_deg,
+                             float /*ankle_vel_f*/,
+                             float hip_deg,
+                             uint32_t nowMs) {
+  assistFlags.pushOffActive = false;
+  assistFlags.dfActive = false;
+  assistFlags.unloadActive = false;
+
+  int16_t iq_target = 0;
+
+  // A3: Swing late unload
+  if (phase == PHASE_SWING && swing_pct > torqueParams.swing_unload_s) {
+    assistFlags.unloadActive = true;
+    return 0;
+  }
+
+  // A1: Push-off（仅 STANCE）
+  if (phase == PHASE_STANCE) {
+    bool in_window = stance_pct >= torqueParams.stance_pf_start &&
+                     stance_pct <= torqueParams.stance_pf_end;
+    bool hip_ok = hip_deg <= torqueParams.hip_ext_th;
+    bool ankle_ok = ankle_deg >= torqueParams.ankle_df_th;
+
+    if (!pushOff.active && in_window && hip_ok && ankle_ok && !ankleSafety.in_cooldown) {
+      pushOff.active = true;
+      pushOff.start_ms = nowMs;
+      int16_t peak = (int16_t)abs(ankle_cmd_amp);
+      if (peak <= 0) peak = torqueParams.iq_pf_max;
+      if (peak > torqueParams.iq_pf_max) peak = torqueParams.iq_pf_max;
+      pushOff.iq_peak = -peak; // 跖屈为负
+    }
+
+    if (pushOff.active) {
+      if ((nowMs - pushOff.start_ms) <= torqueParams.tpulse_ms &&
+          !ankleSafety.in_cooldown) {
+        iq_target = pushOff.iq_peak;
+        assistFlags.pushOffActive = true;
+      } else {
+        pushOff.active = false;
+      }
+    }
+    return iq_target; // STANCE 阶段不做 swing DF
+  }
+
+  // 进入 SWING 时，如脉冲未结束则强制关闭
+  if (phase == PHASE_SWING && pushOff.active) {
+    pushOff.active = false;
+  }
+
+  // A2: Swing early DF
+  if (phase == PHASE_SWING &&
+      swing_pct >= torqueParams.swing_df_start &&
+      swing_pct <= torqueParams.swing_df_end) {
+    float theta_min_df = torqueParams.theta_min_df;
+    float margin = torqueParams.theta_margin;
+    float e = theta_min_df - ankle_deg;
+    float e_eff = e - torqueParams.e_dead;
+    if (e_eff < 0.0f) e_eff = 0.0f;
+    if (e_eff > torqueParams.e_sat) e_eff = torqueParams.e_sat;
+
+    if (e_eff > 0.0f) {
+      float Kdf = (float)torqueParams.iq_df_max / torqueParams.e_sat;
+      float iqf = Kdf * e_eff;
+      if (iqf > torqueParams.iq_df_max) iqf = (float)torqueParams.iq_df_max;
+      iq_target = (int16_t)iqf; // DF 正向
+      assistFlags.dfActive = true;
+    } else if (ankle_deg > theta_min_df + margin) {
+      iq_target = 0;
+    }
+  }
+
+  return iq_target;
+}
+
+int16_t computeHipIqTarget(GaitPhase phase,
+                           float swing_pct,
+                           float hip_deg,
+                           float hip_vel_f) {
+  (void)hip_deg;
+  (void)hip_vel_f;
+  if (phase != PHASE_SWING) return 0;
+  if (swing_pct < torqueParams.hip_win_start ||
+      swing_pct > torqueParams.hip_win_end) return 0;
+
+  int16_t amp = (int16_t)abs(hip_cmd_amp);
+  if (amp <= 0) amp = torqueParams.iq_hip_flex_max;
+  if (amp > torqueParams.iq_hip_flex_max) amp = torqueParams.iq_hip_flex_max;
+
+  int16_t sign = 1; // 若实际方向相反，可改为 -1
+  return sign * amp;
+}
 
 GaitDataCollection gaitCollection = {false, 0, 20}; // 默认20ms间隔（50Hz）
 
@@ -2634,6 +3029,24 @@ void processSerialCommand() {
     setAnkleAssistEnabled(false);
     Serial.println(">>> Ankle dorsiflexion assist DISABLED");
   }
+  // 髋关节力矩模式控制（串口调试）
+  else if (cmd.startsWith("hiptorque")) {
+    // 支持："hiptorque on <iq>", "hiptorque off", "hiptorque"(显示状态)
+    if (cmd == "hiptorque") {
+      Serial.printf(">>> Hip torque mode: %s, target iq=%d\n", hipTorqueMode ? "ON" : "OFF", hipIqTarget);
+    } else if (cmd.startsWith("hiptorque on")) {
+      int space = cmd.indexOf(' ', 12);
+      if (space > 0) {
+        int16_t iq = cmd.substring(space + 1).toInt();
+        hipIqTarget = iq;
+      }
+      hipTorqueMode = true;
+      Serial.printf(">>> Hip torque MODE ENABLED, target iq=%d\n", hipIqTarget);
+    } else if (cmd == "hiptorque off" || cmd == "hiptorque disable") {
+      hipTorqueMode = false;
+      Serial.println(">>> Hip torque MODE DISABLED");
+    }
+  }
   // 顺从控制调试命令：compliance
   else if (cmd == "compliance" || cmd == "comp") {
     if (complianceCtrl.initialized) {
@@ -2943,135 +3356,112 @@ void updateControlLoop() {
   bool ankleDataOk = (ankleStatus.lastUpdateMs > 0) && 
                      ((now - ankleStatus.lastUpdateMs) < COMM_TIMEOUT_MS);
   
-  // 注意：传感器轮询由 updateSensorPolling() 统一处理，这里不再请求
-  // 如果数据不新鲜，说明传感器轮询可能有问题，但这里不处理（避免重复请求）
-  
   // ========================================================================
-  // 2. 相位识别和相位边沿检测（相位门控）
+  // 2. 相位识别与 gait 进度
   // ========================================================================
-  // 获取当前相位与进度/趋势
   GaitPhase currentPhase = gaitPhaseDetector.initialized ? 
                            gaitPhaseDetector.currentPhase : PHASE_STANCE;
-  float s = (swingProgress.initialized) ? swingProgress.swing_progress : 0.0f;
-  bool isSwing = (currentPhase == PHASE_SWING);
+  float swing_pct = getSwingProgress();   // 0~1
+  updateStanceProgress(currentPhase, now);
+  float stance_pct = getStancePct(currentPhase, now);
+  float ankle_deg = getAnkleDeg();
+  float hip_deg   = getHipDeg();
+  updateAnkleVelEstimator(ankle_deg, now);
+  float ankle_vel_f = ankleVel.vel_f;
   float hip_vel_f = hipProcessor.hip_vel_f;
-  // 释放判定（双重保护）：
-  // - 不在 SWING：一定释放
-  // - 在 SWING：只有当 (s > 0.9) 或 (hip_vel_f < -10.0) 才释放
-  // 只要髋角还在往前冲（hip_vel_f 为正），必须顶住位置不准释放
-  bool releaseTorque = (!isSwing) || (s > 0.9f) || (hip_vel_f < -10.0f);
-  
-  // 相位边沿处理：检测相位变化
+
+  // 相位边沿记录（保持与旧逻辑兼容）
   if (currentPhase != controlLoop.prevPhase) {
-    // 相位发生变化
-    if (currentPhase == PHASE_STANCE && controlLoop.prevPhase == PHASE_SWING) {
-      // 从 SWING 进入 STANCE：发送 STOP，释放力矩
-      stopMotor(ankleMotor);
-      controlLoop.ankleTorqueReleased = true;
-      Serial.printf("[PHASE] SWING -> STANCE: STOP sent, torque released\n");
-    } else if (currentPhase == PHASE_SWING && controlLoop.prevPhase == PHASE_STANCE) {
-      // 从 STANCE 进入 SWING：重置标志，准备恢复 A4 控制
-      controlLoop.ankleTorqueReleased = false;
-      Serial.printf("[PHASE] STANCE -> SWING: torque release flag reset, A4 ready\n");
-    }
-    // 更新上一相位
     controlLoop.prevPhase = currentPhase;
-  }
-
-  // 强制控制：SWING 时立即触发最大背屈目标，STANCE 时卸力
-  float theta_ref = 0.0f;
-  if (releaseTorque) {
-    // 后期或支撑相：释放电机力矩（0x81）
-    if (!controlLoop.ankleTorqueReleased) {
-      stopMotor(ankleMotor);  // 0x81 停止，卸荷
-      controlLoop.ankleTorqueReleased = true;
+    // 进入 STANCE 时不再频繁 STOP，只重置 push-off 状态
+    if (currentPhase == PHASE_STANCE) {
+      pushOff.active = false;
     }
-    controlLoop.anklePositionActive = false;
-    theta_ref = getAnkleDeg();  // 仅用于后续安全检查，不下发 A4
-  } else {
-    // SWING 且髋角仍在向前摆动：强制驱动到最大背屈目标
-    controlLoop.ankleTorqueReleased = false;
-    controlLoop.anklePositionActive = true;
-    // 立即触发目标角度：使用 updateAnkleAssistStrategy 计算的结果（参数化的背屈目标角度）
-    theta_ref = getAnkleReferenceAngle();
   }
-  
-  // ========================================================================
-  // 3. 辅助计算（已在handleCanMessage中更新）
-  // ========================================================================
-  // 辅助策略和顺从控制在handleCanMessage中已更新
-  
-  // ========================================================================
-  // 4. 顺从控制逻辑已关闭：不再根据电流/误差调整速度
-  // ========================================================================
 
   // ========================================================================
-  // 状态打印（1Hz频率）
+  // 3. 计算 iq_target
+  // ========================================================================
+  int16_t ankle_iq_target = computeAnkleIqTarget(
+      currentPhase, swing_pct, stance_pct,
+      ankle_deg, ankle_vel_f, hip_deg, now);
+
+  int16_t hip_iq_target = computeHipIqTarget(
+      currentPhase, swing_pct,
+      hipProcessor.hip_f, hip_vel_f);
+
+  // 更新 act 标志：有非零踝 iq 视为“位置追踪/助力中”
+  controlLoop.anklePositionActive = (ankle_iq_target != 0);
+
+  // ========================================================================
+  // 4. 异常检测 & 安全管线
+  // ========================================================================
+  static float ankle_deg_prev = 0.0f;
+  updateAnkleAbnormalDetector(ankle_iq_target, now,
+                              ankle_deg, ankle_deg_prev,
+                              ankle_vel_f);
+  ankle_deg_prev = ankle_deg;
+
+  // 如果检测到异常且尚未进入 compliant，则启动软退出
+  if (ankleAbn != ABN_NONE && !ankleSafety.compliant && !ankleSafety.in_cooldown) {
+    ankleSafety.compliant = true;
+    ankleSafety.abnormal_start_ms = now;
+  }
+
+  int16_t ankle_iq_cmd = applySafetyPipeline(
+      ankleSafety,
+      ankle_iq_target,
+      torqueParams.iq_df_max,
+      torqueParams.iq_pf_max,
+      (ankle_iq_target >= 0) ? torqueParams.diq_up_df : torqueParams.diq_up_pf,
+      (ankle_iq_target >= 0) ? torqueParams.diq_dn_df : torqueParams.diq_dn_pf,
+      now);
+
+  int16_t hip_iq_cmd = applySafetyPipeline(
+      hipSafety,
+      hip_iq_target,
+      torqueParams.iq_hip_flex_max,
+      torqueParams.iq_hip_flex_max,
+      torqueParams.diq_up_hip,
+      torqueParams.diq_dn_hip,
+      now);
+
+  // ========================================================================
+  // 5. 下发 A1 转矩命令（保持 100Hz，不阻塞）
+  // ========================================================================
+  if (ankleDataOk) {
+    sendTorqueCommand(ankleMotor, ankle_iq_cmd);
+  } else {
+    ankleSafety.iq_cmd_prev = 0;
+  }
+
+  if (hipDataOk) {
+    // 若 hipTorqueMode 仍需手动测试，可在此增加优先级判断
+    sendTorqueCommand(hipMotor, hip_iq_cmd);
+  } else {
+    hipSafety.iq_cmd_prev = 0;
+  }
+
+  // ========================================================================
+  // 6. 调试输出（100ms）
   // ========================================================================
   {
-    static uint32_t lastStatusPrintMs = 0;
-    uint32_t now = millis();
-    if (now - lastStatusPrintMs >= 1000) {  // 1Hz = 1000ms
-      lastStatusPrintMs = now;
-      
-      // 获取相位字符串
-      const char* phaseStr = gaitPhaseDetector.initialized ? 
-        (gaitPhaseDetector.currentPhase == PHASE_SWING ? "SWING" : "STANCE") : "UNKNOWN";
-      
-      // 打印状态
-      // Serial.printf("[STATUS] phase=%s, ankle_ref=%.2f, ankle_deg=%.2f, err=%.2f, iq=%d, "
-      //               "ctrlon=%d, ankleOk=%d, hipOk=%d, enabled=%d, init=%d, state=%s, factor=%.2f\n",
-      //               phaseStr, theta_ref, ankle_deg, err, ankleStatus.iq,
-      //               controlLoop.controlEnabled ? 1 : 0,
-      //               ankleDataOk ? 1 : 0,
-      //               hipDataOk ? 1 : 0,
-      //               ankleAssist.enabled ? 1 : 0,
-      //               complianceCtrl.initialized ? 1 : 0,
-      //               stateStr, speedFactor);
-    }
-  }
-  
-  // ========================================================================
-  // 5. 下发控制命令（仅在辅助启用且数据有效时）
-  // ========================================================================
-  // 相位门控：STANCE 时不发 A4（如果已经 STOP 过）
-  bool shouldSendA4 = ankleAssist.enabled && ankleAssist.initialized && 
-                       ankleDataOk && hipDataOk &&
-                       hipProcessor.initialized && adaptiveThreshold.initialized &&
-                       gaitPhaseDetector.initialized && swingProgress.initialized &&
-                       !controlLoop.ankleTorqueReleased;  // STANCE 时已 STOP，不再发 A4
-  
-  if (shouldSendA4) {
-    // 获取参考角度
-    // float theta_ref = getAnkleReferenceAngle();
-    
-    // 限制参考角度在安全范围内（双重保险）
-    if (theta_ref < ANKLE_THETA_MIN) {
-      theta_ref = ANKLE_THETA_MIN;
-    } else if (theta_ref > ANKLE_THETA_MAX) {
-      theta_ref = ANKLE_THETA_MAX;
-    }
-    
-    // 使用参数化的电机速度（可通过串口指令设置）
-    // 确保在摆动相开始的瞬间，踝关节以设定的响应速度抬起
-    uint16_t motorSpeed = controlLoop.motorSpeed;
-    
-    // 发送位置控制命令（带速度限制，A4）
-    // 如果发送失败（CAN队列满），记录错误但不阻塞
-    if (!sendPositionCommandWithSpeed(ankleMotor, theta_ref, motorSpeed)) {
-      // 发送失败，记录错误（限制输出频率）
-      static uint32_t lastCtrlErrorMs = 0;
-      uint32_t now = millis();
-      if (now - lastCtrlErrorMs >= 1000) {
-        Serial.printf("[CTRL ERROR] Failed to send position command (TX queue full?)\n");
-        lastCtrlErrorMs = now;
-      }
-    }
-    
-    // 调试输出（每100次控制循环输出一次，避免串口阻塞）
-    if (controlLoop.controlCount % 100 == 0) {
-      Serial.printf("[CTRL] ref=%.2f deg, speed=%u (max), iq=%d mA\n",
-                   theta_ref, motorSpeed, ankleStatus.iq);
+    static uint32_t lastDbgMs = 0;
+    if (now - lastDbgMs >= 100) {
+      lastDbgMs = now;
+      Serial.printf("[ASSIST] ph=%d, s=%.3f, st=%.3f, "
+                    "ank=%.2f, v=%.2f, iqT_a=%d, iqC_a=%d, "
+                    "hip=%.2f, hipv=%.2f, iqT_h=%d, iqC_h=%d, "
+                    "flags:PF=%d,DF=%d,UL=%d,comp=%d,cool=%d,abn=%d\n",
+                    (int)currentPhase, swing_pct, stance_pct,
+                    ankle_deg, ankle_vel_f, ankle_iq_target, ankle_iq_cmd,
+                    hip_deg, hip_vel_f, hip_iq_target, hip_iq_cmd,
+                    assistFlags.pushOffActive ? 1 : 0,
+                    assistFlags.dfActive ? 1 : 0,
+                    assistFlags.unloadActive ? 1 : 0,
+                    ankleSafety.compliant ? 1 : 0,
+                    ankleSafety.in_cooldown ? 1 : 0,
+                    (int)ankleAbn);
     }
   }
 }
@@ -3105,6 +3495,24 @@ void loop() {
   
   // 100Hz控制循环（仅在启用时执行）
   updateControlLoop();
+
+  // 如果髋关节力矩模式使能，则周期性发送转矩控制命令（例如每50ms）
+  if (hipTorqueMode) {
+    uint32_t now = millis();
+    const uint32_t HIP_TORQUE_PERIOD_MS = 50;
+    if (now - hipTorqueLastSendMs >= HIP_TORQUE_PERIOD_MS) {
+      hipTorqueLastSendMs = now;
+      // 发送转矩控制
+      if (!sendTorqueCommand(hipMotor, hipIqTarget)) {
+        // 发送失败时简单记录一次错误，避免串口阻塞
+        static uint32_t lastHipTorqueErrMs = 0;
+        if (now - lastHipTorqueErrMs > 1000) {
+          Serial.println("[TX ERROR] Failed to send hip torque command");
+          lastHipTorqueErrMs = now;
+        }
+      }
+    }
+  }
   
   // 更新摆动（用于调试功能）
   updateSwing(hipSwing);
