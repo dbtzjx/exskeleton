@@ -594,7 +594,6 @@ class GaitDataCollector:
             self.is_loaded_data = True
             
             # 载入外部数据时，重置上次绘制长度，确保只重绘一次
-            self._last_cycle_len = -1
             self._last_realtime_len = -1
             
             return True
@@ -794,8 +793,7 @@ class GaitDataCollector:
 
 class GaitDataCollectorGUI:
     def __init__(self, root):
-        # 初始化周期长度缓存（用于性能优化）
-        self._last_cycle_len = -1
+        # 初始化实时曲线长度缓存（用于性能优化）
         self._last_realtime_len = -1  # 最近一次实时曲线点数，用于避免重复重绘
         self._last_realtime_latest = None  # 最近一次实时曲线的最新时间戳，用于滑动窗口检测
         self.root = root
@@ -986,14 +984,121 @@ class GaitDataCollectorGUI:
                                          bg='#E0E0E0', fg='#006600', width=8, relief=tk.RAISED, bd=2)
         self.ankle_ref_label.grid(row=0, column=5, padx=5, pady=3)
         
-        # 创建matplotlib图表
-        self.fig = Figure(figsize=(10, 8), dpi=100)
-        self.ax1 = self.fig.add_subplot(2, 1, 1)
+        # 创建matplotlib图表（只保留实时数据图，删除步态周期图）
+        self.fig = Figure(figsize=(10, 6), dpi=100)
+        self.ax1 = self.fig.add_subplot(1, 1, 1)
         # 右侧 Y 轴：只创建一次，后续重复使用，避免在每次刷新时不断叠加新的坐标轴
         self.ax1_right = self.ax1.twinx()
-        self.ax2 = self.fig.add_subplot(2, 1, 2)
         
         self.canvas = FigureCanvasTkAgg(self.fig, plot_frame)
+        
+        # 创建标志位复选框区域（替代原来的步态周期图）
+        flags_frame = ttk.LabelFrame(plot_frame, text="标志位", padding="10")
+        flags_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=False, padx=5, pady=5)
+        
+        # 数据标志位（第一行）
+        data_flags_frame = ttk.Frame(flags_frame)
+        data_flags_frame.pack(side=tk.TOP, fill=tk.X, pady=5)
+        ttk.Label(data_flags_frame, text="数据标志位:", font=('', 9, 'bold')).pack(side=tk.LEFT, padx=5)
+        
+        # 定义数据标志位及其说明
+        data_flags = [
+            ("ph", "步态相位（Phase），表示当前步态的阶段（如站立、摆动等）"),
+            ("s", "步态进度（swing_pct），表示当前步态周期的进度，通常是一个百分比值"),
+            ("st", "站立时间或相关时间，可能表示站立阶段的时间"),
+            ("ank", "踝关节角度（ankle angle），表示踝关节当前的角度"),
+            ("v", "踝关节速度（velocity），表示踝关节的角速度（deg/s）"),
+            ("iqT_a", "踝关节目标力矩（target torque），表示期望的踝关节助力大小"),
+            ("iqC_a", "踝关节实际力矩（current torque），表示实际输出的踝关节助力值"),
+            ("hip", "髋关节角度（hip angle），表示髋关节当前的角度"),
+            ("hipv", "髋关节速度（hip velocity），表示髋关节的角速度（deg/s）"),
+            ("iqT_h", "髋关节目标力矩（target torque），表示期望的髋关节助力大小"),
+            ("iqC_h", "髋关节实际力矩（current torque），表示实际输出的髋关节助力值"),
+        ]
+        
+        # 存储复选框变量
+        self.flag_vars = {}
+        
+        # 创建数据标志位复选框
+        for i, (flag_name, tooltip_text) in enumerate(data_flags):
+            var = tk.BooleanVar(value=True)
+            self.flag_vars[flag_name] = var
+            
+            # 创建复选框框架
+            check_frame = ttk.Frame(data_flags_frame)
+            check_frame.pack(side=tk.LEFT, padx=3)
+            
+            # 复选框
+            cb = ttk.Checkbutton(check_frame, text=flag_name, variable=var)
+            cb.pack(side=tk.LEFT)
+            
+            # 问号标签（带提示）
+            help_label = ttk.Label(check_frame, text="?", cursor="hand2", 
+                                   foreground="blue", font=('', 9, 'bold'))
+            help_label.pack(side=tk.LEFT, padx=(2, 0))
+            
+            # 绑定提示（使用ToolTip或简单messagebox）
+            def create_tooltip(widget, tooltip_text_local):
+                def show_tooltip(event):
+                    tooltip = tk.Toplevel()
+                    tooltip.wm_overrideredirect(True)
+                    tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+                    label = ttk.Label(tooltip, text=tooltip_text_local, background="#ffffe0", 
+                                     relief=tk.SOLID, borderwidth=1, 
+                                     font=('', 9), wraplength=300)
+                    label.pack()
+                    tooltip.after(5000, tooltip.destroy)  # 5秒后自动关闭
+                widget.bind("<Button-1>", show_tooltip)
+            
+            create_tooltip(help_label, tooltip_text)
+        
+        # 状态标志位（第二行）
+        state_flags_frame = ttk.Frame(flags_frame)
+        state_flags_frame.pack(side=tk.TOP, fill=tk.X, pady=5)
+        ttk.Label(state_flags_frame, text="状态标志位:", font=('', 9, 'bold')).pack(side=tk.LEFT, padx=5)
+        
+        # 定义状态标志位及其说明
+        state_flags = [
+            ("PF", "跖屈助力（push-off）状态，表示是否处于跖屈助力阶段"),
+            ("DF", "背屈助力（swing DF）状态，表示是否处于背屈助力阶段"),
+            ("UL", "卸载（unload）状态，表示是否处于卸载阶段"),
+            ("comp", "退让（compliant）模式状态，表示是否处于退让模式"),
+            ("cool", "冷却模式状态，表示是否处于冷却模式"),
+            ("abn", "异常状态，表示是否处于异常状态"),
+        ]
+        
+        # 创建状态标志位复选框
+        for i, (flag_name, tooltip_text) in enumerate(state_flags):
+            var = tk.BooleanVar(value=True)
+            self.flag_vars[flag_name] = var
+            
+            # 创建复选框框架
+            check_frame = ttk.Frame(state_flags_frame)
+            check_frame.pack(side=tk.LEFT, padx=3)
+            
+            # 复选框
+            cb = ttk.Checkbutton(check_frame, text=flag_name, variable=var)
+            cb.pack(side=tk.LEFT)
+            
+            # 问号标签（带提示）
+            help_label = ttk.Label(check_frame, text="?", cursor="hand2", 
+                                   foreground="blue", font=('', 9, 'bold'))
+            help_label.pack(side=tk.LEFT, padx=(2, 0))
+            
+            # 绑定提示
+            def create_tooltip(widget, tooltip_text_local):
+                def show_tooltip(event):
+                    tooltip = tk.Toplevel()
+                    tooltip.wm_overrideredirect(True)
+                    tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+                    label = ttk.Label(tooltip, text=tooltip_text_local, background="#ffffe0", 
+                                     relief=tk.SOLID, borderwidth=1, 
+                                     font=('', 9), wraplength=300)
+                    label.pack()
+                    tooltip.after(5000, tooltip.destroy)  # 5秒后自动关闭
+                widget.bind("<Button-1>", show_tooltip)
+            
+            create_tooltip(help_label, tooltip_text)
         
         # 工具栏
         toolbar_frame = ttk.Frame(plot_frame)
@@ -1168,7 +1273,6 @@ class GaitDataCollectorGUI:
             self.add_history(f"数据已从 {folder_path} 载入", "信息")
             
             # 强制更新图表（清除缓存，确保重绘）
-            self._last_cycle_len = -1
             self._last_realtime_len = -1
             if hasattr(self, '_plot_initialized'):
                 self._plot_initialized = False  # 强制重新初始化绘制
@@ -1252,16 +1356,12 @@ class GaitDataCollectorGUI:
     
     def reset_zoom(self):
         """重置图表缩放，显示全部曲线"""
-        # 重置第一个图表（实时数据）
+        # 重置实时数据图表
         self.ax1.relim()
         self.ax1.autoscale()
         if hasattr(self, "ax1_right") and self.ax1_right is not None:
             self.ax1_right.relim()
             self.ax1_right.autoscale()
-        
-        # 重置第二个图表（步态周期）
-        self.ax2.relim()
-        self.ax2.autoscale()
         
         # 更新图表显示
         self.canvas.draw()
@@ -1273,8 +1373,6 @@ class GaitDataCollectorGUI:
         if messagebox.askyesno("确认", "确定要清除所有采集的数据和曲线吗？"):
             # 清除数据
             self.collector.clear_all_data()
-            # 重置周期长度缓存
-            self._last_cycle_len = -1
             # 重置缩放
             self.reset_zoom()
             # 异步更新图表（避免阻塞主线程）
@@ -1372,36 +1470,7 @@ class GaitDataCollectorGUI:
             self.ax1.set_ylabel('角度 (度)')
             self.ax1.grid(True)
         
-        # 更新步态周期图
-        xlim2 = self.ax2.get_xlim() if len(self.ax2.lines) > 0 else None
-        auto_scale_x2 = (xlim2 is None or xlim2 == (0.0, 1.0))
-        
-        self.ax2.clear()
-        cycle_time, cycle_hip, cycle_ankle = self.collector.get_gait_cycle_data()
-        if len(cycle_time) > 0 and len(cycle_hip) > 0 and len(cycle_ankle) > 0:
-            self.ax2.plot(cycle_time, cycle_hip, 'b-', label='髋关节', linewidth=2)
-            self.ax2.plot(cycle_time, cycle_ankle, 'r-', label='踝关节', linewidth=2)
-            self.ax2.set_title('最新步态周期', fontsize=12)
-            self.ax2.set_xlabel('时间 (秒)')
-            self.ax2.set_ylabel('角度 (度)')
-            self.ax2.grid(True)
-            self.ax2.legend(loc='upper right')
-            if not auto_scale_x2 and xlim2 is not None:
-                self.ax2.set_xlim(xlim2)
-            else:
-                self.ax2.relim()
-                self.ax2.autoscale()
-        else:
-            self.ax2.text(0.5, 0.5, '暂无步态周期数据\n（等待数据采集...）', 
-                         horizontalalignment='center', verticalalignment='center',
-                         transform=self.ax2.transAxes, fontsize=12)
-            self.ax2.set_title('最新步态周期', fontsize=12)
-            self.ax2.set_xlabel('时间 (秒)')
-            self.ax2.set_ylabel('角度 (度)')
-            self.ax2.grid(True)
-        
-        # 更新周期长度缓存
-        self._last_cycle_len = len(cycle_time)
+        # 已删除步态周期图，不再更新
         
         # 使用draw_idle避免阻塞
         self.canvas.draw_idle()
@@ -1513,16 +1582,11 @@ class GaitDataCollectorGUI:
     
     def setup_plots(self):
         """设置图表"""
-        # 测试阶段：只显示髋关节原始值和滤波值
-        self.ax1.set_title('实时数据（髋关节原始值和滤波值）', fontsize=12)
+        # 只显示实时数据图
+        self.ax1.set_title('实时数据（髋关节和踝关节角度，髋关节速度）', fontsize=12)
         self.ax1.set_xlabel('时间 (秒)')
         self.ax1.set_ylabel('角度 (度)')
         self.ax1.grid(True)
-        
-        self.ax2.set_title('最新步态周期', fontsize=12)
-        self.ax2.set_xlabel('时间 (秒)')
-        self.ax2.set_ylabel('角度 (度)')
-        self.ax2.grid(True)
         
         self.fig.tight_layout()
     
@@ -1556,9 +1620,6 @@ class GaitDataCollectorGUI:
             if event.inaxes == self.ax1:
                 self.xlim_backup = self.ax1.get_xlim()
                 self.ylim_backup = self.ax1.get_ylim()
-            elif event.inaxes == self.ax2:
-                self.xlim_backup = self.ax2.get_xlim()
-                self.ylim_backup = self.ax2.get_ylim()
     
     def on_release(self, event):
         """鼠标释放事件"""
@@ -1586,13 +1647,6 @@ class GaitDataCollectorGUI:
             self.ax1.set_xlim(new_xlim)
             # Y轴保持不变
             self.ax1.set_ylim(self.ylim_backup)
-        elif event.inaxes == self.ax2:
-            xlim = self.xlim_backup
-            x_range = xlim[1] - xlim[0]
-            new_xlim = (xlim[0] - dx, xlim[1] - dx)
-            self.ax2.set_xlim(new_xlim)
-            # Y轴保持不变
-            self.ax2.set_ylim(self.ylim_backup)
         
         self.canvas.draw_idle()
     
@@ -1631,21 +1685,14 @@ class GaitDataCollectorGUI:
         # 检查在哪个axes中（使用axes的bbox来检查）
         ax = None
         ax1_bbox = self.ax1.bbox
-        ax2_bbox = self.ax2.bbox
         
-        if ax1_bbox and ax2_bbox:
+        if ax1_bbox:
             # 检查点是否在ax1的bbox内
             ax1_x0, ax1_y0 = ax1_bbox.x0, ax1_bbox.y0
             ax1_x1, ax1_y1 = ax1_bbox.x1, ax1_bbox.y1
             
-            # 检查点是否在ax2的bbox内
-            ax2_x0, ax2_y0 = ax2_bbox.x0, ax2_bbox.y0
-            ax2_x1, ax2_y1 = ax2_bbox.x1, ax2_bbox.y1
-            
             if ax1_x0 <= fig_x <= ax1_x1 and ax1_y0 <= fig_y <= ax1_y1:
                 ax = self.ax1
-            elif ax2_x0 <= fig_x <= ax2_x1 and ax2_y0 <= fig_y <= ax2_y1:
-                ax = self.ax2
             else:
                 return
         else:
@@ -1714,9 +1761,6 @@ class GaitDataCollectorGUI:
         if event.inaxes == self.ax1:
             ax = self.ax1
             xlim = self.ax1.get_xlim()
-        elif event.inaxes == self.ax2:
-            ax = self.ax2
-            xlim = self.ax2.get_xlim()
         else:
             return
         
@@ -1939,61 +1983,7 @@ class GaitDataCollectorGUI:
                     self.ax1.set_ylabel('角度 (度)')
                     self.ax1.grid(True)
         
-        # 更新第二个图表（步态周期）
-        cycle_time, cycle_hip, cycle_ankle = self.collector.get_gait_cycle_data()
-        
-        if not hasattr(self, '_cycle_plot_initialized'):
-            self._cycle_plot_initialized = False
-            self._last_cycle_len = 0
-            self._cycle_plot_lines = {'hip': None, 'ankle': None}
-        
-        cycle_data_changed = (len(cycle_time) != self._last_cycle_len)
-        
-        # 只在数据有实质性变化时重绘
-        if cycle_data_changed:
-            self.ax2.clear()
-            self._cycle_plot_lines = {}
-            
-            if len(cycle_time) > 0 and len(cycle_hip) > 0 and len(cycle_ankle) > 0:
-                # 使用降采样优化性能（如果数据点过多）
-                cycle_time_arr = np.array(cycle_time)
-                cycle_hip_arr = np.array(cycle_hip)
-                cycle_ankle_arr = np.array(cycle_ankle)
-                
-                # 如果数据点超过 500 个，进行降采样（每 2 个取 1 个）
-                if len(cycle_time_arr) > 500:
-                    step = max(1, len(cycle_time_arr) // 500)
-                    cycle_time_arr = cycle_time_arr[::step]
-                    cycle_hip_arr = cycle_hip_arr[::step]
-                    cycle_ankle_arr = cycle_ankle_arr[::step]
-                
-                line_hip, = self.ax2.plot(cycle_time_arr, cycle_hip_arr, 'b-', 
-                                         label='髋关节', linewidth=2)
-                line_ankle, = self.ax2.plot(cycle_time_arr, cycle_ankle_arr, 'r-', 
-                                           label='踝关节', linewidth=2)
-                self._cycle_plot_lines['hip'] = line_hip
-                self._cycle_plot_lines['ankle'] = line_ankle
-                
-                self.ax2.set_title('最新步态周期', fontsize=12)
-                self.ax2.set_xlabel('时间 (秒)')
-                self.ax2.set_ylabel('角度 (度)')
-                self.ax2.grid(True, alpha=0.3)
-                self.ax2.legend(loc='upper right', fontsize=9)
-                self.ax2.relim()
-                self.ax2.autoscale()
-                
-                self._cycle_plot_initialized = True
-            else:
-                self.ax2.text(0.5, 0.5, '暂无步态周期数据\n（等待数据采集...）', 
-                             horizontalalignment='center', verticalalignment='center',
-                             transform=self.ax2.transAxes, fontsize=12)
-                self.ax2.set_title('最新步态周期', fontsize=12)
-                self.ax2.set_xlabel('时间 (秒)')
-                self.ax2.set_ylabel('角度 (度)')
-                self.ax2.grid(True)
-                self._cycle_plot_initialized = True
-            
-            self._last_cycle_len = len(cycle_time)
+        # 已删除步态周期图，不再更新
         
         # ========== 性能优化2：动态调整刷新频率 ==========
         # 根据数据到达速率动态调整更新间隔，减少不必要的绘制
@@ -2025,8 +2015,7 @@ class GaitDataCollectorGUI:
         # 当从空白恢复（_last_realtime_len=0 且 new_len>0）时，也要立即重绘
         need_draw = (
             (data_increment > 15 or data_increment < 0) or  # 数据增长或缓冲区重置
-            (self._last_realtime_len == 0 and new_len > 0) or  # 从空白状态恢复
-            cycle_data_changed
+            (self._last_realtime_len == 0 and new_len > 0)  # 从空白状态恢复
         )
         
         # ✓ 诊断：绘制决策已在内部处理
