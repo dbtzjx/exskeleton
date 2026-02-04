@@ -3,12 +3,20 @@
 #include <math.h>
 #include <ArduinoJson.h>
 
+// ISR 上下文标志：当定时器回调在运行时置位，用于抑制 Serial 输出
+volatile bool inIsrContext = false;
+
+#include <IntervalTimer.h>
+// 定时器前向声明与变量
+void runControlLoopOnce();
+IntervalTimer controlTimer;
+
 // ============================================================================
 // CAN 协议配置（根据《电机CAN总线通讯协议 V2.35》）
 // ============================================================================
 
 // 使用 Teensy 4.1 的 CAN1 控制器（对应底板 CAN 引脚）
-FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> can1;
+FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_64> can1;
 
 // 电机配置结构体
 struct MotorConfig {
@@ -561,7 +569,7 @@ void updateSwingProgress() {
     // 当前是摆动相，计算进度
     uint32_t swingDurationMs = getCurrentPhaseDurationMs();
     swingProgress.t_swing = swingDurationMs / 1000.0f;  // 转换为秒
-
+    
     // 空间偏移映射进度：
     //   s = (hf - hip_min) / max(hip_max_last - hip_min, 15.0)
     // 这样0点永远对齐“起摆物理起点”（STANCE阶段的谷值），幅值使用上一周期的峰-谷差
@@ -1084,7 +1092,7 @@ bool sendCanCommand(uint8_t motorId, uint8_t cmd, const uint8_t *data = nullptr,
   
   // 尝试发送 CAN 消息，如果发送队列满则返回 false
   if (can1.write(msg)) {
-    if (printDebug) {
+    if (printDebug && !inIsrContext) {
       Serial.printf("[TX] Motor %d, CMD=0x%02X, ID=0x%03X, Data: ", motorId, cmd, msg.id);
       for (int i = 0; i < 8; i++) {
         Serial.printf("%02X ", msg.buf[i]);
@@ -1098,7 +1106,9 @@ bool sendCanCommand(uint8_t motorId, uint8_t cmd, const uint8_t *data = nullptr,
     uint32_t now = millis();
     // 限制错误输出频率（每1秒最多输出一次），避免串口阻塞
     if (now - lastErrorMs >= 1000) {
-      Serial.printf("[TX ERROR] Motor %d, CMD=0x%02X failed (TX queue full?)\n", motorId, cmd);
+      if (!inIsrContext) {
+        Serial.printf("[TX ERROR] Motor %d, CMD=0x%02X failed (TX queue full?)\n", motorId, cmd);
+      }
       lastErrorMs = now;
     }
     return false;
@@ -1113,8 +1123,7 @@ bool sendTorqueCommand(const MotorConfig &motor, int16_t iqControl) {
   data[4] = (uint8_t)(iqControl & 0xFF);
   data[5] = (uint8_t)((iqControl >> 8) & 0xFF);
   // 打开 printDebug 便于调试
-  // return sendCanCommand(motor.id, CMD_TORQUE_CTRL, data, 7, false);
-  return true;
+  return sendCanCommand(motor.id, CMD_TORQUE_CTRL, data, 7, false);
 }
 
 // 使能电机（电机运行命令 0x88）
@@ -1368,9 +1377,11 @@ void handleCanMessage(const CAN_message_t &msg) {
         status->errorState = errorState;
         status->enabled = (motorState == 0x00);
         
-        Serial.printf("[RX] %s: temp=%d℃, voltage=%.2fV, current=%.2fA, state=0x%02X, error=0x%02X, ID=0x%03X\n",
-                      motor->name, temperature, voltage * 0.01f, current * 0.01f, 
-                      motorState, errorState, msg.id);
+        if (!inIsrContext) {
+          Serial.printf("[RX] %s: temp=%d℃, voltage=%.2fV, current=%.2fA, state=0x%02X, error=0x%02X, ID=0x%03X\n",
+                        motor->name, temperature, voltage * 0.01f, current * 0.01f, 
+                        motorState, errorState, msg.id);
+        }
       }
       //else if (cmd == CMD_READ_STATUS2 || cmd == CMD_POSITION_CTRL1 || cmd == CMD_POSITION_CTRL2) {
       else if (cmd == CMD_READ_STATUS2) {
@@ -1407,7 +1418,9 @@ void handleCanMessage(const CAN_message_t &msg) {
         int16_t iq = (int16_t)(msg.buf[1] | (msg.buf[2] << 8));
         hipTorqueMode = true;
         hipIqTarget = iq;
-        Serial.printf(">>> BOARD: Enable hip torque mode, iq=%d\n", hipIqTarget);
+        if (!inIsrContext) {
+          Serial.printf(">>> BOARD: Enable hip torque mode, iq=%d\n", hipIqTarget);
+        }
         // 回复ACK
         CAN_message_t ack;
         ack.id = BOARD_CMD_ID;
@@ -1421,7 +1434,9 @@ void handleCanMessage(const CAN_message_t &msg) {
         return;
       } else if (bcmd == BOARD_CMD_DISABLE_HIP_TORQUE) {
         hipTorqueMode = false;
-        Serial.println(">>> BOARD: Disable hip torque mode");
+        if (!inIsrContext) {
+          Serial.println(">>> BOARD: Disable hip torque mode");
+        }
         CAN_message_t ack;
         ack.id = BOARD_CMD_ID;
         ack.len = 8;
@@ -1434,11 +1449,13 @@ void handleCanMessage(const CAN_message_t &msg) {
     }
 
     // 其他未知帧，原样打印
-    Serial.printf("[RX] Unknown ID=0x%03X, DLC=%u, Data: ", msg.id, msg.len);
-    for (int i = 0; i < msg.len; i++) {
-      Serial.printf("%02X ", msg.buf[i]);
+    if (!inIsrContext) {
+      Serial.printf("[RX] Unknown ID=0x%03X, DLC=%u, Data: ", msg.id, msg.len);
+      for (int i = 0; i < msg.len; i++) {
+        Serial.printf("%02X ", msg.buf[i]);
+      }
+      Serial.println();
     }
-    Serial.println();
   }
 }
 
@@ -2197,10 +2214,15 @@ struct TorqueAssistParams {
   float ankle_df_th     = 22.0f;
   uint32_t tpulse_ms    = 100;
   int16_t iq_pf_max     = 180; // -PF
-  // hip
+  // hip 助力窗口与幅值（可通过串口/上位机调节）
+  // hipAssistWindowEnd: 髋关节助力在 SWING 早期持续的摆动进度上限（0~1），例如 0.4 表示前 40%
+  // hipAssistMaxIq:     髋关节助力的最大峰值电流（iq 单位，可映射到 mA），例如 1500mA
+  float  hipAssistWindowEnd = 0.4f;
+  int16_t hipAssistMaxIq    = 50;
+  // 仍保留原有 hip 斜率/限幅参数，用于安全管线
   float hip_win_start   = 0.0f;
   float hip_win_end     = 0.25f;
-  int16_t iq_hip_flex_max = 70;
+  int16_t iq_hip_flex_max = 10;
   // slew per 10ms
   int16_t diq_up_df  = 4,  diq_dn_df  = 8;
   int16_t diq_up_pf  = 6,  diq_dn_pf  = 10;
@@ -2217,6 +2239,9 @@ struct TorqueAssistParams {
   float Tst_init = 0.6f; // 初始 stance 周期
 };
 TorqueAssistParams torqueParams;
+
+// 全局髋关节助力最大电流（mA 或 驱动单位），可通过串口或上位机调整
+int16_t hipAssistMaxIq = 0; // 0 表示使用 torqueParams.hipAssistMaxIq
 
 // 控制杆输入（需在串口/CAN 回调中更新）
 volatile int16_t ankle_cmd_amp = 0; // 踝 push-off / DF 强度
@@ -2500,16 +2525,55 @@ int16_t computeHipIqTarget(GaitPhase phase,
                            float hip_vel_f) {
   (void)hip_deg;
   (void)hip_vel_f;
-  if (phase != PHASE_SWING) return 0;
-  if (swing_pct < torqueParams.hip_win_start ||
-      swing_pct > torqueParams.hip_win_end) return 0;
+  // 仅在摆动相（SWING）内提供助力
+  if (phase != PHASE_SWING) {
+    return 0;
+  }
+
+  // 助力窗口：仅在 SWING 早期 [0, hipAssistWindowEnd] 内生效
+  float winEnd = torqueParams.hipAssistWindowEnd;
+  if (winEnd <= 0.0f) {
+    return 0;
+  }
+  if (swing_pct < 0.0f || swing_pct > winEnd) {
+    return 0;
+  }
+
+  // 将全局摆动进度映射到 [0,1] 的局部归一化时间 u
+  // u = 0: 助力开始；u = 1: 助力结束
+  float u = swing_pct / winEnd;
+  if (u < 0.0f) u = 0.0f;
+  if (u > 1.0f) u = 1.0f;
+
+  // 使用半个正弦波作为平滑窗函数：
+  // window(u) = sin(pi * u), 在 u ∈ [0,1] 上从 0 平滑上升到 1 再平滑回到 0
+  const float PI_F = 3.1415926f;
+  float window = sinf(PI_F * u);
+  if (window < 0.0f) window = 0.0f;  // 理论上不会小于0，这里只是防御性处理
+
+  // 助力峰值：由控制杆 hip_cmd_amp 决定，并受 hipAssistMaxIq 限幅
+    // 全局可调节的最大助力强度（以 hipAssistMaxIq 为优先）
+    extern int16_t hipAssistMaxIq;
+    int16_t maxIq = (hipAssistMaxIq > 0) ? hipAssistMaxIq : torqueParams.hipAssistMaxIq;
+  if (maxIq <= 0) {
+    // 若未显式配置，则退回到原有的 iq_hip_flex_max
+    maxIq = torqueParams.iq_hip_flex_max;
+  }
 
   int16_t amp = (int16_t)abs(hip_cmd_amp);
-  if (amp <= 0) amp = torqueParams.iq_hip_flex_max;
-  if (amp > torqueParams.iq_hip_flex_max) amp = torqueParams.iq_hip_flex_max;
+  if (amp <= 0) {
+    amp = maxIq;
+  } else if (amp > maxIq) {
+    amp = maxIq;
+  }
 
-  int16_t sign = 1; // 若实际方向相反，可改为 -1
-  return sign * amp;
+  // 髋屈为正方向，若实际机械安装相反，可将 sign 改为 -1
+  int16_t sign = 1;
+
+  // 根据窗函数缩放得到当前时刻的目标电流
+  float iq_f = (float)amp * window;
+  int16_t iq = (int16_t)iq_f;
+  return sign * iq;
 }
 
 GaitDataCollection gaitCollection = {false, 0, 20}; // 默认20ms间隔（50Hz）
@@ -3295,6 +3359,9 @@ void setup() {
   
   // 初始化默认步态轨迹
   initDefaultGaitTrajectory();
+  // 启动硬件定时器，直接在定时器回调中调用 runControlLoopOnce，周期 10ms (100Hz)
+  controlTimer.begin(runControlLoopOnce, 10000); // 10000 us = 10 ms
+  controlTimer.priority(128);
 }
 
 // ============================================================================
@@ -3313,6 +3380,9 @@ ControlLoop controlLoop = {
   5000      // motorSpeed (默认最大速度，协议单位，电机轴速度 dps)
 };
 
+// 控制循环定时器（通过定时器产生节拍，在 loop 中跑控制，避免 ISR 内部做重活）
+#include <IntervalTimer.h>
+
 // 启用/禁用控制循环
 void setControlLoopEnabled(bool enabled) {
   controlLoop.controlEnabled = enabled;
@@ -3324,26 +3394,51 @@ void setControlLoopEnabled(bool enabled) {
     startSensorPolling(20);  // 默认20ms间隔（50Hz）
   } else {
     Serial.println(">>> Control loop DISABLED");
+    // Timer continues running but runControlLoopOnce() will be no-op when disabled
     // 停止传感器轮询
     stopSensorPolling();
   }
 }
 
-// 100Hz控制循环（在主循环中调用）
-void updateControlLoop() {
+struct AssistDebugSnapshot {
+  int phase = 0;
+  float swing_pct = 0.0f;
+  float stance_pct = 0.0f;
+  float ankle_deg = 0.0f;
+  float ankle_vel_f = 0.0f;
+  int16_t ankle_iq_target = 0;
+  int16_t ankle_iq_cmd = 0;
+  float hip_deg = 0.0f;
+  float hip_vel_f = 0.0f;
+  int16_t hip_iq_target = 0;
+  int16_t hip_iq_cmd = 0;
+  uint8_t pf = 0, df = 0, ul = 0;
+  uint8_t comp = 0, cool = 0, abn = 0;
+  uint32_t lastUpdateMs = 0;
+};
+
+AssistDebugSnapshot assistDbg;  // 控制循环内更新，loop 中打印
+
+// 100Hz 控制循环主体（由定时器驱动，loop 中消费 pending 计数执行）
+void runControlLoopOnce() {
+  // Run only when enabled
   if (!controlLoop.controlEnabled) {
     return;
   }
-  
-  uint32_t now = millis();
-  uint32_t elapsed = now - controlLoop.lastControlMs;
-  
-  // 检查是否到达控制周期（10ms for 100Hz）
-  if (elapsed < controlLoop.controlIntervalMs) {
-    return;  // 还没到时间，跳过本次控制
+
+  // Enter ISR context: suppress Serial output in called functions
+  inIsrContext = true;
+
+  // 在每次控制计算前，优先处理所有 CAN 接收帧，确保获取到最新反馈
+  {
+    CAN_message_t inMsg;
+    // 处理尽可能多的消息，但避免死循环（硬件层面通常会停止返回）
+    while (can1.read(inMsg)) {
+      handleCanMessage(inMsg);
+    }
   }
 
-  // 更新控制时间戳
+  uint32_t now = millis();
   controlLoop.lastControlMs = now;
   controlLoop.controlCount++;
   
@@ -3378,7 +3473,7 @@ void updateControlLoop() {
       pushOff.active = false;
     }
   }
-
+  
   // ========================================================================
   // 3. 计算 iq_target
   // ========================================================================
@@ -3425,12 +3520,12 @@ void updateControlLoop() {
       torqueParams.diq_up_hip,
       torqueParams.diq_dn_hip,
       now);
-
+  
   // ========================================================================
   // 5. 下发 A1 转矩命令（保持 100Hz，不阻塞）
   // ========================================================================
   if (ankleDataOk) {
-    sendTorqueCommand(ankleMotor, ankle_iq_cmd);
+    // sendTorqueCommand(ankleMotor, ankle_iq_cmd);
   } else {
     ankleSafety.iq_cmd_prev = 0;
   }
@@ -3442,59 +3537,53 @@ void updateControlLoop() {
     hipSafety.iq_cmd_prev = 0;
   }
 
-  // ========================================================================
-  // 6. 调试输出（100ms）
-  // ========================================================================
-  {
+  // 记录调试快照，供 loop 中按需打印
+  assistDbg.phase = (int)currentPhase;
+  assistDbg.swing_pct = swing_pct;
+  assistDbg.stance_pct = stance_pct;
+  assistDbg.ankle_deg = ankle_deg;
+  assistDbg.ankle_vel_f = ankle_vel_f;
+  assistDbg.ankle_iq_target = ankle_iq_target;
+  assistDbg.ankle_iq_cmd = ankle_iq_cmd;
+  assistDbg.hip_deg = hip_deg;
+  assistDbg.hip_vel_f = hip_vel_f;
+  assistDbg.hip_iq_target = hip_iq_target;
+  assistDbg.hip_iq_cmd = hip_iq_cmd;
+  assistDbg.pf = assistFlags.pushOffActive ? 1 : 0;
+  assistDbg.df = assistFlags.dfActive ? 1 : 0;
+  assistDbg.ul = assistFlags.unloadActive ? 1 : 0;
+  assistDbg.comp = ankleSafety.compliant ? 1 : 0;
+  assistDbg.cool = ankleSafety.in_cooldown ? 1 : 0;
+  assistDbg.abn = (uint8_t)ankleAbn;
+  assistDbg.lastUpdateMs = now;
+  // 退出 ISR 上下文，允许主循环打印
+  inIsrContext = false;
+}
+void loop() {
+
+  // 处理串口命令（非阻塞）
+  processSerialCommand();
+
+  // 更新传感器轮询（在ctrlon开启时自动运行，喂数据给状态机）
+  updateSensorPolling();
+  // 调试信息打印（保持在 loop 中，避免占用控制节拍）
+  // 仅当控制循环启用时打印
+  if (controlLoop.controlEnabled) {
     static uint32_t lastDbgMs = 0;
-    if (now - lastDbgMs >= 100) {
+    uint32_t now = millis();
+    if (now - lastDbgMs >= 50 && assistDbg.lastUpdateMs != 0) {
       lastDbgMs = now;
       Serial.printf("[ASSIST] ph=%d, s=%.3f, st=%.3f, "
                     "ank=%.2f, v=%.2f, iqT_a=%d, iqC_a=%d, "
                     "hip=%.2f, hipv=%.2f, iqT_h=%d, iqC_h=%d, "
                     "flags:PF=%d,DF=%d,UL=%d,comp=%d,cool=%d,abn=%d\n",
-                    (int)currentPhase, swing_pct, stance_pct,
-                    ankle_deg, ankle_vel_f, ankle_iq_target, ankle_iq_cmd,
-                    hip_deg, hip_vel_f, hip_iq_target, hip_iq_cmd,
-                    assistFlags.pushOffActive ? 1 : 0,
-                    assistFlags.dfActive ? 1 : 0,
-                    assistFlags.unloadActive ? 1 : 0,
-                    ankleSafety.compliant ? 1 : 0,
-                    ankleSafety.in_cooldown ? 1 : 0,
-                    (int)ankleAbn);
+                    assistDbg.phase, assistDbg.swing_pct * 10.0f, assistDbg.stance_pct * 10.0f,
+                    assistDbg.ankle_deg, assistDbg.ankle_vel_f, assistDbg.ankle_iq_target, assistDbg.ankle_iq_cmd,
+                    assistDbg.hip_deg, assistDbg.hip_vel_f, assistDbg.hip_iq_target, assistDbg.hip_iq_cmd,
+                    assistDbg.pf, assistDbg.df, assistDbg.ul,
+                    assistDbg.comp, assistDbg.cool, assistDbg.abn);
     }
   }
-}
-
-void loop() {
-  // static uint32_t lastBeat=0, cnt=0;
-  // cnt++;
-  // if (millis()-lastBeat>=1000){
-  //   Serial.printf("loopHz=%lu\n", cnt);
-  //   cnt=0; lastBeat=millis();
-  // }
-
-  // 处理串口命令（非阻塞）
-  processSerialCommand();
-  
-  // 轮询接收 CAN 帧（非阻塞）
-  // 限制每次循环最多处理的消息数量，避免阻塞其他任务
-  {
-    CAN_message_t inMsg;
-    uint8_t msgCount = 0;
-    const uint8_t MAX_MSG_PER_LOOP = 10;  // 每次循环最多处理10条消息
-    while (can1.read(inMsg) && msgCount < MAX_MSG_PER_LOOP) {
-      handleCanMessage(inMsg);
-      msgCount++;
-    }
-    // 如果还有未处理的消息，在下次循环中处理（避免阻塞）
-  }
-  
-  // 更新传感器轮询（在ctrlon开启时自动运行，喂数据给状态机）
-  updateSensorPolling();
-  
-  // 100Hz控制循环（仅在启用时执行）
-  updateControlLoop();
 
   // 如果髋关节力矩模式使能，则周期性发送转矩控制命令（例如每50ms）
   if (hipTorqueMode) {
@@ -3502,6 +3591,7 @@ void loop() {
     const uint32_t HIP_TORQUE_PERIOD_MS = 50;
     if (now - hipTorqueLastSendMs >= HIP_TORQUE_PERIOD_MS) {
       hipTorqueLastSendMs = now;
+      Serial.println("力矩控制输出。。。");
       // 发送转矩控制
       if (!sendTorqueCommand(hipMotor, hipIqTarget)) {
         // 发送失败时简单记录一次错误，避免串口阻塞
