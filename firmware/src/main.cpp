@@ -12,6 +12,56 @@ void runControlLoopOnce();
 IntervalTimer controlTimer;
 
 // ============================================================================
+// 全局安全状态（Global Safety State）
+// ============================================================================
+volatile bool isSystemError = false;     // 系统是否处于严重错误状态
+volatile uint8_t errorMotorId = 0;       // 报错的电机ID
+volatile uint8_t errorCode = 0;          // 错误码
+bool errorPrinted = false;               // 错误信息是否已打印到串口
+
+// ============================================================================
+// 前向声明与结构体移动（解决编译依赖顺序问题）
+// ============================================================================
+
+// 传感器轮询状态
+struct SensorPollingTimer {
+  bool enabled;              // 是否启用轮询（在ctrlon开启时自动启用）
+  uint32_t lastPollMs;      // 上次轮询的时间
+  uint32_t pollIntervalMs;  // 轮询间隔（毫秒），建议 10-20ms
+};
+SensorPollingTimer sensorPolling = {false, 0, 20}; // 默认20ms间隔（50Hz）
+
+// 步态相位枚举（提前定义，ControlLoop需要）
+enum GaitPhase {
+  PHASE_STANCE = 0,  // 支撑相
+  PHASE_SWING = 1    // 摆动相
+};
+
+// 控制循环状态结构体
+struct ControlLoop {
+  uint32_t lastControlMs;      // 上次控制循环时间（毫秒）
+  uint32_t controlIntervalMs;  // 控制周期（毫秒），100Hz = 10ms
+  bool controlEnabled;         // 是否启用控制循环
+  uint32_t controlCount;       // 控制循环计数（用于调试）
+  bool ankleTorqueReleased;    // 兼容旧逻辑（保留但不再频繁使用 STOP）
+  bool anklePositionActive;    // 兼容 JSON 输出的 act 标志
+  GaitPhase prevPhase;         // 用于检测相位边沿
+  uint16_t motorSpeed;         // 踝关节电机速度参数（协议单位，电机轴速度 dps），可通过串口指令设置
+};
+ControlLoop controlLoop = {
+  0,        // lastControlMs
+  10,       // controlIntervalMs (100Hz = 10ms)
+  false,    // controlEnabled
+  0,        // controlCount
+  false,    // ankleTorqueReleased
+  false,    // anklePositionActive
+  PHASE_STANCE,  // prevPhase
+  5000      // motorSpeed (默认最大速度，协议单位，电机轴速度 dps)
+};
+
+
+
+// ============================================================================
 // CAN 协议配置（根据《电机CAN总线通讯协议 V2.35》）
 // ============================================================================
 
@@ -353,10 +403,12 @@ void updateAdaptiveThreshold(float hip_f) {
 // ============================================================================
 
 // 步态相位枚举
-enum GaitPhase {
-  PHASE_STANCE = 0,  // 支撑相
-  PHASE_SWING = 1    // 摆动相
-};
+// enum GaitPhase {
+//   PHASE_STANCE = 0,  // 支撑相
+//   PHASE_SWING = 1    // 摆动相
+// };
+// 已移动到文件头部
+
 
 // 步态相位识别状态
 struct GaitPhaseDetector {
@@ -677,7 +729,15 @@ void updateAnkleAssistStrategy(float ankle_deg, GaitPhase currentPhase, float sw
     // 立即触发目标角度：使用参数化的背屈目标角度，不再使用 S 曲线平滑
     ankleAssist.theta_ref = ankleAssist.dorsiflexion_target;
     ankleAssist.theta_target = ankleAssist.dorsiflexion_target;
-    ankleAssist.assist_factor = 1.0f;  // 最大助力
+    
+    // assist_factor 软启动：在摆动相前 200ms 内，从 0 线性增加到 1.0
+    // 这可以防止电流突然跳变，即使 target angle 已经到位
+    uint32_t swingDuration = getCurrentPhaseDurationMs();
+    if (swingDuration < 200) {
+        ankleAssist.assist_factor = (float)swingDuration / 200.0f;
+    } else {
+        ankleAssist.assist_factor = 1.0f;  // 最大助力
+    }
   } else {
     // 支撑相：跟随当前角度，不提供辅助
     ankleAssist.theta_ref = ankle_deg;
@@ -1377,10 +1437,32 @@ void handleCanMessage(const CAN_message_t &msg) {
         status->errorState = errorState;
         status->enabled = (motorState == 0x00);
         
-        if (!inIsrContext) {
-          Serial.printf("[RX] %s: temp=%d℃, voltage=%.2fV, current=%.2fA, state=0x%02X, error=0x%02X, ID=0x%03X\n",
-                        motor->name, temperature, voltage * 0.01f, current * 0.01f, 
-                        motorState, errorState, msg.id);
+        // if (!inIsrContext) {
+        //   Serial.printf("[RX] %s: temp=%d℃, voltage=%.2fV, current=%.2fA, state=0x%02X, error=0x%02X, ID=0x%03X\n",
+        //                 motor->name, temperature, voltage * 0.01f, current * 0.01f, 
+        //                 motorState, errorState, msg.id);
+        // }
+
+        // ====================================================================
+        // 严重错误检测（Emergency Stop）
+        // ====================================================================
+        // 如果电机报告错误（errorState != 0），立即停止所有控制!
+        if (errorState != 0) {
+          if (!isSystemError) {
+            isSystemError = true;
+            errorMotorId = motor->id;
+            errorCode = errorState;
+            
+            // 紧急停止控制循环
+            controlLoop.controlEnabled = false;
+            // 紧急停止传感器轮询
+            sensorPolling.enabled = false;
+            
+            // 下发停止命令（尝试停止电机）
+            // 注意：在ISR中发送CAN可能会有风险，但为了安全必须尝试
+            // sendCanCommand(motor->id, CMD_MOTOR_STOP); 
+            // 更好的做法是依赖全局标志让主循环停止，或者电机内部保护
+          }
         }
       }
       //else if (cmd == CMD_READ_STATUS2 || cmd == CMD_POSITION_CTRL1 || cmd == CMD_POSITION_CTRL2) {
@@ -2115,14 +2197,10 @@ void updateGaitPlayback() {
 // 传感器轮询定时器（独立于数据采集，负责喂数据给状态机）
 // ============================================================================
 
-// 传感器轮询状态
-struct SensorPollingTimer {
-  bool enabled;              // 是否启用轮询（在ctrlon开启时自动启用）
-  uint32_t lastPollMs;      // 上次轮询的时间
-  uint32_t pollIntervalMs;  // 轮询间隔（毫秒），建议 10-20ms
-};
+// 传感器轮询状态结构体已移动到文件头部
+// struct SensorPollingTimer { ... };
+// SensorPollingTimer sensorPolling = {false, 0, 20};
 
-SensorPollingTimer sensorPolling = {false, 0, 20}; // 默认20ms间隔（50Hz）
 
 // 启动传感器轮询（在ctrlon开启时调用）
 void startSensorPolling(uint32_t intervalMs = 20) {
@@ -2143,28 +2221,35 @@ void stopSensorPolling() {
 // 负责定期请求角度和状态2，喂数据给状态机
 void updateSensorPolling() {
   if (!sensorPolling.enabled) return;
+  // 如果发生系统错误，强制停止轮询
+  if (isSystemError) {
+    sensorPolling.enabled = false;
+    return;
+  }
   
   uint32_t now = millis();
+
+  // 即使不发送轮询请求，也要尝试读取CAN消息，确保及时处理
+  CAN_message_t inMsg;
+  if (can1.read(inMsg)) {
+    handleCanMessage(inMsg);
+  }
   
   // 定期请求角度和状态（固定频率轮询）
   if (now - sensorPolling.lastPollMs >= sensorPolling.pollIntervalMs) {
     sensorPolling.lastPollMs = now;
     
-    // 请求两个电机的角度（检查发送是否成功）
-    // 如果发送失败（CAN队列满），跳过本次轮询，避免阻塞
-    if (!requestMotorAngle(ankleMotor)) {
-      // 发送失败，跳过本次轮询
-      return;
-    }
-    if (!requestMotorAngle(hipMotor)) {
-      // 发送失败，跳过本次轮询
-      return;
-    }
+    // 尝试发送请求，即使某一个失败也不返回，尽可能多发
+    // 请求电机角度
+    requestMotorAngle(ankleMotor);
+    requestMotorAngle(hipMotor);
     
-    // 请求踝关节状态2（获取电流数据，用于顺从控制）
-    if (!sendCanCommand(ankleMotor.id, CMD_READ_STATUS2, nullptr, 0, false)) {
-      // 发送失败，但前两个已发送，继续执行
-    }
+    // 请求踝关节状态2（获取电流数据）
+    sendCanCommand(ankleMotor.id, CMD_READ_STATUS2, nullptr, 0, false);
+    
+    // 请求电机状态1（检测错误）
+    sendCanCommand(ankleMotor.id, CMD_READ_STATUS1, nullptr, 0, false);
+    sendCanCommand(hipMotor.id, CMD_READ_STATUS1, nullptr, 0, false);
   }
 }
 
@@ -2179,18 +2264,10 @@ struct GaitDataCollection {
   uint32_t sendIntervalMs;  // 发送间隔（毫秒），建议 10-50ms
 };
 
-// 控制循环状态结构体（供控制与调试输出 Active 标志使用）
-struct ControlLoop {
-  uint32_t lastControlMs;      // 上次控制循环时间（毫秒）
-  uint32_t controlIntervalMs;  // 控制周期（毫秒），100Hz = 10ms
-  bool controlEnabled;         // 是否启用控制循环
-  uint32_t controlCount;       // 控制循环计数（用于调试）
-  bool ankleTorqueReleased;    // 兼容旧逻辑（保留但不再频繁使用 STOP）
-  bool anklePositionActive;    // 兼容 JSON 输出的 act 标志
-  GaitPhase prevPhase;         // 用于检测相位边沿
-  uint16_t motorSpeed;         // 踝关节电机速度参数（协议单位，电机轴速度 dps），可通过串口指令设置
-};
-extern ControlLoop controlLoop;
+// 控制循环状态结构体已移动到文件头部
+// struct ControlLoop { ... };
+// extern ControlLoop controlLoop;
+
 
 // ============================================================================
 // 转矩助力控制：参数与状态（最小侵入式新增）
@@ -2206,14 +2283,14 @@ struct TorqueAssistParams {
   float swing_df_start = 0.05f;
   float swing_df_end   = 0.40f;
   float swing_unload_s = 0.60f;
-  int16_t iq_df_max = 120;   // +DF
+  int16_t iq_df_max = 5;   // +DF
   // push-off
-  float stance_pf_start = 0.78f;
-  float stance_pf_end   = 0.92f;
-  float hip_ext_th      = -8.0f;
-  float ankle_df_th     = 22.0f;
-  uint32_t tpulse_ms    = 100;
-  int16_t iq_pf_max     = 180; // -PF
+  float stance_pf_start = 0.75f;  // 原0.78，提前触发窗口
+  float stance_pf_end   = 0.95f;  // 原0.92，延长触发窗口
+  float hip_ext_th      = -6.0f;  // 原-8，放宽髋伸展要求
+  float ankle_df_th     = 18.0f;  // 原22，降低背屈阈值以增加触发机会
+  uint32_t tpulse_ms    = 120;    // 原200，缩短脉冲时长避免持续过载
+  int16_t iq_pf_max     = 20;     // -PF （保持20，待测试稳定后可逐步提高）
   // hip 助力窗口与幅值（可通过串口/上位机调节）
   // hipAssistWindowEnd: 髋关节助力在 SWING 早期持续的摆动进度上限（0~1），例如 0.4 表示前 40%
   // hipAssistMaxIq:     髋关节助力的最大峰值电流（iq 单位，可映射到 mA），例如 1500mA
@@ -2223,10 +2300,10 @@ struct TorqueAssistParams {
   float hip_win_start   = 0.0f;
   float hip_win_end     = 0.25f;
   int16_t iq_hip_flex_max = 10;
-  // slew per 10ms
-  int16_t diq_up_df  = 4,  diq_dn_df  = 8;
-  int16_t diq_up_pf  = 6,  diq_dn_pf  = 10;
-  int16_t diq_up_hip = 3,  diq_dn_hip = 6;
+  // slew per 10ms (OPTIMIZED FOR PUSH-OFF)
+  int16_t diq_up_df  = 4,   diq_dn_df  = 8;   // DF上升提速：原1→4
+  int16_t diq_up_pf  = 15,  diq_dn_pf  = 20;  // PF上升大幅提速：原6→15，确保120ms内能达到目标
+  int16_t diq_up_hip = 3,   diq_dn_hip = 6;   // 髋保持不变
   // abnormal
   int16_t iq_small   = 20;
   float   v_rev      = 5.0f;
@@ -3369,16 +3446,9 @@ void setup() {
 // ============================================================================
 
 // 控制循环变量定义（结构体定义已移到前面）
-ControlLoop controlLoop = {
-  0,        // lastControlMs
-  10,       // controlIntervalMs (100Hz = 10ms)
-  false,    // controlEnabled
-  0,        // controlCount
-  false,    // ankleTorqueReleased
-  false,    // anklePositionActive
-  PHASE_STANCE,  // prevPhase
-  5000      // motorSpeed (默认最大速度，协议单位，电机轴速度 dps)
-};
+// 控制循环变量定义（结构体定义已移到前面）
+// controlLoop 定义已移到文件头部
+
 
 // 控制循环定时器（通过定时器产生节拍，在 loop 中跑控制，避免 ISR 内部做重活）
 #include <IntervalTimer.h>
@@ -3389,7 +3459,23 @@ void setControlLoopEnabled(bool enabled) {
   if (enabled) {
     controlLoop.lastControlMs = millis();
     controlLoop.controlCount = 0;
-    Serial.println(">>> Control loop ENABLED (100Hz)");
+    
+    // 重置安全状态和滤波器，防止由于上次残留的大电流导致瞬间冲击
+    ankleSafety.iq_cmd_prev = 0;
+    ankleSafety.compliant = false;
+    ankleSafety.in_cooldown = false;
+    
+    hipSafety.iq_cmd_prev = 0;
+    hipSafety.compliant = false;
+    hipSafety.in_cooldown = false;
+    
+    // 重置助力控制器状态
+    ankleAssist.initialized = false; // 将触发 updateAnkleAssistStrategy 中的初始化逻辑
+    
+    // 重置步态检测与滤波
+    // hipProcessor.initialized = false; // 可选：是否重置滤波？暂时保留滤波历史可能更好
+    
+    Serial.println(">>> Control loop ENABLED (100Hz) - States Reset");
     // 自动启动传感器轮询（喂数据给状态机）
     startSensorPolling(20);  // 默认20ms间隔（50Hz）
   } else {
@@ -3525,14 +3611,14 @@ void runControlLoopOnce() {
   // 5. 下发 A1 转矩命令（保持 100Hz，不阻塞）
   // ========================================================================
   if (ankleDataOk) {
-    // sendTorqueCommand(ankleMotor, ankle_iq_cmd);
+    sendTorqueCommand(ankleMotor, ankle_iq_cmd);
   } else {
     ankleSafety.iq_cmd_prev = 0;
   }
 
   if (hipDataOk) {
     // 若 hipTorqueMode 仍需手动测试，可在此增加优先级判断
-    sendTorqueCommand(hipMotor, hip_iq_cmd);
+    // sendTorqueCommand(hipMotor, hip_iq_cmd);
   } else {
     hipSafety.iq_cmd_prev = 0;
   }
@@ -3561,6 +3647,29 @@ void runControlLoopOnce() {
 }
 void loop() {
 
+
+  // ========================================================================
+  // 严重错误处理
+  // ========================================================================
+  if (isSystemError) {
+    if (!errorPrinted) {
+      Serial.println("\n");
+      Serial.println("**************************************************");
+      Serial.println("              [EMERGENCY STOP]                    ");
+      Serial.printf ("    Motor %d Reported Error: 0x%02X              \n", errorMotorId, errorCode);
+      Serial.println("    System HALTED. Control Loop Stopped.          ");
+      Serial.println("**************************************************");
+      Serial.println("\n");
+      
+      // 尝试发送停止命令给两个电机
+      stopMotor(hipMotor);
+      stopMotor(ankleMotor);
+      
+      errorPrinted = true;
+    }
+    // 错误状态下只保留基本串口命令处理，不运行其他逻辑
+  }
+
   // 处理串口命令（非阻塞）
   processSerialCommand();
 
@@ -3573,22 +3682,26 @@ void loop() {
     uint32_t now = millis();
     if (now - lastDbgMs >= 50 && assistDbg.lastUpdateMs != 0) {
       lastDbgMs = now;
-      Serial.printf("[ASSIST] ph=%d, s=%.3f, st=%.3f, "
-                    "ank=%.2f, v=%.2f, iqT_a=%d, iqC_a=%d, "
-                    "hip=%.2f, hipv=%.2f, iqT_h=%d, iqC_h=%d, "
-                    "flags:PF=%d,DF=%d,UL=%d,comp=%d,cool=%d,abn=%d\n",
-                    assistDbg.phase, assistDbg.swing_pct * 10.0f, assistDbg.stance_pct * 10.0f,
-                    assistDbg.ankle_deg, assistDbg.ankle_vel_f, assistDbg.ankle_iq_target, assistDbg.ankle_iq_cmd,
-                    assistDbg.hip_deg, assistDbg.hip_vel_f, assistDbg.hip_iq_target, assistDbg.hip_iq_cmd,
-                    assistDbg.pf, assistDbg.df, assistDbg.ul,
-                    assistDbg.comp, assistDbg.cool, assistDbg.abn);
+      if (sensorPolling.enabled) {
+        Serial.printf("[ASSIST] ph=%d, s=%.3f, st=%.3f, "
+                      "ank=%.2f, v=%.2f, iqT_a=%d, iqC_a=%d, "
+                      "hip=%.2f, hipv=%.2f, iqT_h=%d, iqC_h=%d, "
+                      "flags:PF=%d,DF=%d,UL=%d,comp=%d,cool=%d,abn=%d\n",
+                      assistDbg.phase, assistDbg.swing_pct * 10.0f, assistDbg.stance_pct * 10.0f,
+                      assistDbg.ankle_deg, assistDbg.ankle_vel_f, assistDbg.ankle_iq_target, assistDbg.ankle_iq_cmd,
+                      assistDbg.hip_deg, assistDbg.hip_vel_f, assistDbg.hip_iq_target, assistDbg.hip_iq_cmd,
+                      assistDbg.pf, assistDbg.df, assistDbg.ul,
+                      assistDbg.comp, assistDbg.cool, assistDbg.abn);
+      } else {
+         Serial.println("[ASSIST-WARN] Sensor Polling DISABLED! (Check control loop or error state)");
+      }
     }
   }
 
   // 如果髋关节力矩模式使能，则周期性发送转矩控制命令（例如每50ms）
   if (hipTorqueMode) {
     uint32_t now = millis();
-    const uint32_t HIP_TORQUE_PERIOD_MS = 50;
+    const uint32_t HIP_TORQUE_PERIOD_MS = 100;
     if (now - hipTorqueLastSendMs >= HIP_TORQUE_PERIOD_MS) {
       hipTorqueLastSendMs = now;
       Serial.println("力矩控制输出。。。");
@@ -3613,4 +3726,21 @@ void loop() {
   
   // 更新步态轨迹播放
   updateGaitPlayback();
+  
+  // ========================================================================
+  // 6. 兜底 CAN 读取（当控制循环未开启时执行）
+  // ========================================================================
+  // 如果控制循环关闭，runControlLoopOnce 不会执行，因此也就不会读取 CAN。
+  // 这会导致 gc 指令、s 指令等无法更新数据。
+  // 因此在这里补充读取逻辑：
+  if (!controlLoop.controlEnabled) {
+    CAN_message_t inMsg;
+    // 限制每次 loop 最多读多少帧，避免阻塞太久
+    int maxReads = 10;
+    while (can1.read(inMsg) && maxReads > 0) {
+      handleCanMessage(inMsg);
+      maxReads--;
+    }
+  }
 }
+
