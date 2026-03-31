@@ -37,6 +37,8 @@ enum GaitPhase {
   PHASE_SWING = 1    // 摆动相
 };
 
+float getStancePct(GaitPhase phase, uint32_t nowMs);
+
 // 控制循环状态结构体
 struct ControlLoop {
   uint32_t lastControlMs;      // 上次控制循环时间（毫秒）
@@ -664,6 +666,369 @@ float getCurrentSwingDuration() {
 }
 
 // ============================================================================
+// 4相步态识别（PhaseDetect4）
+//
+// 在现有2相（STANCE/SWING）基础上，对支撑相细分为3个子相，共4相：
+//
+//   P1 承重期 LOADING      — 踵触地→足掌着地（0~20%支撑进度）
+//                            不施加主动助力；缓冲着地冲击；系统软启动
+//   P2 支撑中期 MID_STANCE — 足掌着地→踵离地（20~65%支撑进度）
+//                            踝中立位跟随；监测患者主动背屈意图；不干预
+//   P3 推进期 PUSH_OFF     — 踵离地→趾离地（65~100%支撑进度）
+//                            踝跖屈蹬地助力（PhaseProfile曲线输出）；改善推进
+//   P4 摆动相 SWING        — 趾离地→踵触地
+//                            踝背屈助力（PhaseProfile曲线软启动→保持）；防止拖地
+//
+// 切换条件：
+//   SWING→P1: 底层2相检测到STANCE（hip_vel_f < -10 deg/s，T_hold防抖）
+//   P1→P2:    stance_pct ≥ 20%（防抖40ms）或超时800ms强制推进
+//   P2→P3:    stance_pct ≥ 65%（防抖40ms）；超时2.5s触发退化
+//   P3→P4:    底层2相检测到SWING（delta_from_min > 1.5°且vel > 10 deg/s，T_hold防抖）
+//   P4→P1:    底层2相检测到STANCE（新步开始）；超时1.5s触发退化
+//
+// 退化策略：
+//   超时退化 — 任一相停留超过各自超时阈值（见 PHASE4_TIMEOUT_Px_MS），触发退化模式
+//   抖动退化 — 3秒内相切换次数≥14次，判定系统不稳定，触发退化模式
+//   退化模式 — 仅做2相→4相直接映射（STANCE→MID_STANCE/PUSH_OFF，SWING→SWING）
+//   自动恢复 — 退化后6秒自动尝试恢复到完整4相检测
+//   助力策略 — 退化为 true 时关闭 A1 跖屈与 A2 背屈 iq 助力及踝背屈参考策略（相位不可靠）
+// ============================================================================
+
+// 4相枚举
+enum GaitPhase4 {
+  PHASE4_LOADING    = 0,  // 承重期 (Loading Response)
+  PHASE4_MID_STANCE = 1,  // 支撑中期 (Mid-Stance)
+  PHASE4_PUSH_OFF   = 2,  // 推进期/蹬地 (Terminal Stance / Push-Off)
+  PHASE4_SWING      = 3   // 摆动相 (Swing)
+};
+
+// 相位曲线参数结构体（每相3参数 + 斜率限制）
+// 曲线形状：Gaussian窗函数
+//   output = amp * exp(-0.5 * ((progress - center) / width)^2)
+struct PhaseProfile {
+  float amp;         // 峰值助力因子（0.0 ~ 1.0）
+  float center;      // 曲线中心（相内归一化进度，0.0 ~ 1.0）
+  float width;       // 曲线半宽 sigma（0.0 ~ 1.0，越大越平缓）
+  float ramp_limit;  // 每10ms控制周期的最大输出变化量（软斜率限制，归一化）
+};
+
+// 4相默认曲线参数（P1/P2无助力，P3蹬地，P4背屈）
+PhaseProfile phaseProfiles[4] = {
+  // P1_LOADING: 无助力（amp=0），仅软启动缓冲
+  {0.0f, 0.5f,  0.40f, 0.03f},
+  // P2_MID_STANCE: 无主动助力（amp=0），监测患者主动意图
+  {0.0f, 0.5f,  0.40f, 0.03f},
+  // P3_PUSH_OFF: 蹬地助力，峰值在相内40%处（踵离地后快速上升）
+  {1.0f, 0.40f, 0.32f, 0.08f},
+  // P4_SWING: 背屈助力，峰值在相内30%处（趾离地后快速背屈保持）
+  {1.0f, 0.30f, 0.38f, 0.08f},
+};
+
+// 计算相位曲线输出（Gaussian窗函数）
+// 输入：profile（相位参数）、progress（相内进度 0~1）
+// 输出：0.0 ~ profile.amp
+float computePhaseProfileOutput(const PhaseProfile& profile, float progress) {
+  if (progress < 0.0f) progress = 0.0f;
+  if (progress > 1.0f) progress = 1.0f;
+  float sigma = (profile.width > 0.01f) ? profile.width : 0.01f;
+  float z = (progress - profile.center) / sigma;
+  float gauss = expf(-0.5f * z * z);
+  return profile.amp * gauss;
+}
+
+// ---- 4相切换阈值参数 ----
+// 支撑相内子相切换点（归一化支撑进度，基于stanceProg自适应值）
+const float    PHASE4_P1P2_STANCE_PCT = 0.20f;  // P1→P2切换（支撑进度20%，约120ms@0.6s周期）
+const float    PHASE4_P2P3_STANCE_PCT = 0.65f;  // P2→P3切换（支撑进度65%，确保早于蹬地窗0.75）
+
+// 子相内防抖时间（比主相位防抖T_HOLD_MS=80ms短，因支撑进度曲线更平滑）
+const uint32_t PHASE4_DEBOUNCE_MS     = 40;
+
+// 各相超时退化阈值
+const uint32_t PHASE4_TIMEOUT_P1_MS  = 800;    // P1承重期：超时强制推进到P2
+const uint32_t PHASE4_TIMEOUT_P2_MS  = 2500;   // P2中期：超时触发退化（用户停止或传感器异常）
+const uint32_t PHASE4_TIMEOUT_P3_MS  = 800;    // P3推进期：超时触发退化（蹬地期不应超过0.8s）
+const uint32_t PHASE4_TIMEOUT_P4_MS  = 1500;   // P4摆动相：超时触发退化（摆动不应超过1.5s）
+
+// 抖动退化检测参数
+const uint32_t PHASE4_UNSTABLE_WINDOW_MS    = 3000; // 抖动检测时间窗口（3秒）
+const uint8_t  PHASE4_UNSTABLE_TRANS_THRESH = 14;   // 3秒内子相切换≥14次则触发退化
+const uint32_t PHASE4_RECOVERY_MS           = 6000; // 退化后6秒自动尝试恢复
+
+// 4相状态机结构体
+struct GaitPhase4Detector {
+  GaitPhase4  currentPhase;         // 当前4相
+  uint32_t    phaseStartMs;         // 当前相开始时间（毫秒）
+  float       phaseProgress;        // 当前相内归一化进度（0.0 ~ 1.0）
+  float       profileOutput;        // 相位曲线输出（Gaussian，0.0 ~ amp）
+
+  // 子相切换防抖计时器
+  uint32_t    conditionHoldP2Ms;    // P1→P2条件持续计时（毫秒）
+  uint32_t    conditionHoldP3Ms;    // P2→P3条件持续计时（毫秒）
+
+  // 退化检测
+  bool        degraded;             // 是否处于退化模式（2相直接映射）
+  uint32_t    degradedStartMs;      // 退化开始时间
+  uint8_t     transitionCount;      // 最近窗口内子相切换计数
+  uint32_t    transitionWindowMs;   // 切换计数窗口起始时间
+
+  bool        initialized;
+  uint32_t    lastUpdateMs;
+};
+
+GaitPhase4Detector phase4Det = {
+  PHASE4_LOADING,  // currentPhase
+  0,               // phaseStartMs
+  0.0f,            // phaseProgress
+  0.0f,            // profileOutput
+  0, 0,            // conditionHoldP2Ms, conditionHoldP3Ms
+  false, 0,        // degraded, degradedStartMs
+  0, 0,            // transitionCount, transitionWindowMs
+  false,           // initialized
+  0                // lastUpdateMs
+};
+
+// 登记一次子相切换，维护抖动计数器；超过阈值触发退化
+void phase4RegisterTransition(uint32_t nowMs) {
+  // 窗口超时则重置计数
+  if (nowMs - phase4Det.transitionWindowMs >= PHASE4_UNSTABLE_WINDOW_MS) {
+    phase4Det.transitionCount = 0;
+    phase4Det.transitionWindowMs = nowMs;
+  }
+  if (phase4Det.transitionCount < 255) {
+    phase4Det.transitionCount++;
+  }
+  if (!phase4Det.degraded &&
+      phase4Det.transitionCount >= PHASE4_UNSTABLE_TRANS_THRESH) {
+    phase4Det.degraded = true;
+    phase4Det.degradedStartMs = nowMs;
+  }
+}
+
+// 切换到指定4相（重置进度与防抖计时器，登记切换）
+void phase4SwitchTo(GaitPhase4 newPhase, uint32_t nowMs) {
+  phase4Det.currentPhase      = newPhase;
+  phase4Det.phaseStartMs      = nowMs;
+  phase4Det.phaseProgress     = 0.0f;
+  phase4Det.conditionHoldP2Ms = 0;
+  phase4Det.conditionHoldP3Ms = 0;
+  phase4RegisterTransition(nowMs);
+}
+
+// 更新4相步态状态机（100Hz，在runControlLoopOnce中调用）
+// 依赖：gaitPhaseDetector、swingProgress、stanceProg 均已更新
+void updateGaitPhase4Detector() {
+  if (!gaitPhaseDetector.initialized || !swingProgress.initialized) return;
+
+  uint32_t nowMs = millis();
+
+  // --- 初始化 ---
+  if (!phase4Det.initialized) {
+    GaitPhase base = gaitPhaseDetector.currentPhase;
+    phase4Det.currentPhase      = (base == PHASE_SWING) ? PHASE4_SWING : PHASE4_LOADING;
+    phase4Det.phaseStartMs      = nowMs;
+    phase4Det.phaseProgress     = 0.0f;
+    phase4Det.profileOutput     = 0.0f;
+    phase4Det.degraded          = false;
+    phase4Det.transitionCount   = 0;
+    phase4Det.transitionWindowMs = nowMs;
+    phase4Det.initialized       = true;
+    phase4Det.lastUpdateMs      = nowMs;
+    return;
+  }
+
+  uint32_t dt_ms = nowMs - phase4Det.lastUpdateMs;
+  if (dt_ms == 0) {
+    return;  // 避免在同一ms内重复执行
+  }
+  phase4Det.lastUpdateMs = nowMs;
+
+  // ---- 退化模式处理 ----
+  if (phase4Det.degraded) {
+    // 超过恢复等待时间，重置退化并回到4相检测
+    if (nowMs - phase4Det.degradedStartMs >= PHASE4_RECOVERY_MS) {
+      phase4Det.degraded = false;
+      phase4Det.transitionCount = 0;
+      phase4Det.transitionWindowMs = nowMs;
+      GaitPhase base = gaitPhaseDetector.currentPhase;
+      phase4Det.currentPhase  = (base == PHASE_SWING) ? PHASE4_SWING : PHASE4_LOADING;
+      phase4Det.phaseStartMs  = nowMs;
+      phase4Det.phaseProgress = 0.0f;
+      // 继续执行主状态机（不return，phaseDur=0安全）
+    } else {
+      // 退化期间：2相直接映射到4相（不细分支撑子相）
+      GaitPhase base = gaitPhaseDetector.currentPhase;
+      if (base == PHASE_SWING) {
+        if (phase4Det.currentPhase != PHASE4_SWING) {
+          phase4Det.currentPhase = PHASE4_SWING;
+          phase4Det.phaseStartMs = nowMs;
+        }
+        phase4Det.phaseProgress = getSwingProgress();
+      } else {
+        // STANCE → 仅按支撑进度切换MID_STANCE / PUSH_OFF，跳过LOADING细分
+        float sp = getStancePct(PHASE_STANCE, nowMs);
+        GaitPhase4 target = (sp >= PHASE4_P2P3_STANCE_PCT) ?
+                            PHASE4_PUSH_OFF : PHASE4_MID_STANCE;
+        if (phase4Det.currentPhase != target) {
+          phase4Det.currentPhase = target;
+          phase4Det.phaseStartMs = nowMs;
+        }
+        phase4Det.phaseProgress = sp;
+      }
+      phase4Det.profileOutput = computePhaseProfileOutput(
+          phaseProfiles[(int)phase4Det.currentPhase], phase4Det.phaseProgress);
+      return;
+    }
+  }
+
+  // ---- 获取底层状态 ----
+  GaitPhase basePhase  = gaitPhaseDetector.currentPhase;
+  float     swing_pct  = getSwingProgress();
+  float     stance_pct = getStancePct(basePhase, nowMs);
+  uint32_t  phaseDur   = nowMs - phase4Det.phaseStartMs;
+
+  // ========================================================================
+  // 主状态机
+  // ========================================================================
+  switch (phase4Det.currentPhase) {
+
+    // ---- P1: 承重期 ----
+    // 入口条件：SWING→STANCE（底层heel strike检测）
+    // 出口条件：支撑进度≥20%（足掌着地完成）或超时800ms强制推进
+    // 动作意图：不施加主动助力；确保系统软启动；踝自然着地
+    case PHASE4_LOADING: {
+      // 异常快速切换：底层已进入SWING，直接跟随
+      if (basePhase == PHASE_SWING) {
+        phase4SwitchTo(PHASE4_SWING, nowMs);
+        break;
+      }
+      // 超时强制推进（承重期卡死保护）
+      if (phaseDur >= PHASE4_TIMEOUT_P1_MS) {
+        phase4SwitchTo(PHASE4_MID_STANCE, nowMs);
+        break;
+      }
+      // 正常切换：支撑进度达到P1P2边界 + 防抖
+      if (stance_pct >= PHASE4_P1P2_STANCE_PCT) {
+        phase4Det.conditionHoldP2Ms += dt_ms;
+      } else {
+        phase4Det.conditionHoldP2Ms = 0;
+      }
+      if (phase4Det.conditionHoldP2Ms >= PHASE4_DEBOUNCE_MS) {
+        phase4SwitchTo(PHASE4_MID_STANCE, nowMs);
+      } else {
+        // P1内进度：以超时阈值归一化的时间进度
+        phase4Det.phaseProgress = constrain(
+            (float)phaseDur / (float)PHASE4_TIMEOUT_P1_MS, 0.0f, 1.0f);
+      }
+      break;
+    }
+
+    // ---- P2: 支撑中期 ----
+    // 入口条件：P1结束（支撑进度≥20%）
+    // 出口条件：支撑进度≥65%（踵即将离地）
+    // 动作意图：踝中立位跟随；监测患者主动背屈意图；不主动干预
+    case PHASE4_MID_STANCE: {
+      // 底层提前进入SWING（极短步或检测提前），跳过推进期
+      if (basePhase == PHASE_SWING) {
+        phase4SwitchTo(PHASE4_SWING, nowMs);
+        break;
+      }
+      // 超时退化（用户站立不动或传感器异常）
+      if (phaseDur >= PHASE4_TIMEOUT_P2_MS) {
+        phase4Det.degraded = true;
+        phase4Det.degradedStartMs = nowMs;
+        break;
+      }
+      // 正常切换：支撑进度达到P2P3边界 + 防抖
+      if (stance_pct >= PHASE4_P2P3_STANCE_PCT) {
+        phase4Det.conditionHoldP3Ms += dt_ms;
+      } else {
+        phase4Det.conditionHoldP3Ms = 0;
+      }
+      if (phase4Det.conditionHoldP3Ms >= PHASE4_DEBOUNCE_MS) {
+        phase4SwitchTo(PHASE4_PUSH_OFF, nowMs);
+      } else {
+        // P2内进度：在[P1P2_PCT, P2P3_PCT]区间内归一化
+        float range = PHASE4_P2P3_STANCE_PCT - PHASE4_P1P2_STANCE_PCT;
+        if (range < 0.01f) range = 0.01f;
+        phase4Det.phaseProgress = constrain(
+            (stance_pct - PHASE4_P1P2_STANCE_PCT) / range, 0.0f, 1.0f);
+      }
+      break;
+    }
+
+    // ---- P3: 推进期/蹬地 ----
+    // 入口条件：P2结束（支撑进度≥65%）
+    // 出口条件：底层切换到SWING（趾离地检测）或超时800ms退化
+    // 动作意图：踝跖屈蹬地助力（PhaseProfile Gaussian曲线）；改善推进期步态
+    case PHASE4_PUSH_OFF: {
+      // 正常出口：底层检测到趾离地进入SWING
+      if (basePhase == PHASE_SWING) {
+        phase4SwitchTo(PHASE4_SWING, nowMs);
+        break;
+      }
+      // 超时退化（蹬地期不应持续超过0.8s）
+      if (phaseDur >= PHASE4_TIMEOUT_P3_MS) {
+        phase4Det.degraded = true;
+        phase4Det.degradedStartMs = nowMs;
+        break;
+      }
+      // P3内进度：在[P2P3_PCT, 1.0]区间内归一化
+      float range = 1.0f - PHASE4_P2P3_STANCE_PCT;
+      if (range < 0.01f) range = 0.01f;
+      phase4Det.phaseProgress = constrain(
+          (stance_pct - PHASE4_P2P3_STANCE_PCT) / range, 0.0f, 1.0f);
+      break;
+    }
+
+    // ---- P4: 摆动相 ----
+    // 入口条件：P3→SWING（趾离地，底层2相切换）
+    // 出口条件：底层切换到STANCE（踵触地，新步开始）或超时1.5s退化
+    // 动作意图：踝背屈助力（PhaseProfile Gaussian曲线）；防止脚尖拖地
+    case PHASE4_SWING: {
+      // 正常出口：底层检测到踵触地进入新步的承重期
+      if (basePhase == PHASE_STANCE) {
+        phase4SwitchTo(PHASE4_LOADING, nowMs);
+        break;
+      }
+      // 超时退化（摆动相不应持续超过1.5s）
+      if (phaseDur >= PHASE4_TIMEOUT_P4_MS) {
+        phase4Det.degraded = true;
+        phase4Det.degradedStartMs = nowMs;
+        break;
+      }
+      // P4内进度：直接使用底层摆动进度（空间映射，与步速自适应）
+      phase4Det.phaseProgress = swing_pct;
+      break;
+    }
+  }
+
+  // 更新相位曲线Gaussian输出（供PhaseProfileCurve模块使用）
+  phase4Det.profileOutput = computePhaseProfileOutput(
+      phaseProfiles[(int)phase4Det.currentPhase], phase4Det.phaseProgress);
+}
+
+// 获取当前4相枚举值（0=LOADING, 1=MID_STANCE, 2=PUSH_OFF, 3=SWING）
+GaitPhase4 getCurrentGaitPhase4() {
+  return phase4Det.initialized ? phase4Det.currentPhase : PHASE4_LOADING;
+}
+
+// 获取当前相内归一化进度（0.0 ~ 1.0）
+float getPhase4Progress() {
+  return phase4Det.initialized ? phase4Det.phaseProgress : 0.0f;
+}
+
+// 获取当前相位曲线Gaussian输出（0.0 ~ phaseProfiles[ph].amp）
+float getPhase4ProfileOutput() {
+  return phase4Det.initialized ? phase4Det.profileOutput : 0.0f;
+}
+
+// 是否处于退化模式（true=2相映射，false=完整4相）
+bool isPhase4Degraded() {
+  return phase4Det.initialized ? phase4Det.degraded : false;
+}
+
+// ============================================================================
 // 踝背屈辅助策略（B人群核心）
 // ============================================================================
 
@@ -724,8 +1089,11 @@ void updateAnkleAssistStrategy(float ankle_deg, GaitPhase currentPhase, float sw
     return;
   }
   
-  // 强制控制：只要在摆动相，立即设为参数化的背屈目标值
-  if (currentPhase == PHASE_SWING) {
+  // 产品策略：背屈参考仅在与 4 相一致的摆动相内更新；退化模式下关闭
+  const bool df_phase_ok = (currentPhase == PHASE_SWING &&
+                            getCurrentGaitPhase4() == PHASE4_SWING &&
+                            !isPhase4Degraded());
+  if (df_phase_ok) {
     // 立即触发目标角度：使用参数化的背屈目标角度，不再使用 S 曲线平滑
     ankleAssist.theta_ref = ankleAssist.dorsiflexion_target;
     ankleAssist.theta_target = ankleAssist.dorsiflexion_target;
@@ -2264,6 +2632,15 @@ struct GaitDataCollection {
   uint32_t sendIntervalMs;  // 发送间隔（毫秒），建议 10-50ms
 };
 
+// 4相步态实时输出状态（用于串口抓取最新相位数据）
+struct Phase4RealtimeMonitor {
+  bool enabled;
+  uint32_t lastSendMs;
+  uint32_t sendIntervalMs;
+};
+
+Phase4RealtimeMonitor phase4Monitor = {false, 0, 100};  // 默认 10Hz
+
 // 控制循环状态结构体已移动到文件头部
 // struct ControlLoop { ... };
 // extern ControlLoop controlLoop;
@@ -2284,12 +2661,14 @@ struct TorqueAssistParams {
   float swing_df_end   = 0.40f;
   float swing_unload_s = 0.60f;
   int16_t iq_df_max = 5;   // +DF
-  // push-off
-  float stance_pf_start = 0.75f;  // 原0.78，提前触发窗口
-  float stance_pf_end   = 0.95f;  // 原0.92，延长触发窗口
+  // push-off / A1：产品门控以 4 相 PHASE4_PUSH_OFF 为准（见 computeAnkleIqTarget）
+  float stance_pf_start = 0.75f;  // 已废弃：旧版 stance_pct 窗，仅保留兼容串口/调参占位
+  float stance_pf_end   = 0.95f;
   float hip_ext_th      = -6.0f;  // 原-8，放宽髋伸展要求
   float ankle_df_th     = 18.0f;  // 原22，降低背屈阈值以增加触发机会
-  uint32_t tpulse_ms    = 120;    // 原200，缩短脉冲时长避免持续过载
+  uint32_t tpulse_ms    = 120;    // 已废弃：由 pushoff_max_ms 与踝角结束条件替代
+  float ankle_pf_target_deg = 10.0f;  // 背屈为正；踝角 ≤ 此值则结束跖屈助力（须 < ankle_df_th）
+  uint32_t pushoff_max_ms = 300;     // 跖屈助力持续时间兜底（ms）
   int16_t iq_pf_max     = 20;     // -PF （保持20，待测试稳定后可逐步提高）
   // hip 助力窗口与幅值（可通过串口/上位机调节）
   // hipAssistWindowEnd: 髋关节助力在 SWING 早期持续的摆动进度上限（0~1），例如 0.4 表示前 40%
@@ -2538,14 +2917,27 @@ int16_t computeAnkleIqTarget(GaitPhase phase,
     return 0;
   }
 
-  // A1: Push-off（仅 STANCE）
+  // A1: Push-off（仅 STANCE；触发门控 = 4 相 PHASE4_PUSH_OFF，非退化）
   if (phase == PHASE_STANCE) {
-    bool in_window = stance_pct >= torqueParams.stance_pf_start &&
-                     stance_pct <= torqueParams.stance_pf_end;
-    bool hip_ok = hip_deg <= torqueParams.hip_ext_th;
-    bool ankle_ok = ankle_deg >= torqueParams.ankle_df_th;
+    (void)stance_pct; // 产品逻辑不再使用 stance 进度窗
+    const GaitPhase4 ph4 = getCurrentGaitPhase4();
+    const bool pf_ok = !isPhase4Degraded();
+    const bool in_pushoff_phase = (ph4 == PHASE4_PUSH_OFF);
+    const bool hip_ok = hip_deg <= torqueParams.hip_ext_th;
+    const bool ankle_ok = ankle_deg >= torqueParams.ankle_df_th;
 
-    if (!pushOff.active && in_window && hip_ok && ankle_ok && !ankleSafety.in_cooldown) {
+    if (pushOff.active) {
+      const bool lift_off = (ph4 == PHASE4_SWING);  // 此处 phase 恒为 STANCE
+      const bool left_p3 = (ph4 != PHASE4_PUSH_OFF);
+      const bool angle_end = ankle_deg <= torqueParams.ankle_pf_target_deg;
+      const bool timeout = (nowMs - pushOff.start_ms) >= torqueParams.pushoff_max_ms;
+      if (lift_off || left_p3 || !pf_ok || angle_end || timeout) {
+        pushOff.active = false;
+      }
+    }
+
+    if (!pushOff.active && in_pushoff_phase && pf_ok && hip_ok && ankle_ok &&
+        !ankleSafety.in_cooldown) {
       pushOff.active = true;
       pushOff.start_ms = nowMs;
       int16_t peak = (int16_t)abs(ankle_cmd_amp);
@@ -2554,25 +2946,22 @@ int16_t computeAnkleIqTarget(GaitPhase phase,
       pushOff.iq_peak = -peak; // 跖屈为负
     }
 
-    if (pushOff.active) {
-      if ((nowMs - pushOff.start_ms) <= torqueParams.tpulse_ms &&
-          !ankleSafety.in_cooldown) {
-        iq_target = pushOff.iq_peak;
-        assistFlags.pushOffActive = true;
-      } else {
-        pushOff.active = false;
-      }
+    if (pushOff.active && !ankleSafety.in_cooldown) {
+      iq_target = pushOff.iq_peak;
+      assistFlags.pushOffActive = true;
     }
     return iq_target; // STANCE 阶段不做 swing DF
   }
 
-  // 进入 SWING 时，如脉冲未结束则强制关闭
+  // 进入 SWING 时，如脉冲未结束则强制关闭（与离撑一致）
   if (phase == PHASE_SWING && pushOff.active) {
     pushOff.active = false;
   }
 
-  // A2: Swing early DF
+  // A2: Swing early DF（与 4 相 PHASE4_SWING 对齐；退化模式下关闭）
   if (phase == PHASE_SWING &&
+      getCurrentGaitPhase4() == PHASE4_SWING &&
+      !isPhase4Degraded() &&
       swing_pct >= torqueParams.swing_df_start &&
       swing_pct <= torqueParams.swing_df_end) {
     float theta_min_df = torqueParams.theta_min_df;
@@ -2653,102 +3042,83 @@ int16_t computeHipIqTarget(GaitPhase phase,
   return sign * iq;
 }
 
+struct AssistDebugSnapshot {
+  int phase = 0;
+  float swing_pct = 0.0f;
+  float stance_pct = 0.0f;
+  float ankle_deg = 0.0f;
+  float ankle_vel_f = 0.0f;
+  int16_t ankle_iq_target = 0;
+  int16_t ankle_iq_cmd = 0;
+  float hip_deg = 0.0f;
+  float hip_vel_f = 0.0f;
+  int16_t hip_iq_target = 0;
+  int16_t hip_iq_cmd = 0;
+  uint8_t pf = 0, df = 0, ul = 0;
+  uint8_t comp = 0, cool = 0, abn = 0;
+  // 4相快照
+  int     phase4 = 0;
+  float   phase4_progress = 0.0f;
+  float   phase4_output = 0.0f;
+  uint8_t phase4_degraded = 0;
+  uint32_t lastUpdateMs = 0;
+};
+
+AssistDebugSnapshot assistDbg;  // 控制循环内更新，sendGaitData/loop 中读取
+
 GaitDataCollection gaitCollection = {false, 0, 20}; // 默认20ms间隔（50Hz）
 
-// 发送步态数据到串口（JSON格式，便于上位机解析）
-// 测试阶段：只输出4个数据：hip_raw(h), hip_f(hf), hip_vel_f(hvf), phase, swing_progress(s)
+// 发送步态数据到串口（固定 JSON schema，便于上位机稳定解析）
 void sendGaitData() {
-  // M2阶段格式：{"t":时间戳(ms),"h":髋角度原始值(deg),"hf":滤波髋角(deg),"hvf":滤波髋速度(deg/s),"phase":相位(0=STANCE,1=SWING),"s":摆动进度(0-1),"a":踝角度(deg),"ar":踝参考角度(deg)}
-  // 保持原有逻辑结构，只修改输出字段
-  
-  // 获取摆动进度值（如果已初始化则使用实际值，否则为0.0）
-  float swing_progress_value = swingProgress.initialized ? swingProgress.swing_progress : 0.0f;
-  int active_flag = controlLoop.anklePositionActive ? 1 : 0;  // 1=位置追踪，0=释放
-  float hip_max_value = gaitPhaseDetector.hip_max_last;       // 使用上一周期峰值，贴合进度分母定义
-  
-  // 获取相位值（如果已初始化则使用实际值，否则为0）
-  int phase_value = gaitPhaseDetector.initialized ? gaitPhaseDetector.currentPhase : 0;
-  
-  // 获取踝参考角度值（如果已初始化则使用实际值，否则为0.0）
-  float ankle_ref_value = ankleAssist.initialized ? getAnkleReferenceAngle() : 0.0f;
-  
-  if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized && swingProgress.initialized && ankleAssist.initialized && complianceCtrl.initialized) {
-    // 所有模块已初始化，输出M2阶段需要的6个数据
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"vf\":%.2f,\"phase\":%d,\"s\":%.3f,\"a\":%.2f,\"ar\":%.2f,\"act\":%d,\"hm\":%.2f}\n",
-                  millis(),
-                  getHipDeg(),  // hip_deg (逻辑角)
-                  hipProcessor.hip_f,  // hip_f
-                  hipProcessor.hip_vel_f,  // hip_vel_f
-                  hipProcessor.hip_vel_f,  // vf (alias)
-                  phase_value,  // phase
-                  swing_progress_value,  // swing_progress
-                  getAnkleDeg(),  // ankle_deg (逻辑角)
-                  ankle_ref_value,  // ankle_ref (theta_ref)
-                  active_flag,
-                  hip_max_value);
-  } else if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized && swingProgress.initialized && ankleAssist.initialized) {
-    // 如果信号处理器、阈值、相位识别、摆动进度和踝辅助已初始化，但顺从控制未初始化
-    // 仍然输出实际的摆动进度值
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"vf\":%.2f,\"phase\":%d,\"s\":%.3f,\"a\":%.2f,\"ar\":%.2f,\"act\":%d,\"hm\":%.2f}\n",
-                  millis(),
-                  getHipDeg(),
-                  hipProcessor.hip_f,
-                  hipProcessor.hip_vel_f,
-                  hipProcessor.hip_vel_f,  // vf (alias)
-                  phase_value,
-                  swing_progress_value,  // 使用实际的摆动进度值
-                  getAnkleDeg(),
-                  ankle_ref_value,
-                  active_flag,
-                  hip_max_value);
-  } else if (hipProcessor.initialized && adaptiveThreshold.initialized && gaitPhaseDetector.initialized) {
-    // 如果信号处理器、阈值和相位识别已初始化但摆动进度未初始化
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"vf\":%.2f,\"phase\":%d,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f,\"act\":%d,\"hm\":%.2f}\n",
-                  millis(),
-                  getHipDeg(),
-                  hipProcessor.hip_f,
-                  hipProcessor.hip_vel_f,
-                  hipProcessor.hip_vel_f,  // vf (alias)
-                  phase_value,
-                  getAnkleDeg(),
-                  ankle_ref_value,
-                  active_flag,
-                  hip_max_value);
-  } else if (hipProcessor.initialized && adaptiveThreshold.initialized) {
-    // 如果信号处理器和阈值已初始化但相位识别未初始化
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"vf\":%.2f,\"phase\":0,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f,\"act\":%d,\"hm\":%.2f}\n",
-                  millis(),
-                  getHipDeg(),
-                  hipProcessor.hip_f,
-                  hipProcessor.hip_vel_f,
-                  hipProcessor.hip_vel_f,  // vf (alias)
-                  getAnkleDeg(),
-                  ankle_ref_value,
-                  active_flag,
-                  hip_max_value);
-  } else if (hipProcessor.initialized) {
-    // 如果信号处理器已初始化但自适应阈值未初始化，只发送信号处理数据
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"vf\":%.2f,\"phase\":0,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f,\"act\":%d,\"hm\":%.2f}\n",
-                  millis(),
-                  getHipDeg(),
-                  hipProcessor.hip_f,
-                  hipProcessor.hip_vel_f,
-                  hipProcessor.hip_vel_f,  // vf (alias)
-                  getAnkleDeg(),
-                  ankle_ref_value,
-                  active_flag,
-                  hip_max_value);
-  } else {
-    // 如果信号处理器未初始化，只发送基本数据
-    Serial.printf("{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":0.0,\"vf\":0.0,\"phase\":0,\"s\":0.0,\"a\":%.2f,\"ar\":%.2f,\"act\":%d,\"hm\":%.2f}\n",
-                  millis(),
-                  getHipDeg(),
-                  getHipDeg(),  // 如果未初始化，使用逻辑角作为滤波值
-                  getAnkleDeg(),
-                  ankle_ref_value,
-                  active_flag,
-                  hip_max_value);
-  }
+  const uint32_t now = millis();
+
+  const float h = getHipDeg();
+  const float a = getAnkleDeg();
+  const float hf = hipProcessor.initialized ? hipProcessor.hip_f : h;
+  const float hvf = hipProcessor.initialized ? hipProcessor.hip_vel_f : 0.0f;
+  const int phase = gaitPhaseDetector.initialized ? (int)gaitPhaseDetector.currentPhase : 0;
+  const float s = swingProgress.initialized ? swingProgress.swing_progress : 0.0f;
+  const float ar = ankleAssist.initialized ? getAnkleReferenceAngle() : a;
+  const int act = controlLoop.anklePositionActive ? 1 : 0;
+  const float hm = gaitPhaseDetector.initialized ? gaitPhaseDetector.hip_max_last : 0.0f;
+
+  const int ph4 = phase4Det.initialized ? (int)getCurrentGaitPhase4() : 0;
+  const int ph4v = ph4 * 10;  // 0/10/20/30：用于上位机阶梯显示
+  const float ph4p = phase4Det.initialized ? getPhase4Progress() : 0.0f;
+  const float ph4o = phase4Det.initialized ? getPhase4ProfileOutput() : 0.0f;
+  const int ph4d = phase4Det.initialized ? (isPhase4Degraded() ? 1 : 0) : 0;
+
+  // 理论助力链路（当前阶段用于观察，不代表已下发电机）
+  const int iqT_a = (int)assistDbg.ankle_iq_target;
+  const int iqC_a = (int)assistDbg.ankle_iq_cmd;
+  const int iqT_h = (int)assistDbg.hip_iq_target;
+  const int iqC_h = (int)assistDbg.hip_iq_cmd;
+  const int PF = (int)assistDbg.pf;
+  const int DF = (int)assistDbg.df;
+  const int UL = (int)assistDbg.ul;
+  const int comp = (int)assistDbg.comp;
+  const int cool = (int)assistDbg.cool;
+  const int abn = (int)assistDbg.abn;
+  const float st = assistDbg.stance_pct;
+  const float ank = assistDbg.ankle_deg;
+  const float v = assistDbg.ankle_vel_f;
+  const float hip = assistDbg.hip_deg;
+  const float hipv = assistDbg.hip_vel_f;
+  const int ph = ph4v;  // 上位机现有 "ph" 曲线直接显示四相放大值
+
+  Serial.printf(
+      "{\"t\":%lu,\"h\":%.2f,\"hf\":%.2f,\"hvf\":%.2f,\"vf\":%.2f,"
+      "\"phase\":%d,\"s\":%.3f,\"a\":%.2f,\"ar\":%.2f,\"act\":%d,\"hm\":%.2f,"
+      "\"ph4\":%d,\"ph4v\":%d,\"ph4p\":%.3f,\"ph4o\":%.3f,\"ph4d\":%d,"
+      "\"ph\":%d,\"st\":%.3f,\"ank\":%.2f,\"v\":%.2f,\"hip\":%.2f,\"hipv\":%.2f,"
+      "\"iqT_a\":%d,\"iqC_a\":%d,\"iqT_h\":%d,\"iqC_h\":%d,"
+      "\"PF\":%d,\"DF\":%d,\"UL\":%d,\"comp\":%d,\"cool\":%d,\"abn\":%d}\n",
+      now, h, hf, hvf, hvf,
+      phase, s, a, ar, act, hm,
+      ph4, ph4v, ph4p, ph4o, ph4d,
+      ph, st, ank, v, hip, hipv,
+      iqT_a, iqC_a, iqT_h, iqC_h,
+      PF, DF, UL, comp, cool, abn);
 }
 
 // 启动/停止步态数据采集（只控制是否输出JSON）
@@ -2783,6 +3153,42 @@ void updateGaitCollection() {
       gaitCollection.lastSendMs = now;
       sendGaitData();
     }
+  }
+}
+
+void sendPhase4RealtimeData() {
+  uint32_t now = millis();
+  int phase4 = phase4Det.initialized ? (int)phase4Det.currentPhase : -1;
+  int basePhase = gaitPhaseDetector.initialized ? (int)gaitPhaseDetector.currentPhase : -1;
+  float stancePct = gaitPhaseDetector.initialized ?
+      getStancePct(gaitPhaseDetector.currentPhase, now) : 0.0f;
+  uint32_t phaseDurMs = phase4Det.initialized ? (now - phase4Det.phaseStartMs) : 0;
+  uint32_t degradedMs = (phase4Det.initialized && phase4Det.degraded) ?
+      (now - phase4Det.degradedStartMs) : 0;
+
+  // 结构化输出，便于上位机/脚本直接抓取
+  Serial.printf("{\"ph4rt\":1,\"t\":%lu,\"init\":%d,\"ph4\":%d,\"p\":%.3f,"
+                "\"out\":%.3f,\"deg\":%d,\"dur\":%lu,\"deg_ms\":%lu,"
+                "\"base\":%d,\"stance\":%.3f,\"trans\":%d}\n",
+                now,
+                phase4Det.initialized ? 1 : 0,
+                phase4,
+                phase4Det.initialized ? phase4Det.phaseProgress : 0.0f,
+                phase4Det.initialized ? phase4Det.profileOutput : 0.0f,
+                phase4Det.degraded ? 1 : 0,
+                phaseDurMs,
+                degradedMs,
+                basePhase,
+                stancePct,
+                phase4Det.transitionCount);
+}
+
+void updatePhase4RealtimeMonitor() {
+  if (!phase4Monitor.enabled) return;
+  uint32_t now = millis();
+  if (now - phase4Monitor.lastSendMs >= phase4Monitor.sendIntervalMs) {
+    phase4Monitor.lastSendMs = now;
+    sendPhase4RealtimeData();
   }
 }
 
@@ -3111,6 +3517,88 @@ void processSerialCommand() {
       Serial.println(">>> Start gait collection (gc) to initialize phase detection");
     }
   }
+  // 4相步态识别调试命令：phase4
+  else if (cmd == "phase4" || cmd == "ph4") {
+    if (phase4Det.initialized) {
+      const char* phaseNames[4] = {"LOADING", "MID_STANCE", "PUSH_OFF", "SWING"};
+      Serial.println(">>> 4-Phase Gait Detection Status:");
+      Serial.printf(">>>   Current Phase: %s (%d)\n",
+                   phaseNames[(int)phase4Det.currentPhase], (int)phase4Det.currentPhase);
+      Serial.printf(">>>   Phase Progress: %.3f (%.1f%%)\n",
+                   phase4Det.phaseProgress, phase4Det.phaseProgress * 100.0f);
+      Serial.printf(">>>   Profile Output (Gaussian): %.3f\n", phase4Det.profileOutput);
+      Serial.printf(">>>   Phase Duration: %lu ms\n", millis() - phase4Det.phaseStartMs);
+      Serial.printf(">>>   Degraded Mode: %s\n", phase4Det.degraded ? "YES" : "NO");
+      if (phase4Det.degraded) {
+        Serial.printf(">>>   Degraded for: %lu ms (recovers after %lu ms)\n",
+                     millis() - phase4Det.degradedStartMs,
+                     PHASE4_RECOVERY_MS);
+      }
+      Serial.printf(">>>   Transition Count (3s window): %d / %d\n",
+                   phase4Det.transitionCount, PHASE4_UNSTABLE_TRANS_THRESH);
+      Serial.println(">>>   Thresholds:");
+      Serial.printf(">>>     P1→P2 stance_pct: %.2f (%.0f%%)\n",
+                   PHASE4_P1P2_STANCE_PCT, PHASE4_P1P2_STANCE_PCT * 100.0f);
+      Serial.printf(">>>     P2→P3 stance_pct: %.2f (%.0f%%)\n",
+                   PHASE4_P2P3_STANCE_PCT, PHASE4_P2P3_STANCE_PCT * 100.0f);
+      Serial.printf(">>>     Debounce: %lu ms\n", PHASE4_DEBOUNCE_MS);
+      Serial.println(">>>   Phase Profiles (amp/center/width/ramp):");
+      const char* pnames[4] = {"LOADING   ", "MID_STANCE", "PUSH_OFF  ", "SWING     "};
+      for (int i = 0; i < 4; i++) {
+        Serial.printf(">>>     %s: amp=%.2f ctr=%.2f wid=%.2f ramp=%.3f\n",
+                     pnames[i], phaseProfiles[i].amp, phaseProfiles[i].center,
+                     phaseProfiles[i].width, phaseProfiles[i].ramp_limit);
+      }
+      // 显示底层2相状态
+      if (gaitPhaseDetector.initialized) {
+        Serial.printf(">>>   Base Phase (2-phase): %s, stance_pct=%.3f\n",
+                     gaitPhaseDetector.currentPhase == PHASE_SWING ? "SWING" : "STANCE",
+                     getStancePct(gaitPhaseDetector.currentPhase, millis()));
+      }
+    } else {
+      Serial.println(">>> 4-Phase Detector: NOT INITIALIZED");
+      Serial.println(">>> Enable control loop (ctrlon) to initialize phase detection");
+    }
+  }
+  else if (cmd == "ph4 on" || cmd == "phase4 on") {
+    phase4Monitor.enabled = true;
+    phase4Monitor.lastSendMs = 0;
+    phase4Monitor.sendIntervalMs = 100;
+    Serial.println(">>> PH4 realtime monitor ENABLED");
+    Serial.println(">>> Output format: JSON line, key `ph4rt` marks realtime phase4 stream");
+    Serial.printf(">>> Interval: %lu ms (%.1f Hz)\n",
+                  phase4Monitor.sendIntervalMs, 1000.0f / phase4Monitor.sendIntervalMs);
+  }
+  else if (cmd == "ph4 off" || cmd == "phase4 off") {
+    phase4Monitor.enabled = false;
+    Serial.println(">>> PH4 realtime monitor DISABLED");
+  }
+  else if (cmd.startsWith("ph4 ") || cmd.startsWith("phase4 ")) {
+    int spaceIdx = cmd.indexOf(' ');
+    String arg = cmd.substring(spaceIdx + 1);
+    arg.trim();
+    if (arg == "on") {
+      phase4Monitor.enabled = true;
+      phase4Monitor.lastSendMs = 0;
+      phase4Monitor.sendIntervalMs = 100;
+      Serial.printf(">>> PH4 realtime monitor ENABLED (%lu ms)\n", phase4Monitor.sendIntervalMs);
+    } else if (arg == "off") {
+      phase4Monitor.enabled = false;
+      Serial.println(">>> PH4 realtime monitor DISABLED");
+    } else {
+      uint32_t interval = arg.toInt();
+      if (interval >= 20 && interval <= 2000) {
+        phase4Monitor.enabled = true;
+        phase4Monitor.lastSendMs = 0;
+        phase4Monitor.sendIntervalMs = interval;
+        Serial.printf(">>> PH4 realtime monitor ENABLED (%lu ms, %.1f Hz)\n",
+                      interval, 1000.0f / interval);
+      } else {
+        Serial.println("ERROR: Usage: ph4 | ph4 on | ph4 off | ph4 <interval_ms>");
+        Serial.println("       Interval range: 20-2000 ms");
+      }
+    }
+  }
   // 摆动进度调试命令：swing
   else if (cmd == "swing" || cmd == "swingprogress") {
     if (swingProgress.initialized) {
@@ -3377,6 +3865,7 @@ void processSerialCommand() {
     Serial.println("Hip Zero:   hz (hip zero calibration)");
     Serial.println("Threshold:  th (show adaptive threshold status)");
     Serial.println("Gait Phase: phase (show gait phase detection status)");
+    Serial.println("4-Phase: ph4 (snapshot), ph4 on/off, ph4 <interval_ms> (realtime stream)");
     Serial.println("Swing Progress: swing (show swing progress status)");
     Serial.println("Ankle Assist: assist (show ankle assist strategy status)");
     Serial.println("Assist On/Off: assiston / assistoff (enable/disable ankle assist)");
@@ -3471,7 +3960,10 @@ void setControlLoopEnabled(bool enabled) {
     
     // 重置助力控制器状态
     ankleAssist.initialized = false; // 将触发 updateAnkleAssistStrategy 中的初始化逻辑
-    
+
+    // 重置4相状态机（控制循环重启时从头开始）
+    phase4Det.initialized = false;
+
     // 重置步态检测与滤波
     // hipProcessor.initialized = false; // 可选：是否重置滤波？暂时保留滤波历史可能更好
     
@@ -3485,25 +3977,6 @@ void setControlLoopEnabled(bool enabled) {
     stopSensorPolling();
   }
 }
-
-struct AssistDebugSnapshot {
-  int phase = 0;
-  float swing_pct = 0.0f;
-  float stance_pct = 0.0f;
-  float ankle_deg = 0.0f;
-  float ankle_vel_f = 0.0f;
-  int16_t ankle_iq_target = 0;
-  int16_t ankle_iq_cmd = 0;
-  float hip_deg = 0.0f;
-  float hip_vel_f = 0.0f;
-  int16_t hip_iq_target = 0;
-  int16_t hip_iq_cmd = 0;
-  uint8_t pf = 0, df = 0, ul = 0;
-  uint8_t comp = 0, cool = 0, abn = 0;
-  uint32_t lastUpdateMs = 0;
-};
-
-AssistDebugSnapshot assistDbg;  // 控制循环内更新，loop 中打印
 
 // 100Hz 控制循环主体（由定时器驱动，loop 中消费 pending 计数执行）
 void runControlLoopOnce() {
@@ -3545,6 +4018,8 @@ void runControlLoopOnce() {
   float swing_pct = getSwingProgress();   // 0~1
   updateStanceProgress(currentPhase, now);
   float stance_pct = getStancePct(currentPhase, now);
+  // 4相检测：必须在stanceProg和swingProgress更新后调用
+  updateGaitPhase4Detector();
   float ankle_deg = getAnkleDeg();
   float hip_deg   = getHipDeg();
   updateAnkleVelEstimator(ankle_deg, now);
@@ -3610,11 +4085,11 @@ void runControlLoopOnce() {
   // ========================================================================
   // 5. 下发 A1 转矩命令（保持 100Hz，不阻塞）
   // ========================================================================
-  if (ankleDataOk) {
-    sendTorqueCommand(ankleMotor, ankle_iq_cmd);
-  } else {
-    ankleSafety.iq_cmd_prev = 0;
-  }
+  // if (ankleDataOk) {
+  //   sendTorqueCommand(ankleMotor, ankle_iq_cmd);
+  // } else {
+  //   ankleSafety.iq_cmd_prev = 0;
+  // }
 
   if (hipDataOk) {
     // 若 hipTorqueMode 仍需手动测试，可在此增加优先级判断
@@ -3641,6 +4116,10 @@ void runControlLoopOnce() {
   assistDbg.comp = ankleSafety.compliant ? 1 : 0;
   assistDbg.cool = ankleSafety.in_cooldown ? 1 : 0;
   assistDbg.abn = (uint8_t)ankleAbn;
+  assistDbg.phase4          = (int)getCurrentGaitPhase4();
+  assistDbg.phase4_progress = getPhase4Progress();
+  assistDbg.phase4_output   = getPhase4ProfileOutput();
+  assistDbg.phase4_degraded = isPhase4Degraded() ? 1 : 0;
   assistDbg.lastUpdateMs = now;
   // 退出 ISR 上下文，允许主循环打印
   inIsrContext = false;
@@ -3677,26 +4156,26 @@ void loop() {
   updateSensorPolling();
   // 调试信息打印（保持在 loop 中，避免占用控制节拍）
   // 仅当控制循环启用时打印
-  if (controlLoop.controlEnabled) {
-    static uint32_t lastDbgMs = 0;
-    uint32_t now = millis();
-    if (now - lastDbgMs >= 50 && assistDbg.lastUpdateMs != 0) {
-      lastDbgMs = now;
-      if (sensorPolling.enabled) {
-        Serial.printf("[ASSIST] ph=%d, s=%.3f, st=%.3f, "
-                      "ank=%.2f, v=%.2f, iqT_a=%d, iqC_a=%d, "
-                      "hip=%.2f, hipv=%.2f, iqT_h=%d, iqC_h=%d, "
-                      "flags:PF=%d,DF=%d,UL=%d,comp=%d,cool=%d,abn=%d\n",
-                      assistDbg.phase, assistDbg.swing_pct * 10.0f, assistDbg.stance_pct * 10.0f,
-                      assistDbg.ankle_deg, assistDbg.ankle_vel_f, assistDbg.ankle_iq_target, assistDbg.ankle_iq_cmd,
-                      assistDbg.hip_deg, assistDbg.hip_vel_f, assistDbg.hip_iq_target, assistDbg.hip_iq_cmd,
-                      assistDbg.pf, assistDbg.df, assistDbg.ul,
-                      assistDbg.comp, assistDbg.cool, assistDbg.abn);
-      } else {
-         Serial.println("[ASSIST-WARN] Sensor Polling DISABLED! (Check control loop or error state)");
-      }
-    }
-  }
+  // if (controlLoop.controlEnabled) {
+  //   static uint32_t lastDbgMs = 0;
+  //   uint32_t now = millis();
+  //   if (now - lastDbgMs >= 50 && assistDbg.lastUpdateMs != 0) {
+  //     lastDbgMs = now;
+  //     if (sensorPolling.enabled) {
+  //       Serial.printf("[ASSIST] ph=%d, s=%.3f, st=%.3f, "
+  //                     "ank=%.2f, v=%.2f, iqT_a=%d, iqC_a=%d, "
+  //                     "hip=%.2f, hipv=%.2f, iqT_h=%d, iqC_h=%d, "
+  //                     "flags:PF=%d,DF=%d,UL=%d,comp=%d,cool=%d,abn=%d\n",
+  //                     assistDbg.phase, assistDbg.swing_pct * 10.0f, assistDbg.stance_pct * 10.0f,
+  //                     assistDbg.ankle_deg, assistDbg.ankle_vel_f, assistDbg.ankle_iq_target, assistDbg.ankle_iq_cmd,
+  //                     assistDbg.hip_deg, assistDbg.hip_vel_f, assistDbg.hip_iq_target, assistDbg.hip_iq_cmd,
+  //                     assistDbg.pf, assistDbg.df, assistDbg.ul,
+  //                     assistDbg.comp, assistDbg.cool, assistDbg.abn);
+  //     } else {
+  //        Serial.println("[ASSIST-WARN] Sensor Polling DISABLED! (Check control loop or error state)");
+  //     }
+  //   }
+  // }
 
   // 如果髋关节力矩模式使能，则周期性发送转矩控制命令（例如每50ms）
   if (hipTorqueMode) {
@@ -3723,6 +4202,8 @@ void loop() {
   
   // 更新步态数据采集
   updateGaitCollection();
+  // 更新 4 相步态实时输出
+  updatePhase4RealtimeMonitor();
   
   // 更新步态轨迹播放
   updateGaitPlayback();

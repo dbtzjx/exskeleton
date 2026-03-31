@@ -93,6 +93,11 @@ class GaitDataCollector:
         self.hipv_data = deque(maxlen=MAX_DATA_POINTS)  # 髋关节速度 (hipv)
         self.iqT_h_data = deque(maxlen=MAX_DATA_POINTS)  # 髋关节目标力矩 (iqT_h)
         self.iqC_h_data = deque(maxlen=MAX_DATA_POINTS)  # 髋关节实际力矩 (iqC_h)
+        self.ph4_data = deque(maxlen=MAX_DATA_POINTS)  # 四相原始值 (ph4: 0/1/2/3)
+        self.ph4v_data = deque(maxlen=MAX_DATA_POINTS)  # 四相显示值 (ph4v: 0/10/20/30)
+        self.ph4p_data = deque(maxlen=MAX_DATA_POINTS)  # 四相进度 (ph4p)
+        self.ph4o_data = deque(maxlen=MAX_DATA_POINTS)  # 四相输出 (ph4o)
+        self.ph4d_data = deque(maxlen=MAX_DATA_POINTS)  # 四相退化标志 (ph4d)
         # 状态标志位数据
         self.PF_data = deque(maxlen=MAX_DATA_POINTS)  # 跖屈助力状态 (PF)
         self.DF_data = deque(maxlen=MAX_DATA_POINTS)  # 背屈助力状态 (DF)
@@ -304,6 +309,11 @@ class GaitDataCollector:
         self.hipv_data.clear()
         self.iqT_h_data.clear()
         self.iqC_h_data.clear()
+        self.ph4_data.clear()
+        self.ph4v_data.clear()
+        self.ph4p_data.clear()
+        self.ph4o_data.clear()
+        self.ph4d_data.clear()
         self.PF_data.clear()
         self.DF_data.clear()
         self.UL_data.clear()
@@ -355,19 +365,7 @@ class GaitDataCollector:
                         # 记录所有原始返回数据到队列（用于历史记录）
                         self.raw_data_queue.put(original_line)
                         
-                        # 解析新格式数据（转矩控制阶段格式）
-                        # 格式：ph=1, s=0.783, st=0.000, ank=-4.49, v=-0.02, iqT_a=0, iqC_a=0, hip=-0.39, hipv=33.21, iqT_h=0, iqC_h=0, flags:PF=0,DF=0,UL=1,comp=0,cool=1,abn=0
-                        if 'ph=' in line or 'flags:' in line:
-                            # 尝试解析新格式
-                            parsed_data = self._parse_torque_format(line)
-                            if parsed_data:
-                                # 将解析后的数据放入队列（使用字典格式，兼容现有代码）
-                                self.data_queue.put(parsed_data)
-                                self.total_received += 1
-                                self.last_received_time = time.time()
-                                continue  # 已处理，跳过JSON解析
-                        
-                        # 解析JSON数据（步态数据）
+                        # 统一仅解析 JSON 数据（sendGaitData 固定 schema）
                         # 尝试解析JSON（可能包含在行的中间，需要查找）
                         if '{' in line and '}' in line:
                             # 提取JSON部分（从第一个{到最后一个}）
@@ -455,6 +453,11 @@ class GaitDataCollector:
                         self.hipv_data.append(data.get('hipv'))
                         self.iqT_h_data.append(data.get('iqT_h'))
                         self.iqC_h_data.append(data.get('iqC_h'))
+                        self.ph4_data.append(data.get('ph4'))
+                        self.ph4v_data.append(data.get('ph4v'))
+                        self.ph4p_data.append(data.get('ph4p'))
+                        self.ph4o_data.append(data.get('ph4o'))
+                        self.ph4d_data.append(data.get('ph4d'))
                         self.PF_data.append(data.get('PF'))
                         self.DF_data.append(data.get('DF'))
                         self.UL_data.append(data.get('UL'))
@@ -467,7 +470,8 @@ class GaitDataCollector:
                         torque_queues = [
                             self.ph_data, self.s_data, self.st_data, self.ank_data, self.v_data,
                             self.iqT_a_data, self.iqC_a_data, self.hip_data_new, self.hipv_data,
-                            self.iqT_h_data, self.iqC_h_data, self.PF_data, self.DF_data,
+                            self.iqT_h_data, self.iqC_h_data, self.ph4_data, self.ph4v_data,
+                            self.ph4p_data, self.ph4o_data, self.ph4d_data, self.PF_data, self.DF_data,
                             self.UL_data, self.comp_data, self.cool_data, self.abn_data
                         ]
                         for q in torque_queues:
@@ -800,6 +804,11 @@ class GaitDataCollector:
         self.hipv_data.clear()
         self.iqT_h_data.clear()
         self.iqC_h_data.clear()
+        self.ph4_data.clear()
+        self.ph4v_data.clear()
+        self.ph4p_data.clear()
+        self.ph4o_data.clear()
+        self.ph4d_data.clear()
         self.PF_data.clear()
         self.DF_data.clear()
         self.UL_data.clear()
@@ -1134,7 +1143,7 @@ class GaitDataCollectorGUI:
         
         # 定义数据标志位及其说明
         data_flags = [
-            ("ph", "步态相位（Phase），表示当前步态的阶段（如站立、摆动等）"),
+            ("ph", "步态相位显示值（0/10/20/30），用于离散相位曲线观察"),
             ("s", "步态进度（swing_pct），表示当前步态周期的进度，通常是一个百分比值"),
             ("st", "站立时间或相关时间，可能表示站立阶段的时间"),
             ("ank", "踝关节角度（ankle angle），表示踝关节当前的角度"),
@@ -1145,14 +1154,21 @@ class GaitDataCollectorGUI:
             ("hipv", "髋关节速度（hip velocity），表示髋关节的角速度（deg/s）"),
             ("iqT_h", "髋关节目标力矩（target torque），表示期望的髋关节助力大小"),
             ("iqC_h", "髋关节实际力矩（current torque），表示实际输出的髋关节助力值"),
+            ("ph4", "四相原始值（0=LOADING,1=MID_STANCE,2=PUSH_OFF,3=SWING）"),
+            ("ph4v", "四相放大显示值（ph4*10: 0/10/20/30）"),
+            ("ph4p", "四相相内进度（0~1）"),
+            ("ph4o", "四相相位曲线输出（辅助比例，0~1）"),
+            ("ph4d", "四相退化标志（1=退化模式）"),
         ]
         
         # 存储复选框变量
         self.flag_vars = {}
         
+        default_data_flags = {"ph", "s", "st", "ank", "v"}
+
         # 创建数据标志位复选框
         for i, (flag_name, tooltip_text) in enumerate(data_flags):
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(value=(flag_name in default_data_flags))
             self.flag_vars[flag_name] = var
             
             # 创建复选框框架
@@ -1200,7 +1216,7 @@ class GaitDataCollectorGUI:
         
         # 创建状态标志位复选框
         for i, (flag_name, tooltip_text) in enumerate(state_flags):
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(value=False)
             self.flag_vars[flag_name] = var
             
             # 创建复选框框架
@@ -2097,6 +2113,11 @@ class GaitDataCollectorGUI:
                                 'hipv': ('hipv_data', '#88FF00', '髋关节速度(hipv)', '--'),
                                 'iqT_h': ('iqT_h_data', '#FF0088', '髋目标力矩(iqT_h)', '-'),
                                 'iqC_h': ('iqC_h_data', '#88FF88', '髋实际力矩(iqC_h)', '--'),
+                                'ph4': ('ph4_data', '#AAAAAA', '四相原始值(ph4)', '-'),
+                                'ph4v': ('ph4v_data', '#FF4444', '四相放大值(ph4v)', '-'),
+                                'ph4p': ('ph4p_data', '#44AAFF', '四相进度(ph4p)', '--'),
+                                'ph4o': ('ph4o_data', '#AA44FF', '四相输出(ph4o)', '-'),
+                                'ph4d': ('ph4d_data', '#222222', '四相退化(ph4d)', '-'),
                             }
                             
                             # 获取时间数据（用于新格式数据）
@@ -2189,6 +2210,11 @@ class GaitDataCollectorGUI:
                                 'hipv': ('hipv_data', '#88FF00', '髋关节速度(hipv)', '--'),
                                 'iqT_h': ('iqT_h_data', '#FF0088', '髋目标力矩(iqT_h)', '-'),
                                 'iqC_h': ('iqC_h_data', '#88FF88', '髋实际力矩(iqC_h)', '--'),
+                                'ph4': ('ph4_data', '#AAAAAA', '四相原始值(ph4)', '-'),
+                                'ph4v': ('ph4v_data', '#FF4444', '四相放大值(ph4v)', '-'),
+                                'ph4p': ('ph4p_data', '#44AAFF', '四相进度(ph4p)', '--'),
+                                'ph4o': ('ph4o_data', '#AA44FF', '四相输出(ph4o)', '-'),
+                                'ph4d': ('ph4d_data', '#222222', '四相退化(ph4d)', '-'),
                             }
                             
                             for flag_name, (deque_name, color, label, linestyle) in data_flag_config.items():
@@ -2305,8 +2331,11 @@ class GaitDataCollectorGUI:
         if self.collector.hip_module_enabled:
             # 停止髋关节数据模块
             self.collector.stop_hip_module()
+            # 关闭髋关节数据模块时，自动停止下位机 gait JSON 上传
+            self.collector.send_command("gcs")
+            self.add_history("gcs", "TX")
             self.hip_module_btn.config(text="髋关节数据: 关闭")
-            self.add_history("髋关节数据模块已关闭", "信息")
+            self.add_history("髋关节数据模块已关闭（已自动发送 gcs）", "信息")
         else:
             # 启动髋关节数据模块
             if not self.collector.is_connected():
@@ -2315,12 +2344,15 @@ class GaitDataCollectorGUI:
             
             try:
                 self.collector.start_hip_module()
+                # 开启髋关节数据模块时，自动触发下位机开始发送 gait JSON 数据
+                self.collector.send_command("gc")
+                self.add_history("gc", "TX")
                 # ✓ 重置GUI绘制状态，准备新的数据显示
                 self._plot_initialized = False
                 self._last_realtime_len = 0
                 self._plot_lines = {'hip_f': None}
                 self.hip_module_btn.config(text="髋关节数据: 开启")
-                self.add_history("髋关节数据模块已开启", "信息")
+                self.add_history("髋关节数据模块已开启（已自动发送 gc）", "信息")
             except Exception as e:
                 error_msg = f"启动髋关节数据模块失败: {str(e)}"
                 self.add_history(error_msg, "信息")
