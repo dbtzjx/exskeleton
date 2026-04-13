@@ -259,7 +259,8 @@ class GaitDataCollector:
             if response_buffer:
                 for line in response_buffer.split('\n'):
                     line = line.strip()
-                    if line and not line.startswith('>') and not line.startswith('Command:'):
+                    # 仅过滤命令回显（如 "> Command: xxx"），保留 ">>> ..." 系统响应
+                    if line and not line.startswith('> Command:') and not line.startswith('Command:'):
                         self.raw_data_queue.put(line)
             
             return True
@@ -358,8 +359,8 @@ class GaitDataCollector:
                         if not line:
                             continue
                         
-                        # 跳过命令提示（但保留其他所有输出）
-                        if line.startswith('>') or line.startswith('Command:'):
+                        # 跳过命令回显（但保留 ">>> ..." 系统响应）
+                        if line.startswith('> Command:') or line.startswith('Command:'):
                             continue
                         
                         # 记录所有原始返回数据到队列（用于历史记录）
@@ -417,90 +418,65 @@ class GaitDataCollector:
                 if not self.data_queue.empty():
                     data = self.data_queue.get(timeout=0.1)
                     
-                    # 检查是否是新格式数据（转矩控制阶段格式）
-                    is_torque_format = ('ph' in data or 'PF' in data or 'DF' in data)
-                    
-                    if is_torque_format:
-                        # 新格式数据：存储所有字段到专用队列
-                        timestamp = data.get('t', int(time.time() * 1000))
-                        
-                        # 存储基础数据（仅保留绘图/显示仍需要的字段）
-                        hip_f = data.get('hf', None)
-                        hip_vel_f = data.get('hipv') or data.get('hvf', None)
-                        phase = data.get('ph') or data.get('phase', 0)
-                        swing_progress = data.get('s', 0.0)
-                        ankle_ref = data.get('ar', None)
-                        
-                        # 存储到缓冲区（如果字段存在）
-                        if timestamp is not None:
-                            self.time_data.append(timestamp)
-                        self.hip_filtered_data.append(hip_f if hip_f is not None else None)
-                        self.hip_velocity_filtered_data.append(hip_vel_f if hip_vel_f is not None else None)
-                        self.phase_data.append(phase)
-                        self.swing_progress_data.append(swing_progress)
-                        self.ankle_ref_data.append(ankle_ref if ankle_ref is not None else None)
-                        
-                        # 存储新格式的所有字段到专用队列（无条件存储，绘图时根据复选框过滤）
-                        # 确保每个队列都存储数据，即使值为None也要存储，以保持长度一致
-                        self.ph_data.append(data.get('ph'))
-                        self.s_data.append(data.get('s'))
-                        self.st_data.append(data.get('st'))
-                        self.ank_data.append(data.get('ank'))
-                        self.v_data.append(data.get('v'))
-                        self.iqT_a_data.append(data.get('iqT_a'))
-                        self.iqC_a_data.append(data.get('iqC_a'))
-                        self.hip_data_new.append(data.get('hip'))
-                        self.hipv_data.append(data.get('hipv'))
-                        self.iqT_h_data.append(data.get('iqT_h'))
-                        self.iqC_h_data.append(data.get('iqC_h'))
-                        self.ph4_data.append(data.get('ph4'))
-                        self.ph4v_data.append(data.get('ph4v'))
-                        self.ph4p_data.append(data.get('ph4p'))
-                        self.ph4o_data.append(data.get('ph4o'))
-                        self.ph4d_data.append(data.get('ph4d'))
-                        self.PF_data.append(data.get('PF'))
-                        self.DF_data.append(data.get('DF'))
-                        self.UL_data.append(data.get('UL'))
-                        self.comp_data.append(data.get('comp'))
-                        self.cool_data.append(data.get('cool'))
-                        self.abn_data.append(data.get('abn'))
-                        
-                        # 确保所有专用队列长度与time_data一致（补齐缺失的数据）
-                        time_len = len(self.time_data)
-                        torque_queues = [
-                            self.ph_data, self.s_data, self.st_data, self.ank_data, self.v_data,
-                            self.iqT_a_data, self.iqC_a_data, self.hip_data_new, self.hipv_data,
-                            self.iqT_h_data, self.iqC_h_data, self.ph4_data, self.ph4v_data,
-                            self.ph4p_data, self.ph4o_data, self.ph4d_data, self.PF_data, self.DF_data,
-                            self.UL_data, self.comp_data, self.cool_data, self.abn_data
-                        ]
-                        for q in torque_queues:
-                            # 只补齐缺失的数据，不删除多余的数据（避免数据丢失）
-                            while len(q) < time_len:
-                                q.append(None)
-                    else:
-                        # 旧格式JSON数据：M2阶段处理逻辑
-                        timestamp = data.get('t', None)  # 毫秒
-                        hip_raw = data.get('h', None)   # 髋关节原始角度
-                        
-                        # ✓ 验证关键字段存在
-                        if hip_raw is None or timestamp is None:
-                            # 只在启动时打印，避免刷屏
-                            continue
-                        
-                        hip_f = data.get('hf', None)  # 滤波后的髋角
-                        hip_vel_f = data.get('hvf', None)  # 滤波后的髋速度
-                        phase = data.get('phase', 0)  # 步态相位 (0=STANCE, 1=SWING)
-                        swing_progress = data.get('s', 0.0)  # 摆动进度 (0-1)
-                        ankle_ref = data.get('ar', None)  # 踝关节参考角度 (deg)
-                        
-                        # ✓ 存储数据到缓冲区（删除hip_raw/ankle_deg/act的提取与存储）
-                        self.time_data.append(timestamp)
-                        self.hip_filtered_data.append(hip_f if hip_f is not None else None)
-                        self.hip_velocity_filtered_data.append(hip_vel_f if hip_vel_f is not None else None)
-                        self.phase_data.append(phase)
-                        self.swing_progress_data.append(swing_progress)
-                        self.ankle_ref_data.append(ankle_ref if ankle_ref is not None else None)
+                    # 统一按 sendGaitData 的 JSON 键处理：
+                    # 缺失字段保持为 None，绘图阶段按复选框与有效值决定是否显示
+                    timestamp = data.get('t', None)  # 毫秒
+                    hip_raw = data.get('h', None)    # 髋关节原始角度
+
+                    # 至少需要时间戳和髋角
+                    if hip_raw is None or timestamp is None:
+                        continue
+
+                    hip_f = data.get('hf', hip_raw)  # 未上传 hf 时回退 h
+                    hip_vel_f = data.get('hipv') if data.get('hipv') is not None else data.get('hvf', None)
+                    phase = data.get('ph') if data.get('ph') is not None else data.get('phase', 0)
+                    swing_progress = data.get('s', 0.0)
+                    ankle_ref = data.get('ar', None)
+
+                    # 基础缓冲区（用于状态显示/hip_f 主线）
+                    self.time_data.append(timestamp)
+                    self.hip_filtered_data.append(hip_f if hip_f is not None else None)
+                    self.hip_velocity_filtered_data.append(hip_vel_f if hip_vel_f is not None else None)
+                    self.phase_data.append(phase)
+                    self.swing_progress_data.append(swing_progress)
+                    self.ankle_ref_data.append(ankle_ref if ankle_ref is not None else None)
+
+                    # 复选框数据通道：字段缺失即 None（不显示）
+                    self.ph_data.append(data.get('ph'))
+                    self.s_data.append(data.get('s'))
+                    self.st_data.append(data.get('st'))
+                    self.ank_data.append(data.get('ank'))
+                    self.v_data.append(data.get('v'))
+                    self.iqT_a_data.append(data.get('iqT_a'))
+                    self.iqC_a_data.append(data.get('iqC_a'))
+                    self.hip_data_new.append(data.get('hip'))
+                    self.hipv_data.append(data.get('hipv'))
+                    self.iqT_h_data.append(data.get('iqT_h'))
+                    self.iqC_h_data.append(data.get('iqC_h'))
+                    self.ph4_data.append(data.get('ph4'))
+                    self.ph4v_data.append(data.get('ph4v'))
+                    self.ph4p_data.append(data.get('ph4p'))
+                    self.ph4o_data.append(data.get('ph4o'))
+                    self.ph4d_data.append(data.get('ph4d'))
+                    self.PF_data.append(data.get('PF'))
+                    self.DF_data.append(data.get('DF'))
+                    self.UL_data.append(data.get('UL'))
+                    self.comp_data.append(data.get('comp'))
+                    self.cool_data.append(data.get('cool'))
+                    self.abn_data.append(data.get('abn'))
+
+                    # 保证各复选框队列长度与 time_data 一致
+                    time_len = len(self.time_data)
+                    torque_queues = [
+                        self.ph_data, self.s_data, self.st_data, self.ank_data, self.v_data,
+                        self.iqT_a_data, self.iqC_a_data, self.hip_data_new, self.hipv_data,
+                        self.iqT_h_data, self.iqC_h_data, self.ph4_data, self.ph4v_data,
+                        self.ph4p_data, self.ph4o_data, self.ph4d_data, self.PF_data, self.DF_data,
+                        self.UL_data, self.comp_data, self.cool_data, self.abn_data
+                    ]
+                    for q in torque_queues:
+                        while len(q) < time_len:
+                            q.append(None)
                     
                     data_count += 1
                 else:
@@ -1061,6 +1037,55 @@ class GaitDataCollectorGUI:
         # 髋关节数据模块控制
         self.hip_module_btn = ttk.Button(cmd_frame, text="髋关节数据: 关闭", command=self.toggle_hip_module, width=12)
         self.hip_module_btn.grid(row=4, column=0, columnspan=3, padx=2, pady=2, sticky=(tk.W, tk.E))
+
+        # A1 参数调节（可折叠）
+        self.a1_panel_expanded = False
+        self.a1_toggle_btn = ttk.Button(
+            control_frame, text="A1参数调节 ▶", command=self.toggle_a1_param_panel
+        )
+        self.a1_toggle_btn.grid(row=7, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(6, 2))
+
+        self.a1_param_frame = ttk.LabelFrame(control_frame, text="A1实时参数", padding="6")
+        self.a1_param_frame.grid(row=8, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(2, 6))
+        self.a1_param_frame.grid_remove()  # 默认折叠
+
+        self.a1_param_vars = {
+            "ankle_df_th": tk.StringVar(value="18"),
+            "hip_ext_th": tk.StringVar(value="-6"),
+            "pushoff_max_ms": tk.StringVar(value="300"),
+            "ankle_pf_target_deg": tk.StringVar(value="10"),
+            "iq_pf_max": tk.StringVar(value="20"),
+            "iq_pf_floor": tk.StringVar(value="300"),
+            "diq_up_pf": tk.StringVar(value="15"),
+        }
+
+        def add_param_row(parent, row, key, label_text):
+            ttk.Label(parent, text=label_text, width=16).grid(row=row, column=0, sticky=tk.W, pady=2)
+            entry = ttk.Entry(parent, textvariable=self.a1_param_vars[key], width=10)
+            entry.grid(row=row, column=1, sticky=tk.W, padx=2, pady=2)
+            ttk.Button(
+                parent,
+                text="设置",
+                width=6,
+                command=lambda k=key: self.set_a1_param(k),
+            ).grid(row=row, column=2, padx=2, pady=2)
+            ttk.Button(
+                parent,
+                text="读取",
+                width=6,
+                command=lambda k=key: self.get_a1_param(k),
+            ).grid(row=row, column=3, padx=2, pady=2)
+
+        add_param_row(self.a1_param_frame, 0, "ankle_df_th", "ankle_df_th")
+        add_param_row(self.a1_param_frame, 1, "hip_ext_th", "hip_ext_th")
+        add_param_row(self.a1_param_frame, 2, "pushoff_max_ms", "pushoff_max_ms")
+        add_param_row(self.a1_param_frame, 3, "ankle_pf_target_deg", "ankle_pf_target_deg")
+        add_param_row(self.a1_param_frame, 4, "iq_pf_max", "iq_pf_max")
+        add_param_row(self.a1_param_frame, 5, "iq_pf_floor", "iq_pf_floor")
+        add_param_row(self.a1_param_frame, 6, "diq_up_pf", "diq_up_pf")
+        ttk.Button(self.a1_param_frame, text="读取全部(params)", command=self.get_a1_params).grid(
+            row=7, column=0, columnspan=4, sticky=(tk.W, tk.E), pady=(6, 2)
+        )
         
         # 数据管理
         ttk.Separator(control_frame, orient=tk.HORIZONTAL).grid(row=10, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
@@ -1148,8 +1173,8 @@ class GaitDataCollectorGUI:
             ("st", "站立时间或相关时间，可能表示站立阶段的时间"),
             ("ank", "踝关节角度（ankle angle），表示踝关节当前的角度"),
             ("v", "踝关节速度（velocity），表示踝关节的角速度（deg/s）"),
-            ("iqT_a", "踝关节目标力矩（target torque），表示期望的踝关节助力大小"),
-            ("iqC_a", "踝关节实际力矩（current torque），表示实际输出的踝关节助力值"),
+            ("iqT_a", "踝关节目标力矩（target torque），本机型约定：负值=背屈(DF)，正值=跖屈(PF)"),
+            ("iqC_a", "踝关节实际力矩（current torque），本机型约定：负值=背屈(DF)，正值=跖屈(PF)"),
             ("hip", "髋关节角度（hip angle），表示髋关节当前的角度"),
             ("hipv", "髋关节速度（hip velocity），表示髋关节的角速度（deg/s）"),
             ("iqT_h", "髋关节目标力矩（target torque），表示期望的髋关节助力大小"),
@@ -1328,6 +1353,55 @@ class GaitDataCollectorGUI:
         """发送命令文本"""
         self.command_var.set(command)
         self.send_command()
+
+    def toggle_a1_param_panel(self):
+        """展开/折叠 A1 参数调节区域"""
+        self.a1_panel_expanded = not self.a1_panel_expanded
+        if self.a1_panel_expanded:
+            self.a1_param_frame.grid()
+            self.a1_toggle_btn.config(text="A1参数调节 ▼")
+        else:
+            self.a1_param_frame.grid_remove()
+            self.a1_toggle_btn.config(text="A1参数调节 ▶")
+
+    def set_a1_param(self, key):
+        """发送 set <name> <value> 命令"""
+        if not self.collector.is_connected():
+            messagebox.showerror("错误", "请先连接串口")
+            return
+        value = self.a1_param_vars[key].get().strip()
+        if not value:
+            messagebox.showwarning("提示", f"{key} 不能为空")
+            return
+        cmd = f"set {key} {value}"
+        try:
+            self.collector.send_command(cmd)
+            self.add_history(cmd, "TX")
+        except Exception as e:
+            messagebox.showerror("错误", str(e))
+
+    def get_a1_param(self, key):
+        """发送 get <name> 命令"""
+        if not self.collector.is_connected():
+            messagebox.showerror("错误", "请先连接串口")
+            return
+        cmd = f"get {key}"
+        try:
+            self.collector.send_command(cmd)
+            self.add_history(cmd, "TX")
+        except Exception as e:
+            messagebox.showerror("错误", str(e))
+
+    def get_a1_params(self):
+        """发送 params 命令读取所有 A1 参数"""
+        if not self.collector.is_connected():
+            messagebox.showerror("错误", "请先连接串口")
+            return
+        try:
+            self.collector.send_command("params")
+            self.add_history("params", "TX")
+        except Exception as e:
+            messagebox.showerror("错误", str(e))
     
     def reset_motors(self):
         """电机重置：向两个电机发送clearerror指令，然后发送enable指令"""
@@ -2107,8 +2181,8 @@ class GaitDataCollectorGUI:
                                 'st': ('st_data', '#0000FF', '站立时间(st)', '-'),
                                 'ank': ('ank_data', '#FF00FF', '踝关节角度(ank)', '-'),
                                 'v': ('v_data', '#00FFFF', '踝关节速度(v)', '--'),
-                                'iqT_a': ('iqT_a_data', '#FFFF00', '踝目标力矩(iqT_a)', '-'),
-                                'iqC_a': ('iqC_a_data', '#FF8800', '踝实际力矩(iqC_a)', '--'),
+                                'iqT_a': ('iqT_a_data', '#FFFF00', '踝目标力矩(iqT_a, -DF/+PF)', '-'),
+                                'iqC_a': ('iqC_a_data', '#FF8800', '踝实际力矩(iqC_a, -DF/+PF)', '--'),
                                 'hip': ('hip_data_new', '#0088FF', '髋关节角度(hip)', '-'),
                                 'hipv': ('hipv_data', '#88FF00', '髋关节速度(hipv)', '--'),
                                 'iqT_h': ('iqT_h_data', '#FF0088', '髋目标力矩(iqT_h)', '-'),
@@ -2204,8 +2278,8 @@ class GaitDataCollectorGUI:
                                 'st': ('st_data', '#0000FF', '站立时间(st)', '-'),
                                 'ank': ('ank_data', '#FF00FF', '踝关节角度(ank)', '-'),
                                 'v': ('v_data', '#00FFFF', '踝关节速度(v)', '--'),
-                                'iqT_a': ('iqT_a_data', '#FFFF00', '踝目标力矩(iqT_a)', '-'),
-                                'iqC_a': ('iqC_a_data', '#FF8800', '踝实际力矩(iqC_a)', '--'),
+                                'iqT_a': ('iqT_a_data', '#FFFF00', '踝目标力矩(iqT_a, -DF/+PF)', '-'),
+                                'iqC_a': ('iqC_a_data', '#FF8800', '踝实际力矩(iqC_a, -DF/+PF)', '--'),
                                 'hip': ('hip_data_new', '#0088FF', '髋关节角度(hip)', '-'),
                                 'hipv': ('hipv_data', '#88FF00', '髋关节速度(hipv)', '--'),
                                 'iqT_h': ('iqT_h_data', '#FF0088', '髋目标力矩(iqT_h)', '-'),
