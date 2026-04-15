@@ -1315,21 +1315,21 @@ class GaitDataCollectorGUI:
 
         # 主动训练：启动下位机数据上传
         if training_type == "active":
-            if not self.collector.hip_module_enabled:
-                try:
+            try:
+                if not self.collector.hip_module_enabled:
                     self.collector.start_hip_module()
-                    self.collector.send_command("ctrlon")
-                    self.add_history("ctrlon", "TX")
                     self.control_loop_enabled = True
                     self.control_loop_btn.config(text="禁用控制循环")
-                    self.collector.send_command("gc")
-                    self.add_history("gc", "TX")
                     self._plot_initialized = False
                     self._last_realtime_len = 0
                     self._plot_lines = {'hip_f': None}
                     self.hip_module_btn.config(text="髋关节数据: 开启")
-                except Exception as e:
-                    self.add_history(f"启动数据采集失败: {e}", "信息")
+                self.collector.send_command("ctrlon")
+                self.add_history("ctrlon", "TX")
+                self.collector.send_command("gc")
+                self.add_history("gc", "TX")
+            except Exception as e:
+                self.add_history(f"启动数据采集失败: {e}", "信息")
 
         self._start_btn.config(state=tk.DISABLED)
         self._pause_btn.config(state=tk.NORMAL, text="暂停")
@@ -1343,6 +1343,8 @@ class GaitDataCollectorGUI:
         if state == TrainingSession.STATE_RUNNING:
             self.training_session.pause()
             try:
+                self.collector.send_command("gcs")
+                self.add_history("gcs", "TX")
                 self.collector.send_command("ctrloff")
                 self.add_history("ctrloff", "TX")
             except Exception:
@@ -1354,6 +1356,8 @@ class GaitDataCollectorGUI:
             try:
                 self.collector.send_command("ctrlon")
                 self.add_history("ctrlon", "TX")
+                self.collector.send_command("gc")
+                self.add_history("gc", "TX")
             except Exception:
                 pass
             self._pause_btn.config(text="暂停")
@@ -1377,6 +1381,8 @@ class GaitDataCollectorGUI:
         try:
             self.collector.send_command("gcs")
             self.add_history("gcs", "TX")
+            self.collector.send_command("ctrloff")
+            self.add_history("ctrloff", "TX")
         except Exception:
             pass
 
