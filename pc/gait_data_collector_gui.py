@@ -30,6 +30,14 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import sys
 
+from patient_manager import PatientManager
+from training_session import TrainingSession
+try:
+    from pypinyin import lazy_pinyin, Style
+    _PYPINYIN_OK = True
+except ImportError:
+    _PYPINYIN_OK = False
+
 # ============================================================================
 # 配置参数
 # ============================================================================
@@ -909,6 +917,212 @@ class GaitDataCollector:
                 list(self.gait_cycle_ankle))
 
 # ============================================================================
+# 拼音过滤下拉组件
+# ============================================================================
+
+def _get_pinyin_initials(text: str) -> str:
+    """返回汉字字符串的声母首字母缩写（如 '张三' → 'zs'）。需要 pypinyin。"""
+    if not _PYPINYIN_OK:
+        return ""
+    initials = lazy_pinyin(text, style=Style.FIRST_LETTER)
+    return "".join(initials).lower()
+
+
+def _get_full_pinyin(text: str) -> str:
+    """返回汉字字符串的全拼（如 '张三' → 'zhangsan'）。需要 pypinyin。"""
+    if not _PYPINYIN_OK:
+        return ""
+    full = lazy_pinyin(text, style=Style.NORMAL)
+    return "".join(full).lower()
+
+
+class PinyinFilterCombo(ttk.Frame):
+    """
+    支持拼音筛选的自定义下拉组合框。
+    items 格式：[{"label": str, "data": any}, ...]
+    用户可通过汉字、全拼或首字母缩写过滤列表。
+    """
+
+    POPUP_MAX_HEIGHT = 12  # Listbox 最多显示行数
+
+    def __init__(self, parent, width: int = 18, on_select=None, **kwargs):
+        super().__init__(parent, **kwargs)
+        self._all_items: list = []
+        self._filtered_items: list = []
+        self._on_select = on_select
+        self._popup: tk.Toplevel | None = None
+        self._listbox: tk.Listbox | None = None
+        self._suppress_trace = False
+
+        self._text_var = tk.StringVar()
+        self._entry = ttk.Entry(self, textvariable=self._text_var, width=width)
+        self._entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self._arrow_btn = ttk.Button(self, text="▼", width=2, command=self._toggle_popup)
+        self._arrow_btn.pack(side=tk.LEFT)
+
+        self._text_var.trace_add("write", self._on_text_changed)
+        self._entry.bind("<FocusIn>", lambda e: self._show_popup())
+        self._entry.bind("<Return>", self._on_enter)
+        self._entry.bind("<Escape>", lambda e: self._hide_popup())
+        self._entry.bind("<Down>", self._focus_list)
+
+    # -- 公共接口 --
+
+    def set_items(self, items: list):
+        """设置候选列表。items: [{"label": str, "data": any}]"""
+        self._all_items = items
+        # 预计算拼音索引
+        for item in self._all_items:
+            label = item["label"]
+            item["_initials"] = _get_pinyin_initials(label)
+            item["_full_pinyin"] = _get_full_pinyin(label)
+        self._filtered_items = list(self._all_items)
+
+    def set_text(self, text: str):
+        """程序化设置显示文字（不触发筛选弹出）。"""
+        self._suppress_trace = True
+        self._text_var.set(text)
+        self._suppress_trace = False
+
+    def get_text(self) -> str:
+        return self._text_var.get()
+
+    # -- 内部逻辑 --
+
+    def _on_text_changed(self, *_):
+        if self._suppress_trace:
+            return
+        self._update_filter()
+        self._show_popup()
+
+    def _update_filter(self):
+        query = self._text_var.get().strip().lower()
+        if not query:
+            self._filtered_items = list(self._all_items)
+        else:
+            result = []
+            for item in self._all_items:
+                label_lower = item["label"].lower()
+                initials = item.get("_initials", "")
+                full_py = item.get("_full_pinyin", "")
+                if (query in label_lower or
+                        initials.startswith(query) or
+                        full_py.startswith(query)):
+                    result.append(item)
+            self._filtered_items = result
+        if self._listbox:
+            self._populate_listbox()
+
+    def _toggle_popup(self):
+        if self._popup and self._popup.winfo_exists():
+            self._hide_popup()
+        else:
+            self._update_filter()
+            self._show_popup()
+
+    def _show_popup(self):
+        if not self._filtered_items:
+            self._hide_popup()
+            return
+        if self._popup and self._popup.winfo_exists():
+            self._populate_listbox()
+            return
+
+        # 计算弹出位置（Entry 正下方）
+        self.update_idletasks()
+        x = self._entry.winfo_rootx()
+        y = self._entry.winfo_rooty() + self._entry.winfo_height()
+        width = self._entry.winfo_width() + self._arrow_btn.winfo_width()
+
+        popup = tk.Toplevel(self)
+        popup.wm_overrideredirect(True)
+        popup.wm_geometry(f"{width}x1+{x}+{y}")
+        popup.lift()
+        self._popup = popup
+
+        sb = ttk.Scrollbar(popup, orient=tk.VERTICAL)
+        lb = tk.Listbox(popup, yscrollcommand=sb.set, selectmode=tk.SINGLE,
+                        font=("", 9), relief=tk.SOLID, bd=1)
+        sb.config(command=lb.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._listbox = lb
+
+        lb.bind("<<ListboxSelect>>", self._on_listbox_select)
+        lb.bind("<Return>", self._on_listbox_return)
+        lb.bind("<Escape>", lambda e: self._hide_popup())
+
+        self._populate_listbox()
+
+        # 点击弹窗外关闭
+        popup.bind("<FocusOut>", self._on_popup_focus_out)
+
+    def _populate_listbox(self):
+        if self._listbox is None:
+            return
+        self._listbox.delete(0, tk.END)
+        for item in self._filtered_items:
+            self._listbox.insert(tk.END, item["label"])
+        rows = min(len(self._filtered_items), self.POPUP_MAX_HEIGHT)
+        # 动态调整高度（每行约 18px）
+        if self._popup and self._popup.winfo_exists():
+            self.update_idletasks()
+            x = self._entry.winfo_rootx()
+            y = self._entry.winfo_rooty() + self._entry.winfo_height()
+            width = self._entry.winfo_width() + self._arrow_btn.winfo_width()
+            height = rows * 18 + 4
+            self._popup.wm_geometry(f"{width}x{height}+{x}+{y}")
+
+    def _hide_popup(self):
+        if self._popup and self._popup.winfo_exists():
+            self._popup.destroy()
+        self._popup = None
+        self._listbox = None
+
+    def _on_popup_focus_out(self, event):
+        # 延迟一帧判断焦点是否真的离开
+        self.after(50, self._check_focus_and_hide)
+
+    def _check_focus_and_hide(self):
+        focused = self.focus_get()
+        if focused not in (self._entry, self._listbox, self._arrow_btn):
+            self._hide_popup()
+
+    def _on_listbox_select(self, event):
+        lb = self._listbox
+        if lb is None:
+            return
+        sel = lb.curselection()
+        if sel:
+            idx = sel[0]
+            if idx < len(self._filtered_items):
+                self._select_item(self._filtered_items[idx])
+
+    def _on_listbox_return(self, event):
+        self._on_listbox_select(event)
+
+    def _on_enter(self, event):
+        if self._filtered_items:
+            self._select_item(self._filtered_items[0])
+
+    def _select_item(self, item: dict):
+        self._suppress_trace = True
+        self._text_var.set(item["label"])
+        self._suppress_trace = False
+        self._hide_popup()
+        if self._on_select:
+            self._on_select(item)
+
+    def _focus_list(self, event):
+        if self._listbox and self._listbox.winfo_exists():
+            self._listbox.focus_set()
+            if self._listbox.size() > 0:
+                self._listbox.selection_set(0)
+                self._listbox.see(0)
+
+
+# ============================================================================
 # GUI主窗口
 # ============================================================================
 
@@ -931,7 +1145,13 @@ class GaitDataCollectorGUI:
         
         # 按钮状态跟踪
         self.control_loop_enabled = False  # 控制循环启用状态
-        
+
+        # 患者管理
+        self.patient_manager = PatientManager()
+        self.current_patient: dict | None = None
+        self.training_session = TrainingSession()
+        self._last_flush_check: float = 0.0  # 上次临时文件刷新检查时间
+
         # 创建界面
         self.create_widgets()
         
@@ -967,7 +1187,475 @@ class GaitDataCollectorGUI:
     def clear_history(self):
         """清空历史记录"""
         self.history_text.delete('1.0', tk.END)
-        
+
+    # =========================================================================
+    # 患者管理面板
+    # =========================================================================
+
+    def _build_patient_panel(self, parent: ttk.LabelFrame):
+        """在 parent 内构建患者管理 UI。"""
+        parent.columnconfigure(1, weight=1)
+
+        # ── 第0行：患者选择 ──
+        ttk.Label(parent, text="患者:").grid(row=0, column=0, sticky=tk.W, pady=3)
+
+        # 拼音过滤组合框（自定义）
+        self._patient_pinyin_combo = PinyinFilterCombo(parent, width=18,
+                                                        on_select=self._on_patient_selected)
+        self._patient_pinyin_combo.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=4, pady=3)
+
+        btn_row = ttk.Frame(parent)
+        btn_row.grid(row=0, column=2, sticky=tk.W, padx=(2, 0))
+        ttk.Button(btn_row, text="新建患者", width=8,
+                   command=self._open_new_patient_dialog).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="查看记录", width=8,
+                   command=self._open_record_viewer).pack(side=tk.LEFT, padx=2)
+
+        # ── 第1行：当前患者信息 ──
+        self._patient_info_var = tk.StringVar(value="未选择患者")
+        ttk.Label(parent, textvariable=self._patient_info_var,
+                  foreground="#555555").grid(row=1, column=0, columnspan=3,
+                                             sticky=tk.W, pady=(0, 4))
+
+        ttk.Separator(parent, orient=tk.HORIZONTAL).grid(
+            row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=4)
+
+        # ── 第3行：训练类型 ──
+        ttk.Label(parent, text="训练类型:").grid(row=3, column=0, sticky=tk.W, pady=3)
+        self._training_type_var = tk.StringVar(value="active")
+        type_frame = ttk.Frame(parent)
+        type_frame.grid(row=3, column=1, columnspan=2, sticky=tk.W)
+        ttk.Radiobutton(type_frame, text="主动训练", variable=self._training_type_var,
+                        value="active").pack(side=tk.LEFT, padx=(0, 10))
+        self._passive_radio = ttk.Radiobutton(type_frame, text="被动训练（开发中）",
+                                               variable=self._training_type_var,
+                                               value="passive", state=tk.DISABLED)
+        self._passive_radio.pack(side=tk.LEFT)
+
+        # ── 第4行：训练控制按钮 ──
+        ctrl_frame = ttk.Frame(parent)
+        ctrl_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=4)
+        self._start_btn = ttk.Button(ctrl_frame, text="开始训练", width=9,
+                                      command=self._on_start_training)
+        self._start_btn.pack(side=tk.LEFT, padx=2)
+        self._pause_btn = ttk.Button(ctrl_frame, text="暂停", width=7,
+                                      command=self._on_pause_resume, state=tk.DISABLED)
+        self._pause_btn.pack(side=tk.LEFT, padx=2)
+        self._stop_btn = ttk.Button(ctrl_frame, text="结束训练", width=9,
+                                     command=self._on_stop_training, state=tk.DISABLED)
+        self._stop_btn.pack(side=tk.LEFT, padx=2)
+
+        # ── 第5行：训练统计 ──
+        stats_frame = ttk.Frame(parent)
+        stats_frame.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
+        ttk.Label(stats_frame, text="时长:").pack(side=tk.LEFT)
+        self._duration_var = tk.StringVar(value="00:00:00")
+        ttk.Label(stats_frame, textvariable=self._duration_var,
+                  font=("Consolas", 11, "bold"), foreground="#0055AA",
+                  width=9).pack(side=tk.LEFT, padx=(2, 12))
+        ttk.Label(stats_frame, text="步数:").pack(side=tk.LEFT)
+        self._steps_var = tk.StringVar(value="0 步")
+        ttk.Label(stats_frame, textvariable=self._steps_var,
+                  font=("Consolas", 11, "bold"), foreground="#AA5500",
+                  width=7).pack(side=tk.LEFT, padx=(2, 0))
+
+        # 初始刷新患者列表
+        self._refresh_patient_list()
+
+    def _refresh_patient_list(self):
+        """重新加载患者列表到拼音过滤组合框。"""
+        patients = self.patient_manager.get_all_patients()
+        # 每个条目格式：{id:编号  name:姓名} 显示为 "001 张三"
+        items = [{"label": f"{p['id']} {p['name']}", "data": p} for p in patients]
+        self._patient_pinyin_combo.set_items(items)
+
+    def _on_patient_selected(self, item: dict):
+        """用户从下拉列表选择患者后的回调。"""
+        patient = item["data"]
+        self.current_patient = patient
+        age = PatientManager.calc_age(patient.get("birth_date", ""))
+        h = patient.get("height", "")
+        w = patient.get("weight", "")
+        self._patient_info_var.set(
+            f"编号: {patient['id']}  姓名: {patient['name']}  "
+            f"年龄: {age}岁  身高: {h}cm  体重: {w}kg"
+        )
+
+    def _update_training_stats_ui(self):
+        """刷新训练时长和步数标签。"""
+        stats = self.training_session.get_stats()
+        self._duration_var.set(TrainingSession.format_duration(stats["active_duration_s"]))
+        self._steps_var.set(f"{stats['step_count']} 步")
+
+    # =========================================================================
+    # 训练控制
+    # =========================================================================
+
+    def _on_start_training(self):
+        """开始训练按钮处理。"""
+        if self.current_patient is None:
+            messagebox.showwarning("提示", "请先选择患者")
+            return
+        if not self.collector.is_connected():
+            messagebox.showwarning("提示", "请先连接串口设备")
+            return
+        if self.training_session.state != TrainingSession.STATE_IDLE:
+            messagebox.showwarning("提示", "当前已有训练会话，请先结束")
+            return
+
+        training_type = self._training_type_var.get()
+        patient_dir = self.patient_manager.get_patient_dir(
+            self.current_patient["id"], self.current_patient.get("name", ""))
+
+        try:
+            self.training_session.start(self.current_patient, training_type, patient_dir)
+        except Exception as e:
+            messagebox.showerror("错误", f"启动训练失败: {e}")
+            return
+
+        # 主动训练：启动下位机数据上传
+        if training_type == "active":
+            if not self.collector.hip_module_enabled:
+                try:
+                    self.collector.start_hip_module()
+                    self.collector.send_command("ctrlon")
+                    self.add_history("ctrlon", "TX")
+                    self.control_loop_enabled = True
+                    self.control_loop_btn.config(text="禁用控制循环")
+                    self.collector.send_command("gc")
+                    self.add_history("gc", "TX")
+                    self._plot_initialized = False
+                    self._last_realtime_len = 0
+                    self._plot_lines = {'hip_f': None}
+                    self.hip_module_btn.config(text="髋关节数据: 开启")
+                except Exception as e:
+                    self.add_history(f"启动数据采集失败: {e}", "信息")
+
+        self._start_btn.config(state=tk.DISABLED)
+        self._pause_btn.config(state=tk.NORMAL, text="暂停")
+        self._stop_btn.config(state=tk.NORMAL)
+        self.add_history(f"训练开始: {self.current_patient['name']} / "
+                         f"{'主动' if training_type == 'active' else '被动'}训练", "信息")
+
+    def _on_pause_resume(self):
+        """暂停/恢复按钮处理。"""
+        state = self.training_session.state
+        if state == TrainingSession.STATE_RUNNING:
+            self.training_session.pause()
+            try:
+                self.collector.send_command("ctrloff")
+                self.add_history("ctrloff", "TX")
+            except Exception:
+                pass
+            self._pause_btn.config(text="恢复")
+            self.add_history("训练已暂停", "信息")
+        elif state == TrainingSession.STATE_PAUSED:
+            self.training_session.resume()
+            try:
+                self.collector.send_command("ctrlon")
+                self.add_history("ctrlon", "TX")
+            except Exception:
+                pass
+            self._pause_btn.config(text="暂停")
+            self.add_history("训练已恢复", "信息")
+
+    def _on_stop_training(self):
+        """结束训练按钮处理。"""
+        if self.training_session.state not in (
+                TrainingSession.STATE_RUNNING, TrainingSession.STATE_PAUSED):
+            return
+        if not messagebox.askyesno("确认", "确定结束本次训练并保存数据？"):
+            return
+
+        try:
+            saved_path = self.training_session.stop()
+        except Exception as e:
+            messagebox.showerror("错误", f"保存训练数据失败: {e}")
+            return
+
+        # 停止下位机数据上传
+        try:
+            self.collector.send_command("gcs")
+            self.add_history("gcs", "TX")
+        except Exception:
+            pass
+
+        self.training_session.reset()
+        self._start_btn.config(state=tk.NORMAL)
+        self._pause_btn.config(state=tk.DISABLED, text="暂停")
+        self._stop_btn.config(state=tk.DISABLED)
+        self._duration_var.set("00:00:00")
+        self._steps_var.set("0 步")
+
+        self.add_history(f"训练已结束，文件已保存", "信息")
+        messagebox.showinfo("训练完成", f"训练数据已保存至:\n{saved_path}")
+
+    # =========================================================================
+    # 新建患者对话框
+    # =========================================================================
+
+    def _open_new_patient_dialog(self):
+        """打开新建患者的模态对话框。"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("新建患者")
+        dialog.resizable(False, False)
+        dialog.grab_set()  # 模态
+
+        # 居中显示
+        dialog.update_idletasks()
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + self.root.winfo_width() // 2 - 180
+        y = self.root.winfo_y() + self.root.winfo_height() // 2 - 160
+        dialog.geometry(f"360x320+{x}+{y}")
+
+        pad = {"padx": 12, "pady": 5}
+        frame = ttk.Frame(dialog, padding="16")
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        # 编号（只读）
+        new_id = self.patient_manager.generate_id()
+        ttk.Label(frame, text="患者编号:").grid(row=0, column=0, sticky=tk.W, **pad)
+        ttk.Label(frame, text=new_id, font=("", 10, "bold"),
+                  foreground="#0055AA").grid(row=0, column=1, sticky=tk.W, **pad)
+
+        # 姓名
+        ttk.Label(frame, text="姓名 *:").grid(row=1, column=0, sticky=tk.W, **pad)
+        name_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=name_var, width=22).grid(
+            row=1, column=1, sticky=(tk.W, tk.E), **pad)
+
+        # 出生日期
+        ttk.Label(frame, text="出生日期 *:").grid(row=2, column=0, sticky=tk.W, **pad)
+        birth_var = tk.StringVar(value="1980-01-01")
+        birth_entry = ttk.Entry(frame, textvariable=birth_var, width=22)
+        birth_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), **pad)
+        ttk.Label(frame, text="格式 YYYY-MM-DD", foreground="#888888",
+                  font=("", 8)).grid(row=3, column=1, sticky=tk.W, padx=12, pady=0)
+
+        # 身高
+        ttk.Label(frame, text="身高 (cm):").grid(row=4, column=0, sticky=tk.W, **pad)
+        height_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=height_var, width=22).grid(
+            row=4, column=1, sticky=(tk.W, tk.E), **pad)
+
+        # 体重
+        ttk.Label(frame, text="体重 (kg):").grid(row=5, column=0, sticky=tk.W, **pad)
+        weight_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=weight_var, width=22).grid(
+            row=5, column=1, sticky=(tk.W, tk.E), **pad)
+
+        def _save():
+            name = name_var.get().strip()
+            birth = birth_var.get().strip()
+            if not name:
+                messagebox.showwarning("提示", "请输入患者姓名", parent=dialog)
+                return
+            if not birth or len(birth) != 10:
+                messagebox.showwarning("提示", "请输入有效的出生日期（YYYY-MM-DD）",
+                                       parent=dialog)
+                return
+            try:
+                h = float(height_var.get()) if height_var.get().strip() else 0.0
+                w = float(weight_var.get()) if weight_var.get().strip() else 0.0
+            except ValueError:
+                messagebox.showwarning("提示", "身高/体重请输入数字", parent=dialog)
+                return
+            try:
+                patient = self.patient_manager.create_patient(name, birth, h, w)
+            except Exception as e:
+                messagebox.showerror("错误", f"创建患者失败: {e}", parent=dialog)
+                return
+            self._refresh_patient_list()
+            # 自动选中新建患者
+            self._patient_pinyin_combo.set_text(f"{patient['id']} {patient['name']}")
+            self.current_patient = patient
+            self._on_patient_selected({"label": f"{patient['id']} {patient['name']}",
+                                       "data": patient})
+            dialog.destroy()
+            messagebox.showinfo("成功", f"患者【{name}】已创建，编号: {patient['id']}")
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=6, column=0, columnspan=2, pady=12)
+        ttk.Button(btn_frame, text="保存", command=_save, width=10).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy, width=10).pack(
+            side=tk.LEFT, padx=8)
+
+        name_var.trace_add("write", lambda *_: None)
+        frame.nametowidget(frame.grid_slaves(row=1, column=1)[0]).focus_set()
+
+    # =========================================================================
+    # 查看训练记录对话框
+    # =========================================================================
+
+    def _open_record_viewer(self):
+        """打开查看患者训练记录的模态对话框。"""
+        if self.current_patient is None:
+            messagebox.showwarning("提示", "请先选择患者")
+            return
+
+        records = self.patient_manager.get_training_records(self.current_patient)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"{self.current_patient['name']} 的训练记录")
+        dialog.grab_set()
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + 60
+        y = self.root.winfo_y() + 60
+        dialog.geometry(f"820x520+{x}+{y}")
+
+        # 左侧：记录列表
+        left = ttk.Frame(dialog, padding="8")
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        ttk.Label(left, text="训练记录列表", font=("", 10, "bold")).pack(anchor=tk.W)
+
+        list_frame = ttk.Frame(left)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=6)
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL)
+        record_listbox = tk.Listbox(list_frame, width=36, yscrollcommand=scrollbar.set,
+                                    selectmode=tk.SINGLE, font=("", 9))
+        scrollbar.config(command=record_listbox.yview)
+        record_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 右侧：详情面板
+        right = ttk.Frame(dialog, padding="8")
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ttk.Label(right, text="记录详情", font=("", 10, "bold")).pack(anchor=tk.W)
+
+        detail_text = tk.Text(right, height=8, width=44, wrap=tk.WORD, state=tk.DISABLED,
+                              font=("", 9), relief=tk.SUNKEN, bd=1)
+        detail_text.pack(fill=tk.X, pady=(4, 8))
+
+        # 内嵌小图（用于预览）
+        preview_fig = Figure(figsize=(5.5, 3.5), dpi=85)
+        preview_ax = preview_fig.add_subplot(1, 1, 1)
+        preview_canvas = FigureCanvasTkAgg(preview_fig, right)
+        preview_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        btn_row = ttk.Frame(right)
+        btn_row.pack(fill=tk.X, pady=6)
+
+        _current_record = {"data": None, "path": None}
+
+        def _show_record(filepath):
+            """加载并展示选中记录。"""
+            try:
+                rec = self.patient_manager.load_training_record(filepath)
+            except Exception as e:
+                messagebox.showerror("错误", f"读取记录失败: {e}", parent=dialog)
+                return
+            _current_record["data"] = rec
+            _current_record["path"] = filepath
+
+            # 更新文字详情
+            training_type = "主动训练" if rec.get("training_type") == "active" else "被动训练"
+            active_s = rec.get("active_duration_s", 0)
+            m, s = divmod(int(active_s), 60)
+            h, m = divmod(m, 60)
+            pauses = rec.get("pauses", [])
+            detail = (
+                f"训练类型：{training_type}\n"
+                f"开始时间：{rec.get('start_time', '')}\n"
+                f"结束时间：{rec.get('end_time', '')}\n"
+                f"有效时长：{h:02d}:{m:02d}:{s:02d}\n"
+                f"步数：{rec.get('step_count', 0)} 步\n"
+                f"暂停次数：{len(pauses)} 次\n"
+                f"数据点数：{len(rec.get('realtime_data', []))} 条"
+            )
+            detail_text.config(state=tk.NORMAL)
+            detail_text.delete("1.0", tk.END)
+            detail_text.insert(tk.END, detail)
+            detail_text.config(state=tk.DISABLED)
+
+            # 绘制预览曲线
+            preview_ax.clear()
+            rt = rec.get("realtime_data", [])
+            if rt:
+                times = [d.get("t", i * 50) for i, d in enumerate(rt)]
+                t0 = times[0]
+                times_s = [(t - t0) / 1000.0 for t in times]
+                ank_vals = [d.get("ank") for d in rt]
+                hip_vals = [d.get("hip") for d in rt]
+
+                def _filter_none(xs, ys):
+                    pairs = [(x, y) for x, y in zip(xs, ys) if y is not None]
+                    return ([p[0] for p in pairs], [p[1] for p in pairs]) if pairs else ([], [])
+
+                tx, ax_v = _filter_none(times_s, ank_vals)
+                th, hi_v = _filter_none(times_s, hip_vals)
+                if tx:
+                    preview_ax.plot(tx, ax_v, color="#E06000", linewidth=1.2,
+                                    label="踝关节(ank)")
+                if th:
+                    preview_ax.plot(th, hi_v, color="#0066CC", linewidth=1.2,
+                                    label="髋关节(hip)")
+                preview_ax.set_xlabel("时间 (s)", fontsize=8)
+                preview_ax.set_ylabel("角度 (°)", fontsize=8)
+                preview_ax.legend(fontsize=7)
+                preview_ax.grid(True, alpha=0.3)
+            preview_fig.tight_layout()
+            preview_canvas.draw_idle()
+
+        def _on_list_select(event):
+            sel = record_listbox.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            if idx < len(records):
+                _show_record(records[idx])
+
+        def _load_to_main():
+            """将选中记录加载到主界面图表。"""
+            rec = _current_record["data"]
+            if rec is None:
+                messagebox.showwarning("提示", "请先选择一条记录", parent=dialog)
+                return
+            rt = rec.get("realtime_data", [])
+            if not rt:
+                messagebox.showwarning("提示", "该记录没有实时数据", parent=dialog)
+                return
+            # 填充 collector 的数据缓冲，复用已有的绘图机制
+            self.collector.clear_all_data()
+            self.collector.start_hip_module()
+            for d in rt:
+                self.collector.data_queue.put(d)
+            # 给处理线程一点时间消化队列
+            self.root.after(300, lambda: None)
+            self._plot_initialized = False
+            self._last_realtime_len = 0
+            self._plot_lines = {"hip_f": None}
+            self.hip_module_btn.config(text="髋关节数据: 开启")
+            self.add_history(f"已载入训练记录: {os.path.basename(_current_record['path'])}", "信息")
+            dialog.destroy()
+
+        record_listbox.bind("<<ListboxSelect>>", _on_list_select)
+        record_listbox.bind("<Double-Button-1>", lambda e: _load_to_main())
+
+        ttk.Button(btn_row, text="加载到主界面", command=_load_to_main,
+                   width=14).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_row, text="关闭", command=dialog.destroy, width=8).pack(
+            side=tk.LEFT, padx=4)
+
+        # 填充列表
+        if not records:
+            record_listbox.insert(tk.END, "（暂无训练记录）")
+        else:
+            for fp in records:
+                try:
+                    rec = self.patient_manager.load_training_record(fp)
+                    label = PatientManager.format_record_label(fp, rec)
+                except Exception:
+                    label = os.path.basename(fp)
+                record_listbox.insert(tk.END, label)
+            # 默认选中第一条
+            record_listbox.selection_set(0)
+            _show_record(records[0])
+
+    # =========================================================================
+    # 拼音过滤组合框（内部组件类）
+    # =========================================================================
+
     def create_widgets(self):
         """创建GUI组件"""
         # 主框架
@@ -975,11 +1663,21 @@ class GaitDataCollectorGUI:
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        
-        # 左侧控制面板
+
+        # 左列：患者管理（上）+ 控制面板（下）
+        main_frame.columnconfigure(0, weight=0)  # 左列不扩展
+        main_frame.columnconfigure(1, weight=1)  # 右列（图表）扩展
+        main_frame.rowconfigure(0, weight=0)     # 患者管理行不扩展
+        main_frame.rowconfigure(1, weight=1)     # 控制面板行扩展
+
+        # ── 患者管理面板（左上角）──
+        patient_frame = ttk.LabelFrame(main_frame, text="患者管理", padding="8")
+        patient_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10), pady=(0, 6))
+        self._build_patient_panel(patient_frame)
+
+        # 左侧控制面板（移至 row=1）
         control_frame = ttk.LabelFrame(main_frame, text="控制面板", padding="10")
-        control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
-        main_frame.columnconfigure(0, weight=0)  # 控制面板不扩展
+        control_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
         
         # 串口选择
         ttk.Label(control_frame, text="串口:").grid(row=0, column=0, sticky=tk.W, pady=5)
@@ -995,25 +1693,52 @@ class GaitDataCollectorGUI:
         self.status_label = ttk.Label(control_frame, text="状态: 未连接", foreground="red")
         self.status_label.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=5)
         
+        # ── 可折叠控制区域（默认折叠）──
+        self._ctrl_expanded = False
+
+        def _toggle_ctrl_panel():
+            self._ctrl_expanded = not self._ctrl_expanded
+            if self._ctrl_expanded:
+                ctrl_expand_frame.grid()
+                ctrl_toggle_btn.config(text="折叠控制面板 ▲")
+            else:
+                ctrl_expand_frame.grid_remove()
+                ctrl_toggle_btn.config(text="展开控制面板 ▼")
+
+        ctrl_toggle_btn = ttk.Button(control_frame, text="展开控制面板 ▼",
+                                     command=_toggle_ctrl_panel)
+        ctrl_toggle_btn.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(4, 2))
+
+        # 可折叠容器（父级仍为 control_frame）
+        ctrl_expand_frame = ttk.Frame(control_frame)
+        ctrl_expand_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E))
+        ctrl_expand_frame.grid_remove()  # 默认折叠
+        ctrl_expand_frame.columnconfigure(0, weight=0)
+        ctrl_expand_frame.columnconfigure(1, weight=1)
+        ctrl_expand_frame.columnconfigure(2, weight=0)
+
+        # 以下所有内容的父级改为 ctrl_expand_frame，行号从 0 重新计数
+
         # 分隔线
-        ttk.Separator(control_frame, orient=tk.HORIZONTAL).grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
-        
+        ttk.Separator(ctrl_expand_frame, orient=tk.HORIZONTAL).grid(
+            row=0, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=6)
+
         # 命令输入
-        ttk.Label(control_frame, text="控制命令:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        ttk.Label(ctrl_expand_frame, text="控制命令:").grid(row=1, column=0, sticky=tk.W, pady=5)
         self.command_var = tk.StringVar()
-        self.command_entry = ttk.Entry(control_frame, textvariable=self.command_var, width=20)
-        self.command_entry.grid(row=3, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        self.command_entry = ttk.Entry(ctrl_expand_frame, textvariable=self.command_var, width=20)
+        self.command_entry.grid(row=1, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         self.command_entry.bind('<Return>', lambda e: self.send_command())
-        
-        self.send_btn = ttk.Button(control_frame, text="发送", command=self.send_command, state=tk.DISABLED)
-        self.send_btn.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
-        
+
+        self.send_btn = ttk.Button(ctrl_expand_frame, text="发送", command=self.send_command, state=tk.DISABLED)
+        self.send_btn.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+
         # 常用命令按钮
-        ttk.Label(control_frame, text="常用命令:").grid(row=5, column=0, sticky=tk.W, pady=(10, 5))
-        
-        cmd_frame = ttk.Frame(control_frame)
-        cmd_frame.grid(row=6, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
-        
+        ttk.Label(ctrl_expand_frame, text="常用命令:").grid(row=3, column=0, sticky=tk.W, pady=(10, 5))
+
+        cmd_frame = ttk.Frame(ctrl_expand_frame)
+        cmd_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+
         # 第一行：基础控制
         ttk.Button(cmd_frame, text="使能", command=lambda: self.send_command_text("e"), width=8).grid(row=0, column=0, padx=2)
         ttk.Button(cmd_frame, text="掉电", command=lambda: self.send_command_text("d"), width=8).grid(row=0, column=1, padx=2)
@@ -1024,29 +1749,29 @@ class GaitDataCollectorGUI:
         ttk.Button(cmd_frame, text="站立初始化", command=self.send_stand_init, width=10).grid(row=1, column=1, padx=2, pady=2)
         self.control_loop_btn = ttk.Button(cmd_frame, text="启用控制循环", command=self.toggle_control_loop, width=12)
         self.control_loop_btn.grid(row=1, column=2, padx=2, pady=2)
-        
+
         # 第三行：电机重置
         ttk.Button(cmd_frame, text="电机重置", command=self.reset_motors, width=10).grid(row=2, column=0, padx=2, pady=2)
-        
+
         # 分隔线
-        ttk.Separator(cmd_frame, orient=tk.HORIZONTAL).grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
-        
+        ttk.Separator(cmd_frame, orient=tk.HORIZONTAL).grid(row=3, column=0, columnspan=4, sticky=(tk.W, tk.E), pady=5)
+
         # 后处理模块控制
-        ttk.Label(cmd_frame, text="后处理模块:", font=('', 9, 'bold')).grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(5, 2))
+        ttk.Label(cmd_frame, text="后处理模块:", font=('', 9, 'bold')).grid(row=4, column=0, columnspan=4, sticky=tk.W, pady=(5, 2))
 
         # 髋关节数据模块控制
         self.hip_module_btn = ttk.Button(cmd_frame, text="髋关节数据: 关闭", command=self.toggle_hip_module, width=12)
-        self.hip_module_btn.grid(row=4, column=0, columnspan=3, padx=2, pady=2, sticky=(tk.W, tk.E))
+        self.hip_module_btn.grid(row=5, column=0, columnspan=4, padx=2, pady=2, sticky=(tk.W, tk.E))
 
         # A1 参数调节（可折叠）
         self.a1_panel_expanded = False
         self.a1_toggle_btn = ttk.Button(
-            control_frame, text="A1参数调节 ▶", command=self.toggle_a1_param_panel
+            ctrl_expand_frame, text="A1参数调节 ▶", command=self.toggle_a1_param_panel
         )
-        self.a1_toggle_btn.grid(row=7, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(6, 2))
+        self.a1_toggle_btn.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(6, 2))
 
-        self.a1_param_frame = ttk.LabelFrame(control_frame, text="A1实时参数", padding="6")
-        self.a1_param_frame.grid(row=8, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(2, 6))
+        self.a1_param_frame = ttk.LabelFrame(ctrl_expand_frame, text="A1实时参数", padding="6")
+        self.a1_param_frame.grid(row=6, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(2, 6))
         self.a1_param_frame.grid_remove()  # 默认折叠
 
         self.a1_param_vars = {
@@ -1064,15 +1789,11 @@ class GaitDataCollectorGUI:
             entry = ttk.Entry(parent, textvariable=self.a1_param_vars[key], width=10)
             entry.grid(row=row, column=1, sticky=tk.W, padx=2, pady=2)
             ttk.Button(
-                parent,
-                text="设置",
-                width=6,
+                parent, text="设置", width=6,
                 command=lambda k=key: self.set_a1_param(k),
             ).grid(row=row, column=2, padx=2, pady=2)
             ttk.Button(
-                parent,
-                text="读取",
-                width=6,
+                parent, text="读取", width=6,
                 command=lambda k=key: self.get_a1_param(k),
             ).grid(row=row, column=3, padx=2, pady=2)
 
@@ -1086,30 +1807,32 @@ class GaitDataCollectorGUI:
         ttk.Button(self.a1_param_frame, text="读取全部(params)", command=self.get_a1_params).grid(
             row=7, column=0, columnspan=4, sticky=(tk.W, tk.E), pady=(6, 2)
         )
-        
+
         # 数据管理
-        ttk.Separator(control_frame, orient=tk.HORIZONTAL).grid(row=10, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
-        
-        # 数据管理按钮
-        data_btn_frame = ttk.Frame(control_frame)
-        data_btn_frame.grid(row=11, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
-        
+        ttk.Separator(ctrl_expand_frame, orient=tk.HORIZONTAL).grid(
+            row=7, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=6)
+
+        data_btn_frame = ttk.Frame(ctrl_expand_frame)
+        data_btn_frame.grid(row=8, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+
         ttk.Button(data_btn_frame, text="载入步态周期", command=self.load_gait_cycle).grid(row=0, column=0, sticky=(tk.W, tk.E), padx=2)
         ttk.Button(data_btn_frame, text="另存为", command=self.save_gait_cycle_as).grid(row=0, column=1, sticky=(tk.W, tk.E), padx=2)
         ttk.Button(data_btn_frame, text="发送到下位机", command=self.send_gait_to_slave).grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=2, pady=2)
-        
+
         data_btn_frame.columnconfigure(0, weight=1)
         data_btn_frame.columnconfigure(1, weight=1)
-        
-        # 指令收发历史
-        ttk.Separator(control_frame, orient=tk.HORIZONTAL).grid(row=12, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
-        
-        ttk.Label(control_frame, text="指令收发历史:").grid(row=13, column=0, columnspan=3, sticky=tk.W, pady=(5, 2))
-        
+
+        # 指令收发历史（始终可见，行号接在 row=3 的可折叠容器之后）
+        ttk.Separator(control_frame, orient=tk.HORIZONTAL).grid(
+            row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=6)
+
+        ttk.Label(control_frame, text="指令收发历史:").grid(
+            row=5, column=0, columnspan=3, sticky=tk.W, pady=(5, 2))
+
         # 创建历史记录文本框（带滚动条）
         history_frame = ttk.Frame(control_frame)
-        history_frame.grid(row=14, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-        control_frame.rowconfigure(14, weight=1)
+        history_frame.grid(row=6, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        control_frame.rowconfigure(6, weight=1)
         
         self.history_text = tk.Text(history_frame, height=10, width=30, wrap=tk.WORD, font=('Consolas', 9))
         scrollbar = ttk.Scrollbar(history_frame, orient=tk.VERTICAL, command=self.history_text.yview)
@@ -1119,13 +1842,11 @@ class GaitDataCollectorGUI:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         # 清空历史按钮
-        ttk.Button(control_frame, text="清空历史", command=self.clear_history).grid(row=15, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        ttk.Button(control_frame, text="清空历史", command=self.clear_history).grid(row=7, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
         
-        # 右侧图表区域
+        # 右侧图表区域（跨两行，与患者面板+控制面板对齐）
         plot_frame = ttk.Frame(main_frame)
-        plot_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(0, weight=1)
+        plot_frame.grid(row=0, column=1, rowspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
         
         # M2阶段：添加状态显示区域（显示phase、swing_progress和ankle_ref，三个控件放在一行，调小尺寸）
         status_frame = ttk.Frame(plot_frame)
@@ -2100,6 +2821,62 @@ class GaitDataCollectorGUI:
         # 阻止事件继续传播（避免工具栏的默认处理）
         return True
     
+    def _feed_training_session(self):
+        """
+        将 collector 接收到的最新数据同步给 TrainingSession，
+        同时更新训练统计显示，并每 5 秒刷新一次临时文件。
+        仅在训练会话运行或暂停时执行。
+        """
+        session = self.training_session
+        if session.state not in (TrainingSession.STATE_RUNNING,
+                                  TrainingSession.STATE_PAUSED):
+            return
+
+        # 从 _hip_process_loop 存储的数据缓冲中取最新帧（非破坏性读取）
+        # 注：collector.data_queue 已被 _hip_process_loop 消费，这里改用 collector 的
+        # 各数据 deque 推算最新帧。因为我们需要完整的每一帧数据供 TrainingSession 记录，
+        # 所以在 _hip_process_loop 处理前拦截是最优的。
+        # 实际上 collector 的 data_queue 由 _hip_process_loop 消费，
+        # 我们通过记录 collector 已处理数量来批量抓取新帧。
+        if not hasattr(self, '_session_last_data_len'):
+            self._session_last_data_len = 0
+
+        current_len = len(self.collector.time_data)
+        if session.state == TrainingSession.STATE_RUNNING and current_len > self._session_last_data_len:
+            new_start = self._session_last_data_len
+            new_count = current_len - new_start
+
+            # 从各 deque 截取新帧（deque 为环形缓冲，使用 list 切片）
+            def _slice(deque_obj, start, count):
+                lst = list(deque_obj)
+                return lst[max(0, len(lst) - new_count):] if start == 0 else lst[-count:]
+
+            ank_list = list(self.collector.ank_data)[-new_count:] if new_count > 0 else []
+            hip_list = list(self.collector.hip_data_new)[-new_count:] if new_count > 0 else []
+            ph_list = list(self.collector.ph_data)[-new_count:] if new_count > 0 else []
+            t_list = list(self.collector.time_data)[-new_count:] if new_count > 0 else []
+
+            for i in range(new_count):
+                frame = {
+                    "t": t_list[i] if i < len(t_list) else None,
+                    "ank": ank_list[i] if i < len(ank_list) else None,
+                    "hip": hip_list[i] if i < len(hip_list) else None,
+                    "ph": ph_list[i] if i < len(ph_list) else None,
+                }
+                session.add_data(frame)
+
+        self._session_last_data_len = current_len
+
+        # 刷新统计标签
+        if hasattr(self, '_duration_var'):
+            self._update_training_stats_ui()
+
+        # 每 5 秒刷新一次临时文件
+        now = time.time()
+        if now - self._last_flush_check >= 5.0:
+            self._last_flush_check = now
+            session.flush_temp()
+
     def _process_torque_data(self):
         """处理转矩控制阶段的新格式数据（已由_hip_process_loop存储，这里不需要额外处理）"""
         # 新格式数据已经在_hip_process_loop中无条件存储到专用队列
@@ -2108,6 +2885,9 @@ class GaitDataCollectorGUI:
     
     def update_plots(self):
         """更新图表（使用增量更新而非完全重绘，显著提升性能）"""
+        # ── 训练会话：将 data_queue 中的数据同步给 TrainingSession ──
+        self._feed_training_session()
+
         # 处理新格式数据（根据复选框状态）
         self._process_torque_data()
         
