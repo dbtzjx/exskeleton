@@ -1621,15 +1621,42 @@ class GaitDataCollectorGUI:
             if not rt:
                 messagebox.showwarning("提示", "该记录没有实时数据", parent=dialog)
                 return
-            # 填充 collector 的数据缓冲，复用已有的绘图机制
+
+            # 训练记录字段：t / ank / hip / ph
+            # _hip_process_loop 期望 h 字段，直接写入缓冲区绕过队列，避免字段名不匹配导致数据全部被丢弃。
             self.collector.clear_all_data()
-            self.collector.start_hip_module()
+
+            _null_channels = [
+                'hip_velocity_filtered_data', 'ankle_ref_data',
+                's_data', 'st_data', 'v_data',
+                'iqT_a_data', 'iqC_a_data', 'hipv_data',
+                'iqT_h_data', 'iqC_h_data',
+                'ph4_data', 'ph4v_data', 'ph4p_data', 'ph4o_data', 'ph4d_data',
+                'PF_data', 'DF_data', 'UL_data', 'comp_data', 'cool_data', 'abn_data',
+            ]
+
             for d in rt:
-                self.collector.data_queue.put(d)
-            # 给处理线程一点时间消化队列
-            self.root.after(300, lambda: None)
+                t = d.get('t')
+                if t is None:
+                    continue
+                ank = d.get('ank')
+                hip = d.get('hip')
+                ph = d.get('ph')
+
+                self.collector.time_data.append(t)
+                self.collector.hip_filtered_data.append(hip)
+                self.collector.hip_data_new.append(hip)
+                self.collector.ank_data.append(ank)
+                self.collector.ph_data.append(ph)
+                self.collector.phase_data.append(ph if ph is not None else 0)
+                self.collector.swing_progress_data.append(d.get('s', 0.0))
+                for _ch in _null_channels:
+                    getattr(self.collector, _ch).append(None)
+
+            # 触发 update_plots 完整重绘（与 load_gait_cycle 机制一致）
+            self.collector.is_loaded_data = True
             self._plot_initialized = False
-            self._last_realtime_len = 0
+            self._last_realtime_len = -1
             self._plot_lines = {"hip_f": None}
             self.hip_module_btn.config(text="髋关节数据: 开启")
             self.add_history(f"已载入训练记录: {os.path.basename(_current_record['path'])}", "信息")
