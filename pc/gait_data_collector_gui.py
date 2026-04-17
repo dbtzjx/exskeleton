@@ -1813,7 +1813,7 @@ class GaitDataCollectorGUI:
             "hip_ext_th": tk.StringVar(value="-6"),
             "pushoff_max_ms": tk.StringVar(value="300"),
             "ankle_pf_target_deg": tk.StringVar(value="10"),
-            "iq_pf_max": tk.StringVar(value="20"),
+            "iq_pf_max": tk.StringVar(value="800"),
             "iq_pf_floor": tk.StringVar(value="300"),
             "diq_up_pf": tk.StringVar(value="15"),
         }
@@ -2099,6 +2099,8 @@ class GaitDataCollectorGUI:
                 self.status_label.config(text=f"状态: 已连接 ({port})", foreground="green")
                 self.port_combo.config(state=tk.DISABLED)
                 self.add_history(f"串口已连接: {port}", "信息")
+                # 连接成功后延迟自动读取 A1 参数
+                self.root.after(500, self.get_a1_params)
                 messagebox.showinfo("成功", f"已连接到串口: {port}")
             except Exception as e:
                 self.add_history(f"连接失败: {str(e)}", "信息")
@@ -2115,6 +2117,9 @@ class GaitDataCollectorGUI:
         if self.a1_panel_expanded:
             self.a1_param_frame.grid()
             self.a1_toggle_btn.config(text="A1参数调节 ▼")
+            # 展开时若已连接，自动刷新所有参数
+            if self.collector.is_connected():
+                self.get_a1_params()
         else:
             self.a1_param_frame.grid_remove()
             self.a1_toggle_btn.config(text="A1参数调节 ▶")
@@ -3208,13 +3213,30 @@ class GaitDataCollectorGUI:
     
     def start_serial_monitor(self):
         """启动串口监听（处理原始返回数据并显示到历史记录）"""
-        # 处理原始返回数据（记录到历史）
+        import re
+        # 匹配 get/params 回包格式：>>> key=value 或 >>>   key=value（含可选单位和范围说明）
+        _A1_REPLY_RE = re.compile(r'>>>\s+(\w+)=([0-9.eE+\-]+)')
+
         if self.collector.is_connected():
             raw_lines = self.collector.get_raw_data()
             for line in raw_lines:
-                if line.strip():  # 只记录非空行
-                    self.add_history(line.strip(), "RX")
-        
+                line = line.strip()
+                if not line:
+                    continue
+                self.add_history(line, "RX")
+                # 尝试解析 A1 参数回包并回填 UI
+                m = _A1_REPLY_RE.search(line)
+                if m:
+                    key, val = m.group(1), m.group(2)
+                    if key in self.a1_param_vars:
+                        # 整数参数去掉小数点后零（eg "800.00" -> "800"）
+                        try:
+                            f = float(val)
+                            display = str(int(f)) if f == int(f) else f"{f:.2f}".rstrip('0').rstrip('.')
+                        except ValueError:
+                            display = val
+                        self.a1_param_vars[key].set(display)
+
         # 继续监听
         self.root.after(100, self.start_serial_monitor)  # 每100ms检查一次
     
