@@ -457,7 +457,7 @@ class GaitDataCollector:
                     self.v_data.append(data.get('v'))
                     self.iqT_a_data.append(data.get('iqT_a'))
                     self.iqC_a_data.append(data.get('iqC_a'))
-                    self.hip_data_new.append(data.get('hip'))
+                    self.hip_data_new.append(data.get('h', data.get('hip')))
                     self.hipv_data.append(data.get('hipv'))
                     self.iqT_h_data.append(data.get('iqT_h'))
                     self.iqC_h_data.append(data.get('iqC_h'))
@@ -1629,8 +1629,7 @@ class GaitDataCollectorGUI:
             _null_channels = [
                 'hip_velocity_filtered_data', 'ankle_ref_data',
                 's_data', 'st_data', 'v_data',
-                'iqT_a_data', 'iqC_a_data', 'hipv_data',
-                'iqT_h_data', 'iqC_h_data',
+                'iqT_a_data', 'hipv_data', 'iqT_h_data',
                 'ph4_data', 'ph4v_data', 'ph4p_data', 'ph4o_data', 'ph4d_data',
                 'PF_data', 'DF_data', 'UL_data', 'comp_data', 'cool_data', 'abn_data',
             ]
@@ -1650,6 +1649,8 @@ class GaitDataCollectorGUI:
                 self.collector.ph_data.append(ph)
                 self.collector.phase_data.append(ph if ph is not None else 0)
                 self.collector.swing_progress_data.append(d.get('s', 0.0))
+                self.collector.iqC_a_data.append(d.get('iqC_a'))
+                self.collector.iqC_h_data.append(d.get('iqC_h'))
                 for _ch in _null_channels:
                     getattr(self.collector, _ch).append(None)
 
@@ -2884,17 +2885,21 @@ class GaitDataCollectorGUI:
                 lst = list(deque_obj)
                 return lst[max(0, len(lst) - new_count):] if start == 0 else lst[-count:]
 
-            ank_list = list(self.collector.ank_data)[-new_count:] if new_count > 0 else []
-            hip_list = list(self.collector.hip_data_new)[-new_count:] if new_count > 0 else []
-            ph_list = list(self.collector.ph_data)[-new_count:] if new_count > 0 else []
-            t_list = list(self.collector.time_data)[-new_count:] if new_count > 0 else []
+            ank_list    = list(self.collector.ank_data)[-new_count:]    if new_count > 0 else []
+            hip_list    = list(self.collector.hip_data_new)[-new_count:] if new_count > 0 else []
+            ph_list     = list(self.collector.ph_data)[-new_count:]     if new_count > 0 else []
+            t_list      = list(self.collector.time_data)[-new_count:]   if new_count > 0 else []
+            iqC_a_list  = list(self.collector.iqC_a_data)[-new_count:]  if new_count > 0 else []
+            iqC_h_list  = list(self.collector.iqC_h_data)[-new_count:]  if new_count > 0 else []
 
             for i in range(new_count):
                 frame = {
-                    "t": t_list[i] if i < len(t_list) else None,
-                    "ank": ank_list[i] if i < len(ank_list) else None,
-                    "hip": hip_list[i] if i < len(hip_list) else None,
-                    "ph": ph_list[i] if i < len(ph_list) else None,
+                    "t":     t_list[i]     if i < len(t_list)     else None,
+                    "ank":   ank_list[i]   if i < len(ank_list)   else None,
+                    "hip":   hip_list[i]   if i < len(hip_list)   else None,
+                    "ph":    ph_list[i]    if i < len(ph_list)    else None,
+                    "iqC_a": iqC_a_list[i] if i < len(iqC_a_list) else None,
+                    "iqC_h": iqC_h_list[i] if i < len(iqC_h_list) else None,
                 }
                 session.add_data(frame)
 
