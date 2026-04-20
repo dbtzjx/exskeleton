@@ -1955,8 +1955,9 @@ class GaitDataCollectorGUI:
             check_frame = ttk.Frame(data_flags_frame)
             check_frame.pack(side=tk.LEFT, padx=3)
             
-            # 复选框
-            cb = ttk.Checkbutton(check_frame, text=flag_name, variable=var)
+            # 复选框：勾选/取消时立即触发重绘
+            cb = ttk.Checkbutton(check_frame, text=flag_name, variable=var,
+                                 command=self._on_flag_change)
             cb.pack(side=tk.LEFT)
             
             # 问号标签（带提示）
@@ -2003,8 +2004,9 @@ class GaitDataCollectorGUI:
             check_frame = ttk.Frame(state_flags_frame)
             check_frame.pack(side=tk.LEFT, padx=3)
             
-            # 复选框
-            cb = ttk.Checkbutton(check_frame, text=flag_name, variable=var)
+            # 复选框：勾选/取消时立即触发重绘
+            cb = ttk.Checkbutton(check_frame, text=flag_name, variable=var,
+                                 command=self._on_flag_change)
             cb.pack(side=tk.LEFT)
             
             # 问号标签（带提示）
@@ -2920,11 +2922,44 @@ class GaitDataCollectorGUI:
             self._last_flush_check = now
             session.flush_temp()
 
+    # 数据标志位 → (collector属性名, 颜色, 图例标签, 线型)
+    # 所有标志位数据都会被记录到缓冲区；复选框仅控制该曲线在图表中是否可见
+    DATA_FLAG_CONFIG = {
+        'ph':    ('ph_data',       '#FF2200', '步态相位(ph)',              '-'),
+        's':     ('s_data',        '#00BB00', '步态进度(s)',               '-'),
+        'st':    ('st_data',       '#0044FF', '站立时间(st)',              '-'),
+        'ank':   ('ank_data',      '#CC00CC', '踝关节角度(ank)',           '-'),
+        'v':     ('v_data',        '#00AAAA', '踝关节速度(v)',             '--'),
+        'iqT_a': ('iqT_a_data',    '#BBBB00', '踝目标力矩(iqT_a,-DF/+PF)','-'),
+        'iqC_a': ('iqC_a_data',    '#FF8800', '踝实际力矩(iqC_a,-DF/+PF)','--'),
+        'hip':   ('hip_data_new',  '#0088FF', '髋关节角度(hip)',           '-'),
+        'hipv':  ('hipv_data',     '#66CC00', '髋关节速度(hipv)',          '--'),
+        'iqT_h': ('iqT_h_data',    '#FF0088', '髋目标力矩(iqT_h)',         '-'),
+        'iqC_h': ('iqC_h_data',    '#44AA44', '髋实际力矩(iqC_h)',         '--'),
+        'ph4':   ('ph4_data',      '#888888', '四相原始值(ph4)',           '-'),
+        'ph4v':  ('ph4v_data',     '#FF4444', '四相放大值(ph4v)',          '-'),
+        'ph4p':  ('ph4p_data',     '#44AAFF', '四相进度(ph4p)',           '--'),
+        'ph4o':  ('ph4o_data',     '#AA44FF', '四相输出(ph4o)',            '-'),
+        'ph4d':  ('ph4d_data',     '#333333', '四相退化(ph4d)',            '-'),
+        # 状态标志位（0/1离散值，同样绘制为曲线）
+        'PF':    ('PF_data',       '#FF6600', '跖屈助力状态(PF)',          ':'),
+        'DF':    ('DF_data',       '#6699FF', '背屈助力状态(DF)',          ':'),
+        'UL':    ('UL_data',       '#00CC66', '卸载状态(UL)',              ':'),
+        'comp':  ('comp_data',     '#CC44CC', '退让模式(comp)',            ':'),
+        'cool':  ('cool_data',     '#44CCCC', '冷却模式(cool)',            ':'),
+        'abn':   ('abn_data',      '#CC4444', '异常状态(abn)',             ':'),
+    }
+
     def _process_torque_data(self):
         """处理转矩控制阶段的新格式数据（已由_hip_process_loop存储，这里不需要额外处理）"""
         # 新格式数据已经在_hip_process_loop中无条件存储到专用队列
         # 绘图时根据复选框状态决定是否显示
         pass
+
+    def _on_flag_change(self):
+        """复选框勾选/取消时，立即重置绘图状态以触发下一帧完整重绘"""
+        if hasattr(self, '_plot_initialized'):
+            self._plot_initialized = False
     
     def update_plots(self):
         """更新图表（使用增量更新而非完全重绘，显著提升性能）"""
@@ -2995,67 +3030,37 @@ class GaitDataCollectorGUI:
                                                        label='髋关节滤波(hip_f)', linewidth=1.5, alpha=0.8)
                                 self._plot_lines['hip_f'] = line_f
                         
-                        # 根据复选框状态绘制新格式数据
-                        if hasattr(self, 'flag_vars'):
-                            # 定义数据标志位及其颜色和标签
-                            data_flag_config = {
-                                'ph': ('ph_data', '#FF0000', '步态相位(ph)', '-'),
-                                's': ('s_data', '#00FF00', '步态进度(s)', '-'),
-                                'st': ('st_data', '#0000FF', '站立时间(st)', '-'),
-                                'ank': ('ank_data', '#FF00FF', '踝关节角度(ank)', '-'),
-                                'v': ('v_data', '#00FFFF', '踝关节速度(v)', '--'),
-                                'iqT_a': ('iqT_a_data', '#FFFF00', '踝目标力矩(iqT_a, -DF/+PF)', '-'),
-                                'iqC_a': ('iqC_a_data', '#FF8800', '踝实际力矩(iqC_a, -DF/+PF)', '--'),
-                                'hip': ('hip_data_new', '#0088FF', '髋关节角度(hip)', '-'),
-                                'hipv': ('hipv_data', '#88FF00', '髋关节速度(hipv)', '--'),
-                                'iqT_h': ('iqT_h_data', '#FF0088', '髋目标力矩(iqT_h)', '-'),
-                                'iqC_h': ('iqC_h_data', '#88FF88', '髋实际力矩(iqC_h)', '--'),
-                                'ph4': ('ph4_data', '#AAAAAA', '四相原始值(ph4)', '-'),
-                                'ph4v': ('ph4v_data', '#FF4444', '四相放大值(ph4v)', '-'),
-                                'ph4p': ('ph4p_data', '#44AAFF', '四相进度(ph4p)', '--'),
-                                'ph4o': ('ph4o_data', '#AA44FF', '四相输出(ph4o)', '-'),
-                                'ph4d': ('ph4d_data', '#222222', '四相退化(ph4d)', '-'),
-                            }
-                            
-                            # 获取时间数据（用于新格式数据）
-                            if len(self.collector.time_data) > 0:
-                                latest_time = self.collector.time_data[-1]
-                                time_arr_new = np.array([(t - latest_time) / 1000.0 for t in self.collector.time_data])
-                                
-                                # 绘制选中的数据标志位
-                                for flag_name, (deque_name, color, label, linestyle) in data_flag_config.items():
-                                    if flag_name in self.flag_vars and self.flag_vars[flag_name].get():
-                                        if hasattr(self.collector, deque_name):
-                                            data_deque = getattr(self.collector, deque_name)
-                                            if len(data_deque) > 0:
-                                                # 确保数据长度与时间数据一致
-                                                time_len = len(self.collector.time_data)
-                                                data_list = list(data_deque)
-                                                
-                                                # 确保长度匹配（取较小值，避免索引错误）
-                                                actual_len = min(len(data_list), time_len, len(time_arr_new))
-                                                if actual_len == 0:
-                                                    continue
-                                                
-                                                # 截取到实际长度
-                                                data_list = data_list[:actual_len]
-                                                time_arr_plot = time_arr_new[:actual_len]
-                                                
-                                                # 转换为numpy数组并过滤有效数据
-                                                data_arr = np.array([x if x is not None else np.nan for x in data_list])
-                                                valid_mask = ~np.isnan(data_arr)
-                                                
-                                                # 确保valid_mask和time_arr_plot长度一致
-                                                if len(valid_mask) == len(time_arr_plot) and np.any(valid_mask):
-                                                    line_key = f'torque_{flag_name}'
-                                                    line, = self.ax1.plot(time_arr_plot[valid_mask], data_arr[valid_mask], 
-                                                                         color=color, linestyle=linestyle, 
-                                                                         linewidth=1.5, label=label, alpha=0.8)
-                                                    self._plot_lines[line_key] = line
-                                                elif len(valid_mask) != len(time_arr_plot):
-                                                    # 长度不匹配，跳过绘制（避免索引错误）
-                                                    # 只在调试时打印，避免刷屏
-                                                    pass
+                        # 根据复选框状态绘制标志位数据曲线
+                        if hasattr(self, 'flag_vars') and len(self.collector.time_data) > 0:
+                            latest_time = self.collector.time_data[-1]
+                            time_arr_new = np.array([(t - latest_time) / 1000.0 for t in self.collector.time_data])
+                            time_len = len(self.collector.time_data)
+
+                            for flag_name, (deque_name, color, label, linestyle) in self.DATA_FLAG_CONFIG.items():
+                                # 只绘制已勾选且有数据的标志位
+                                if flag_name not in self.flag_vars or not self.flag_vars[flag_name].get():
+                                    continue
+                                if not hasattr(self.collector, deque_name):
+                                    continue
+                                data_deque = getattr(self.collector, deque_name)
+                                if len(data_deque) == 0:
+                                    continue
+
+                                data_list = list(data_deque)
+                                actual_len = min(len(data_list), time_len, len(time_arr_new))
+                                if actual_len == 0:
+                                    continue
+
+                                data_arr = np.array([x if x is not None else np.nan for x in data_list[:actual_len]])
+                                time_arr_plot = time_arr_new[:actual_len]
+                                valid_mask = ~np.isnan(data_arr)
+
+                                if len(valid_mask) == len(time_arr_plot) and np.any(valid_mask):
+                                    line_key = f'torque_{flag_name}'
+                                    line, = self.ax1.plot(time_arr_plot[valid_mask], data_arr[valid_mask],
+                                                         color=color, linestyle=linestyle,
+                                                         linewidth=1.5, label=label, alpha=0.8)
+                                    self._plot_lines[line_key] = line
                         
                         self.ax1.set_title('实时数据（根据复选框选择显示）', fontsize=12)
                         self.ax1.set_xlabel('时间 (秒)')
@@ -3090,46 +3095,30 @@ class GaitDataCollectorGUI:
                                 valid_filtered = np.array([hip_filtered[i] for i in valid_indices])
                                 self._plot_lines['hip_f'].set_data(valid_time, valid_filtered)
                         
-                        # 增量更新新格式数据（根据复选框状态）
+                        # 增量更新标志位曲线数据
                         if hasattr(self, 'flag_vars') and len(self.collector.time_data) > 0:
                             latest_time = self.collector.time_data[-1]
                             time_arr_new = np.array([(t - latest_time) / 1000.0 for t in self.collector.time_data])
-                            
-                            data_flag_config = {
-                                'ph': ('ph_data', '#FF0000', '步态相位(ph)', '-'),
-                                's': ('s_data', '#00FF00', '步态进度(s)', '-'),
-                                'st': ('st_data', '#0000FF', '站立时间(st)', '-'),
-                                'ank': ('ank_data', '#FF00FF', '踝关节角度(ank)', '-'),
-                                'v': ('v_data', '#00FFFF', '踝关节速度(v)', '--'),
-                                'iqT_a': ('iqT_a_data', '#FFFF00', '踝目标力矩(iqT_a, -DF/+PF)', '-'),
-                                'iqC_a': ('iqC_a_data', '#FF8800', '踝实际力矩(iqC_a, -DF/+PF)', '--'),
-                                'hip': ('hip_data_new', '#0088FF', '髋关节角度(hip)', '-'),
-                                'hipv': ('hipv_data', '#88FF00', '髋关节速度(hipv)', '--'),
-                                'iqT_h': ('iqT_h_data', '#FF0088', '髋目标力矩(iqT_h)', '-'),
-                                'iqC_h': ('iqC_h_data', '#88FF88', '髋实际力矩(iqC_h)', '--'),
-                                'ph4': ('ph4_data', '#AAAAAA', '四相原始值(ph4)', '-'),
-                                'ph4v': ('ph4v_data', '#FF4444', '四相放大值(ph4v)', '-'),
-                                'ph4p': ('ph4p_data', '#44AAFF', '四相进度(ph4p)', '--'),
-                                'ph4o': ('ph4o_data', '#AA44FF', '四相输出(ph4o)', '-'),
-                                'ph4d': ('ph4d_data', '#222222', '四相退化(ph4d)', '-'),
-                            }
-                            
-                            for flag_name, (deque_name, color, label, linestyle) in data_flag_config.items():
-                                if flag_name in self.flag_vars and self.flag_vars[flag_name].get():
-                                    line_key = f'torque_{flag_name}'
-                                    if line_key in self._plot_lines and hasattr(self.collector, deque_name):
-                                        data_deque = getattr(self.collector, deque_name)
-                                        if len(data_deque) > 0:
-                                            time_len = len(self.collector.time_data)
-                                            data_list = list(data_deque)
-                                            actual_len = min(len(data_list), time_len, len(time_arr_new))
-                                            if actual_len > 0:
-                                                data_list = data_list[:actual_len]
-                                                time_arr_plot = time_arr_new[:actual_len]
-                                                data_arr = np.array([x if x is not None else np.nan for x in data_list])
-                                                valid_mask = ~np.isnan(data_arr)
-                                                if len(valid_mask) == len(time_arr_plot) and np.any(valid_mask):
-                                                    self._plot_lines[line_key].set_data(time_arr_plot[valid_mask], data_arr[valid_mask])
+                            time_len = len(self.collector.time_data)
+
+                            for flag_name, (deque_name, color, label, linestyle) in self.DATA_FLAG_CONFIG.items():
+                                line_key = f'torque_{flag_name}'
+                                if line_key not in self._plot_lines:
+                                    continue
+                                if not hasattr(self.collector, deque_name):
+                                    continue
+                                data_deque = getattr(self.collector, deque_name)
+                                if len(data_deque) == 0:
+                                    continue
+                                data_list = list(data_deque)
+                                actual_len = min(len(data_list), time_len, len(time_arr_new))
+                                if actual_len == 0:
+                                    continue
+                                data_arr = np.array([x if x is not None else np.nan for x in data_list[:actual_len]])
+                                time_arr_plot = time_arr_new[:actual_len]
+                                valid_mask = ~np.isnan(data_arr)
+                                if len(valid_mask) == len(time_arr_plot) and np.any(valid_mask):
+                                    self._plot_lines[line_key].set_data(time_arr_plot[valid_mask], data_arr[valid_mask])
                         
                         # 自动缩放 Y 轴和 X 轴
                         self.ax1.relim()
