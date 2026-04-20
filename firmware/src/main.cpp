@@ -2815,12 +2815,29 @@ void saveA1ParamsToEeprom() {
   p._pad = 0;
   p.checksum = calcA1ParamsChecksum(p);
   EEPROM.put(EEPROM_ADDR_A1_PARAMS, p);
-  hostPrintln(">>> A1 params saved to EEPROM");
+
+  // 写后立即回读验证（排查 EEPROM.put 是否真正写入）
+  A1ParamsPersist v;
+  EEPROM.get(EEPROM_ADDR_A1_PARAMS, v);
+  if (v.magic == p.magic && v.version == p.version && v.checksum == p.checksum) {
+    hostPrintf(">>> A1 params saved to EEPROM OK (magic=0x%08lX ver=%u crc=0x%04X sz=%u)\n",
+               (unsigned long)p.magic, (unsigned)p.version,
+               (unsigned)p.checksum, (unsigned)sizeof(p));
+  } else {
+    hostPrintf("ERROR: EEPROM write verify FAILED! wrote magic=0x%08lX read=0x%08lX\n",
+               (unsigned long)p.magic, (unsigned long)v.magic);
+  }
 }
 
 bool loadA1ParamsFromEeprom() {
   A1ParamsPersist p;
   EEPROM.get(EEPROM_ADDR_A1_PARAMS, p);
+
+  hostPrintf("DBG EEPROM load: magic=0x%08lX(exp=0x%08lX) ver=%u(exp=%u) sz=%u\n",
+             (unsigned long)p.magic, (unsigned long)A1_PARAMS_MAGIC,
+             (unsigned)p.version, (unsigned)A1_PARAMS_VERSION,
+             (unsigned)sizeof(p));
+
   if (p.magic != A1_PARAMS_MAGIC) {
     hostPrintln("WARN: EEPROM A1 magic not found (first boot or flash erased)");
     return false;
@@ -2832,20 +2849,41 @@ bool loadA1ParamsFromEeprom() {
   }
   uint16_t crc = calcA1ParamsChecksum(p);
   if (crc != p.checksum) {
-    hostPrintln("WARN: EEPROM A1 params checksum mismatch, using defaults");
+    hostPrintf("WARN: EEPROM A1 checksum mismatch (stored=0x%04X computed=0x%04X)\n",
+               (unsigned)p.checksum, (unsigned)crc);
     return false;
   }
 
   // 范围和关联校验，防止写入损坏数据
-  if (p.ankle_df_th < 0.0f || p.ankle_df_th > 40.0f) return false;
-  if (p.hip_ext_th < -40.0f || p.hip_ext_th > 20.0f) return false;
-  if (p.pushoff_max_ms < 50 || p.pushoff_max_ms > 1000) return false;
-  if (p.ankle_pf_target_deg < -10.0f || p.ankle_pf_target_deg > 30.0f) return false;
-  if (p.ankle_pf_target_deg >= p.ankle_df_th) return false;
-  if (p.iq_pf_max < 1 || p.iq_pf_max > 2000) return false;
-  if (p.iq_pf_floor < 0 || p.iq_pf_floor > 2000) return false;
-  if (p.iq_pf_floor > p.iq_pf_max) return false;
-  if (p.diq_up_pf < 1 || p.diq_up_pf > 1000) return false;
+  if (p.ankle_df_th < 0.0f || p.ankle_df_th > 40.0f) {
+    hostPrintf("WARN: EEPROM ankle_df_th=%.2f out of range\n", p.ankle_df_th); return false;
+  }
+  if (p.hip_ext_th < -40.0f || p.hip_ext_th > 20.0f) {
+    hostPrintf("WARN: EEPROM hip_ext_th=%.2f out of range\n", p.hip_ext_th); return false;
+  }
+  if (p.pushoff_max_ms < 50 || p.pushoff_max_ms > 1000) {
+    hostPrintf("WARN: EEPROM pushoff_max_ms=%lu out of range\n", (unsigned long)p.pushoff_max_ms); return false;
+  }
+  if (p.ankle_pf_target_deg < -10.0f || p.ankle_pf_target_deg > 30.0f) {
+    hostPrintf("WARN: EEPROM ankle_pf_target_deg=%.2f out of range\n", p.ankle_pf_target_deg); return false;
+  }
+  if (p.ankle_pf_target_deg >= p.ankle_df_th) {
+    hostPrintf("WARN: EEPROM ankle_pf_target_deg=%.2f >= ankle_df_th=%.2f\n",
+               p.ankle_pf_target_deg, p.ankle_df_th); return false;
+  }
+  if (p.iq_pf_max < 1 || p.iq_pf_max > 2000) {
+    hostPrintf("WARN: EEPROM iq_pf_max=%d out of range\n", (int)p.iq_pf_max); return false;
+  }
+  if (p.iq_pf_floor < 0 || p.iq_pf_floor > 2000) {
+    hostPrintf("WARN: EEPROM iq_pf_floor=%d out of range\n", (int)p.iq_pf_floor); return false;
+  }
+  if (p.iq_pf_floor > p.iq_pf_max) {
+    hostPrintf("WARN: EEPROM iq_pf_floor=%d > iq_pf_max=%d\n",
+               (int)p.iq_pf_floor, (int)p.iq_pf_max); return false;
+  }
+  if (p.diq_up_pf < 1 || p.diq_up_pf > 1000) {
+    hostPrintf("WARN: EEPROM diq_up_pf=%d out of range\n", (int)p.diq_up_pf); return false;
+  }
 
   torqueParams.ankle_df_th = p.ankle_df_th;
   torqueParams.hip_ext_th = p.hip_ext_th;
@@ -4135,6 +4173,18 @@ void processSerialCommand() {
     }
   }
   // 重置故障状态：resetfault
+  // EEPROM 诊断：dump 前 N 字节原始内容，排查持久化问题
+  else if (cmd == "eediag") {
+    const int dumpLen = (int)sizeof(A1ParamsPersist) + 4;
+    hostPrintf(">>> EEPROM raw dump [0..%d] (sizeof struct=%u):\n",
+               dumpLen - 1, (unsigned)sizeof(A1ParamsPersist));
+    for (int i = 0; i < dumpLen; i++) {
+      hostPrintf(" %02X", (unsigned)EEPROM.read(i));
+      if ((i & 0xF) == 0xF || i == dumpLen - 1) hostPrintln("");
+    }
+    // 同时输出解析尝试
+    loadA1ParamsFromEeprom();
+  }
   else if (cmd == "resetfault" || cmd == "reset") {
     if (complianceCtrl.currentState == STATE_FAULT_SAFE) {
       resetComplianceFault();
