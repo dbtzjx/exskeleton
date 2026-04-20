@@ -5,6 +5,7 @@
 #include <EEPROM.h>
 #include <cstdarg>
 #include <cstdio>
+#include <cstddef>  // offsetof
 
 // ISR 上下文标志：当定时器回调在运行时置位，用于抑制 Serial 输出
 volatile bool inIsrContext = false;
@@ -2788,12 +2789,16 @@ struct A1ParamsPersist {
 
 static const int EEPROM_ADDR_A1_PARAMS = 0;
 static const uint32_t A1_PARAMS_MAGIC = 0x41315052UL;  // "A1PR"
-static const uint16_t A1_PARAMS_VERSION = 2;  // v2: 加入 ankleBypassSafety 字段
+// v3: 修复 checksum 计算 bug（v2 错误地用 sizeof(struct)-2，导致 checksum 字段本身
+//     被纳入自身的 hash 计算，save/load 之间 checksum 始终不匹配）
+static const uint16_t A1_PARAMS_VERSION = 3;
 
 uint16_t calcA1ParamsChecksum(const A1ParamsPersist &p) {
   uint16_t c = 0x5A5A;
   const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&p);
-  for (size_t i = 0; i < sizeof(A1ParamsPersist) - sizeof(p.checksum); ++i) {
+  // 使用 offsetof 精确定位 checksum 字段起始位置，只对它之前的数据做 hash，
+  // 避免 struct 尾部 padding（sizeof 可能比 offsetof+2 大）引入的误差
+  for (size_t i = 0; i < offsetof(A1ParamsPersist, checksum); ++i) {
     c = (uint16_t)(c + bytes[i] * (uint16_t)(i + 1));
   }
   return c;
