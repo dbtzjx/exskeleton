@@ -2801,6 +2801,7 @@ uint16_t calcA1ParamsChecksum(const A1ParamsPersist &p) {
 
 void saveA1ParamsToEeprom() {
   A1ParamsPersist p;
+  memset(&p, 0, sizeof(p));  // 清零所有字节（含编译器隐式 padding），保证 checksum 确定性
   p.magic = A1_PARAMS_MAGIC;
   p.version = A1_PARAMS_VERSION;
   p.ankle_df_th = torqueParams.ankle_df_th;
@@ -4384,8 +4385,10 @@ void setup() {
 
   if (loadA1ParamsFromEeprom()) {
     hostPrintln(">>> Loaded A1 params from EEPROM");
+    printA1Params();  // 打印实际加载值，便于串口确认
   } else {
     hostPrintln(">>> EEPROM A1 params not found/invalid, using defaults");
+    printA1Params();  // 打印默认值
   }
   
   // 初始化默认步态轨迹

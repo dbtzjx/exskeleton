@@ -2183,6 +2183,14 @@ class GaitDataCollectorGUI:
         self.a1_panel_expanded = True
         self.a1_toggle_btn.config(text="A1参数调节 ▼")
 
+        # 打开面板时自动读取固件当前值（防止 GUI 显示硬编码默认值）
+        if self.collector.is_connected():
+            try:
+                self.collector.send_command("params")
+                self.add_history("params (自动读取)", "TX")
+            except Exception:
+                pass
+
     def _close_a1_panel_window(self):
         """关闭 A1 参数浮动窗口并重置按钮状态"""
         if self._a1_win is not None and self._a1_win.winfo_exists():
