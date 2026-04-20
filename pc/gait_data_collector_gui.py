@@ -1797,50 +1797,25 @@ class GaitDataCollectorGUI:
         self.hip_module_btn = ttk.Button(cmd_frame, text="髋关节数据: 关闭", command=self.toggle_hip_module, width=12)
         self.hip_module_btn.grid(row=5, column=0, columnspan=4, padx=2, pady=2, sticky=(tk.W, tk.E))
 
-        # A1 参数调节（可折叠）
+        # A1 参数调节（点击向右弹出浮动窗口，不占主界面纵向空间）
         self.a1_panel_expanded = False
+        self._a1_win = None
         self.a1_toggle_btn = ttk.Button(
             ctrl_expand_frame, text="A1参数调节 ▶", command=self.toggle_a1_param_panel
         )
         self.a1_toggle_btn.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(6, 2))
 
-        self.a1_param_frame = ttk.LabelFrame(ctrl_expand_frame, text="A1实时参数", padding="6")
-        self.a1_param_frame.grid(row=6, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(2, 6))
-        self.a1_param_frame.grid_remove()  # 默认折叠
-
+        # 参数变量（供浮动窗口和串口解析共享）
         self.a1_param_vars = {
-            "ankle_df_th": tk.StringVar(value="18"),
-            "hip_ext_th": tk.StringVar(value="-6"),
-            "pushoff_max_ms": tk.StringVar(value="300"),
+            "ankle_df_th":         tk.StringVar(value="18"),
+            "hip_ext_th":          tk.StringVar(value="-6"),
+            "pushoff_max_ms":      tk.StringVar(value="300"),
             "ankle_pf_target_deg": tk.StringVar(value="10"),
-            "iq_pf_max": tk.StringVar(value="800"),
-            "iq_pf_floor": tk.StringVar(value="300"),
-            "diq_up_pf": tk.StringVar(value="15"),
+            "iq_pf_max":           tk.StringVar(value="1200"),
+            "iq_pf_floor":         tk.StringVar(value="800"),
+            "diq_up_pf":           tk.StringVar(value="500"),
+            "ankleBypassSafety":   tk.StringVar(value="0"),
         }
-
-        def add_param_row(parent, row, key, label_text):
-            ttk.Label(parent, text=label_text, width=16).grid(row=row, column=0, sticky=tk.W, pady=2)
-            entry = ttk.Entry(parent, textvariable=self.a1_param_vars[key], width=10)
-            entry.grid(row=row, column=1, sticky=tk.W, padx=2, pady=2)
-            ttk.Button(
-                parent, text="设置", width=6,
-                command=lambda k=key: self.set_a1_param(k),
-            ).grid(row=row, column=2, padx=2, pady=2)
-            ttk.Button(
-                parent, text="读取", width=6,
-                command=lambda k=key: self.get_a1_param(k),
-            ).grid(row=row, column=3, padx=2, pady=2)
-
-        add_param_row(self.a1_param_frame, 0, "ankle_df_th", "ankle_df_th")
-        add_param_row(self.a1_param_frame, 1, "hip_ext_th", "hip_ext_th")
-        add_param_row(self.a1_param_frame, 2, "pushoff_max_ms", "pushoff_max_ms")
-        add_param_row(self.a1_param_frame, 3, "ankle_pf_target_deg", "ankle_pf_target_deg")
-        add_param_row(self.a1_param_frame, 4, "iq_pf_max", "iq_pf_max")
-        add_param_row(self.a1_param_frame, 5, "iq_pf_floor", "iq_pf_floor")
-        add_param_row(self.a1_param_frame, 6, "diq_up_pf", "diq_up_pf")
-        ttk.Button(self.a1_param_frame, text="读取全部(params)", command=self.get_a1_params).grid(
-            row=7, column=0, columnspan=4, sticky=(tk.W, tk.E), pady=(6, 2)
-        )
 
         # 数据管理
         ttk.Separator(ctrl_expand_frame, orient=tk.HORIZONTAL).grid(
@@ -2114,17 +2089,71 @@ class GaitDataCollectorGUI:
         self.send_command()
 
     def toggle_a1_param_panel(self):
-        """展开/折叠 A1 参数调节区域"""
-        self.a1_panel_expanded = not self.a1_panel_expanded
-        if self.a1_panel_expanded:
-            self.a1_param_frame.grid()
-            self.a1_toggle_btn.config(text="A1参数调节 ▼")
-            # 展开时若已连接，自动刷新所有参数
-            if self.collector.is_connected():
-                self.get_a1_params()
-        else:
-            self.a1_param_frame.grid_remove()
-            self.a1_toggle_btn.config(text="A1参数调节 ▶")
+        """点击按钮：向右弹出 / 关闭 A1 参数浮动窗口"""
+        # 如果窗口已存在且可见，则关闭
+        if self._a1_win is not None and self._a1_win.winfo_exists():
+            self._close_a1_panel_window()
+            return
+        # 否则打开
+        self._open_a1_panel_window()
+        if self.collector.is_connected():
+            self.get_a1_params()
+
+    def _open_a1_panel_window(self):
+        """创建并定位 A1 参数浮动窗口（出现在按钮右侧）"""
+        win = tk.Toplevel(self.root)
+        self._a1_win = win
+        win.title("A1实时参数")
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self._close_a1_panel_window)
+
+        # 定位：出现在切换按钮右侧
+        self.root.update_idletasks()
+        btn = self.a1_toggle_btn
+        bx = btn.winfo_rootx() + btn.winfo_width() + 10
+        by = btn.winfo_rooty()
+        win.geometry(f"+{bx}+{by}")
+
+        frame = ttk.LabelFrame(win, text="A1实时参数", padding="8")
+        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # 参数行：标签 | 输入框 | 设置 | 读取
+        param_rows = [
+            ("ankle_df_th",         "ankle_df_th"),
+            ("hip_ext_th",          "hip_ext_th"),
+            ("pushoff_max_ms",      "pushoff_max_ms"),
+            ("ankle_pf_target_deg", "ankle_pf_target_deg"),
+            ("iq_pf_max",           "iq_pf_max"),
+            ("iq_pf_floor",         "iq_pf_floor"),
+            ("diq_up_pf",           "diq_up_pf"),
+            ("ankleBypassSafety",   "ankleBypassSafety (0/1)"),
+        ]
+        for row_idx, (key, label_text) in enumerate(param_rows):
+            ttk.Label(frame, text=label_text, width=20, anchor=tk.W).grid(
+                row=row_idx, column=0, sticky=tk.W, pady=2)
+            ttk.Entry(frame, textvariable=self.a1_param_vars[key], width=10).grid(
+                row=row_idx, column=1, sticky=tk.W, padx=4, pady=2)
+            ttk.Button(frame, text="设置", width=6,
+                       command=lambda k=key: self.set_a1_param(k)).grid(
+                row=row_idx, column=2, padx=2, pady=2)
+            ttk.Button(frame, text="读取", width=6,
+                       command=lambda k=key: self.get_a1_param(k)).grid(
+                row=row_idx, column=3, padx=2, pady=2)
+
+        ttk.Button(frame, text="读取全部 (params)", command=self.get_a1_params).grid(
+            row=len(param_rows), column=0, columnspan=4,
+            sticky=(tk.W, tk.E), pady=(8, 2))
+
+        self.a1_panel_expanded = True
+        self.a1_toggle_btn.config(text="A1参数调节 ▼")
+
+    def _close_a1_panel_window(self):
+        """关闭 A1 参数浮动窗口并重置按钮状态"""
+        if self._a1_win is not None and self._a1_win.winfo_exists():
+            self._a1_win.destroy()
+        self._a1_win = None
+        self.a1_panel_expanded = False
+        self.a1_toggle_btn.config(text="A1参数调节 ▶")
 
     def set_a1_param(self, key):
         """发送 set <name> <value> 命令"""
