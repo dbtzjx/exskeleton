@@ -2779,12 +2779,14 @@ struct A1ParamsPersist {
   int16_t iq_pf_max;
   int16_t iq_pf_floor;
   int16_t diq_up_pf;
+  uint8_t  ankleBypassSafety;  // v2 新增：0=安全管线，1=旁路测试
+  uint8_t  _pad;               // 对齐到偶数字节
   uint16_t checksum;
 };
 
 static const int EEPROM_ADDR_A1_PARAMS = 0;
 static const uint32_t A1_PARAMS_MAGIC = 0x41315052UL;  // "A1PR"
-static const uint16_t A1_PARAMS_VERSION = 1;
+static const uint16_t A1_PARAMS_VERSION = 2;  // v2: 加入 ankleBypassSafety 字段
 
 uint16_t calcA1ParamsChecksum(const A1ParamsPersist &p) {
   uint16_t c = 0x5A5A;
@@ -2806,6 +2808,8 @@ void saveA1ParamsToEeprom() {
   p.iq_pf_max = torqueParams.iq_pf_max;
   p.iq_pf_floor = torqueParams.iq_pf_floor;
   p.diq_up_pf = torqueParams.diq_up_pf;
+  p.ankleBypassSafety = torqueParams.ankleBypassSafety ? 1u : 0u;
+  p._pad = 0;
   p.checksum = calcA1ParamsChecksum(p);
   EEPROM.put(EEPROM_ADDR_A1_PARAMS, p);
   hostPrintln(">>> A1 params saved to EEPROM");
@@ -2841,6 +2845,7 @@ bool loadA1ParamsFromEeprom() {
   torqueParams.iq_pf_max = p.iq_pf_max;
   torqueParams.iq_pf_floor = p.iq_pf_floor;
   torqueParams.diq_up_pf = p.diq_up_pf;
+  torqueParams.ankleBypassSafety = (p.ankleBypassSafety != 0);
   return true;
 }
 
@@ -4495,6 +4500,12 @@ void runControlLoopOnce() {
   // ========================================================================
   // 3. 计算 iq_target
   // ========================================================================
+  // bypass 模式：在目标计算前清除 compliant/cooldown，否则 computeAnkleIqTarget
+  // 内部的 !in_cooldown 门控会让 push-off 目标归零，bypass 失效
+  if (torqueParams.ankleBypassSafety) {
+    ankleSafety.compliant   = false;
+    ankleSafety.in_cooldown = false;
+  }
   int16_t ankle_iq_target = computeAnkleIqTarget(
       currentPhase, swing_pct, stance_pct,
       ankle_deg, ankle_vel_f, hip_deg, now);
