@@ -106,6 +106,7 @@ class GaitDataCollector:
         self.ph4p_data = deque(maxlen=MAX_DATA_POINTS)  # 四相进度 (ph4p)
         self.ph4o_data = deque(maxlen=MAX_DATA_POINTS)  # 四相输出 (ph4o)
         self.ph4d_data = deque(maxlen=MAX_DATA_POINTS)  # 四相退化标志 (ph4d)
+        self.ph4tc_data = deque(maxlen=MAX_DATA_POINTS) # 四相切换计数 (ph4tc)
         # 状态标志位数据
         self.PF_data = deque(maxlen=MAX_DATA_POINTS)  # 跖屈助力状态 (PF)
         self.DF_data = deque(maxlen=MAX_DATA_POINTS)  # 背屈助力状态 (DF)
@@ -323,6 +324,7 @@ class GaitDataCollector:
         self.ph4p_data.clear()
         self.ph4o_data.clear()
         self.ph4d_data.clear()
+        self.ph4tc_data.clear()
         self.PF_data.clear()
         self.DF_data.clear()
         self.UL_data.clear()
@@ -466,6 +468,7 @@ class GaitDataCollector:
                     self.ph4p_data.append(data.get('ph4p'))
                     self.ph4o_data.append(data.get('ph4o'))
                     self.ph4d_data.append(data.get('ph4d'))
+                    self.ph4tc_data.append(data.get('ph4tc'))
                     self.PF_data.append(data.get('PF'))
                     self.DF_data.append(data.get('DF'))
                     self.UL_data.append(data.get('UL'))
@@ -479,7 +482,8 @@ class GaitDataCollector:
                         self.ph_data, self.s_data, self.st_data, self.ank_data, self.v_data,
                         self.iqT_a_data, self.iqC_a_data, self.hip_data_new, self.hipv_data,
                         self.iqT_h_data, self.iqC_h_data, self.ph4_data, self.ph4v_data,
-                        self.ph4p_data, self.ph4o_data, self.ph4d_data, self.PF_data, self.DF_data,
+                        self.ph4p_data, self.ph4o_data, self.ph4d_data, self.ph4tc_data,
+                        self.PF_data, self.DF_data,
                         self.UL_data, self.comp_data, self.cool_data, self.abn_data
                     ]
                     for q in torque_queues:
@@ -793,6 +797,7 @@ class GaitDataCollector:
         self.ph4p_data.clear()
         self.ph4o_data.clear()
         self.ph4d_data.clear()
+        self.ph4tc_data.clear()
         self.PF_data.clear()
         self.DF_data.clear()
         self.UL_data.clear()
@@ -1630,7 +1635,7 @@ class GaitDataCollectorGUI:
                 'hip_velocity_filtered_data', 'ankle_ref_data',
                 's_data', 'st_data', 'v_data',
                 'iqT_a_data', 'hipv_data', 'iqT_h_data',
-                'ph4_data', 'ph4v_data', 'ph4p_data', 'ph4o_data', 'ph4d_data',
+                'ph4_data', 'ph4v_data', 'ph4p_data', 'ph4o_data', 'ph4d_data', 'ph4tc_data',
                 'PF_data', 'DF_data', 'UL_data', 'comp_data', 'cool_data', 'abn_data',
             ]
 
@@ -1871,6 +1876,7 @@ class GaitDataCollectorGUI:
             ("ph4p", "四相相内进度（0~1）"),
             ("ph4o", "四相相位曲线输出（辅助比例，0~1）"),
             ("ph4d", "四相退化标志（1=退化模式）"),
+            ("ph4tc", "四相切换计数（3秒窗口内子相切换次数，≥40触发退化）"),
         ]
         
         # 存储复选框变量
@@ -2999,7 +3005,8 @@ class GaitDataCollectorGUI:
         'ph4v':  ('ph4v_data',     '#FF4444', '四相放大值(ph4v)',          '-'),
         'ph4p':  ('ph4p_data',     '#44AAFF', '四相进度(ph4p)',           '--'),
         'ph4o':  ('ph4o_data',     '#AA44FF', '四相输出(ph4o)',            '-'),
-        'ph4d':  ('ph4d_data',     '#333333', '四相退化(ph4d)',            '-'),
+        'ph4d':  ('ph4d_data',     '#CC0000', '四相退化(ph4d)',            '-'),
+        'ph4tc': ('ph4tc_data',   '#FF8800', '四相切换计数(ph4tc)',        '--'),
         # 状态标志位（0/1离散值，同样绘制为曲线）
         'PF':    ('PF_data',       '#FF6600', '跖屈助力状态(PF)',          ':'),
         'DF':    ('DF_data',       '#6699FF', '背屈助力状态(DF)',          ':'),
