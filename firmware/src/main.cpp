@@ -2738,8 +2738,8 @@ struct TorqueAssistParams {
   uint32_t tpulse_ms    = 120;    // 已废弃：由 pushoff_max_ms 与踝角结束条件替代
   float ankle_pf_target_deg = 10.0f;  // 背屈为正；踝角 ≤ 此值则结束跖屈助力（须 < ankle_df_th）
   uint32_t pushoff_max_ms = 300;     // 跖屈助力持续时间兜底（ms）
-  int16_t iq_pf_max     = 800;     // +PF （本机型：正数为跖屈）
-  int16_t iq_pf_floor   = 300;     // +PF 起步偏置（触发后先爬升到该值，再继续向峰值）
+  int16_t iq_pf_max     = 1200;    // +PF （本机型：正数为跖屈）；实测800有感，调至1200+
+  int16_t iq_pf_floor   = 800;     // +PF 起步偏置；实测<800无感，直接从800起步
   // hip 助力窗口与幅值（可通过串口/上位机调节）
   // hipAssistWindowEnd: 髋关节助力在 SWING 早期持续的摆动进度上限（0~1），例如 0.4 表示前 40%
   // hipAssistMaxIq:     髋关节助力的最大峰值电流（iq 单位，可映射到 mA），例如 1500mA
@@ -2750,8 +2750,8 @@ struct TorqueAssistParams {
   float hip_win_end     = 0.25f;
   int16_t iq_hip_flex_max = 10;
   // slew per 10ms (OPTIMIZED FOR PUSH-OFF)
-  int16_t diq_up_df  = 4,   diq_dn_df  = 8;   // DF上升提速：原1→4
-  int16_t diq_up_pf  = 15,  diq_dn_pf  = 20;  // PF上升大幅提速：原6→15，确保120ms内能达到目标
+  int16_t diq_up_df  = 4,   diq_dn_df  = 8;   // DF上升
+  int16_t diq_up_pf  = 500, diq_dn_pf  = 20;  // PF斜率大幅提速：500/10ms，约20~30ms内到达峰值
   int16_t diq_up_hip = 3,   diq_dn_hip = 6;   // 髋保持不变
   // abnormal
   int16_t iq_small   = 20;
@@ -2763,6 +2763,8 @@ struct TorqueAssistParams {
   uint32_t soft_exit_ms = 200;
   // stance progress
   float Tst_init = 0.6f; // 初始 stance 周期
+  // 安全管线旁路（测试用）：跳过斜率限幅和 compliant/cooldown，直接下发 iq_target（仅幅值限幅保留）
+  bool ankleBypassSafety = false;
 };
 TorqueAssistParams torqueParams;
 
@@ -2827,10 +2829,10 @@ bool loadA1ParamsFromEeprom() {
   if (p.pushoff_max_ms < 50 || p.pushoff_max_ms > 1000) return false;
   if (p.ankle_pf_target_deg < -10.0f || p.ankle_pf_target_deg > 30.0f) return false;
   if (p.ankle_pf_target_deg >= p.ankle_df_th) return false;
-  if (p.iq_pf_max < 1 || p.iq_pf_max > 800) return false;
-  if (p.iq_pf_floor < 0 || p.iq_pf_floor > 800) return false;
+  if (p.iq_pf_max < 1 || p.iq_pf_max > 2000) return false;
+  if (p.iq_pf_floor < 0 || p.iq_pf_floor > 2000) return false;
   if (p.iq_pf_floor > p.iq_pf_max) return false;
-  if (p.diq_up_pf < 1 || p.diq_up_pf > 200) return false;
+  if (p.diq_up_pf < 1 || p.diq_up_pf > 1000) return false;
 
   torqueParams.ankle_df_th = p.ankle_df_th;
   torqueParams.hip_ext_th = p.hip_ext_th;
@@ -3398,9 +3400,10 @@ void printA1Params() {
   hostPrintf(">>>   pushoff_max_ms=%lu ms (range: 50~1000)\n", (unsigned long)torqueParams.pushoff_max_ms);
   hostPrintf(">>>   ankle_pf_target_deg=%.2f deg (range: -10.0~30.0, must < ankle_df_th)\n",
                 torqueParams.ankle_pf_target_deg);
-  hostPrintf(">>>   iq_pf_max=%d (range: 1~800)\n", (int)torqueParams.iq_pf_max);
-  hostPrintf(">>>   iq_pf_floor=%d (range: 0~800, must <= iq_pf_max)\n", (int)torqueParams.iq_pf_floor);
-  hostPrintf(">>>   diq_up_pf=%d (range: 1~200)\n", (int)torqueParams.diq_up_pf);
+  hostPrintf(">>>   iq_pf_max=%d (range: 1~2000)\n", (int)torqueParams.iq_pf_max);
+  hostPrintf(">>>   iq_pf_floor=%d (range: 0~2000, must <= iq_pf_max)\n", (int)torqueParams.iq_pf_floor);
+  hostPrintf(">>>   diq_up_pf=%d (range: 1~1000)\n", (int)torqueParams.diq_up_pf);
+  hostPrintf(">>>   ankleBypassSafety=%d (0=安全管线, 1=旁路/测试)\n", torqueParams.ankleBypassSafety ? 1 : 0);
 }
 
 bool setA1Param(const String& name, const String& valueStr) {
@@ -3454,8 +3457,8 @@ bool setA1Param(const String& name, const String& valueStr) {
   }
   if (name == "iq_pf_max") {
     int v = valueStr.toInt();
-    if (v < 1 || v > 800) {
-      hostPrintln("ERROR: iq_pf_max out of range (1~800)");
+    if (v < 1 || v > 2000) {
+      hostPrintln("ERROR: iq_pf_max out of range (1~2000)");
       return false;
     }
     if (torqueParams.iq_pf_floor > v) {
@@ -3468,8 +3471,8 @@ bool setA1Param(const String& name, const String& valueStr) {
   }
   if (name == "iq_pf_floor") {
     int v = valueStr.toInt();
-    if (v < 0 || v > 800) {
-      hostPrintln("ERROR: iq_pf_floor out of range (0~800)");
+    if (v < 0 || v > 2000) {
+      hostPrintln("ERROR: iq_pf_floor out of range (0~2000)");
       return false;
     }
     if (v > torqueParams.iq_pf_max) {
@@ -3482,17 +3485,29 @@ bool setA1Param(const String& name, const String& valueStr) {
   }
   if (name == "diq_up_pf") {
     int v = valueStr.toInt();
-    if (v < 1 || v > 200) {
-      hostPrintln("ERROR: diq_up_pf out of range (1~200)");
+    if (v < 1 || v > 1000) {
+      hostPrintln("ERROR: diq_up_pf out of range (1~1000)");
       return false;
     }
     torqueParams.diq_up_pf = (int16_t)v;
     hostPrintf(">>> Set diq_up_pf=%d\n", (int)torqueParams.diq_up_pf);
     return true;
   }
+  if (name == "ankleBypassSafety") {
+    int v = valueStr.toInt();
+    torqueParams.ankleBypassSafety = (v != 0);
+    // 切换 bypass 时同步重置安全状态，避免遗留 compliant/cooldown 影响
+    ankleSafety.compliant    = false;
+    ankleSafety.in_cooldown  = false;
+    ankleSafety.iq_cmd_prev  = 0;
+    hostPrintf(">>> Set ankleBypassSafety=%d (%s)\n",
+               torqueParams.ankleBypassSafety ? 1 : 0,
+               torqueParams.ankleBypassSafety ? "旁路/测试模式" : "安全管线模式");
+    return true;
+  }
 
   hostPrintln("ERROR: Unknown A1 param name");
-  hostPrintln("       Supported: ankle_df_th, hip_ext_th, pushoff_max_ms, ankle_pf_target_deg, iq_pf_max, iq_pf_floor, diq_up_pf");
+  hostPrintln("       Supported: ankle_df_th, hip_ext_th, pushoff_max_ms, ankle_pf_target_deg, iq_pf_max, iq_pf_floor, diq_up_pf, ankleBypassSafety");
   return false;
 }
 
@@ -3523,6 +3538,10 @@ bool getA1Param(const String& name) {
   }
   if (name == "diq_up_pf") {
     hostPrintf(">>> diq_up_pf=%d\n", (int)torqueParams.diq_up_pf);
+    return true;
+  }
+  if (name == "ankleBypassSafety") {
+    hostPrintf(">>> ankleBypassSafety=%d\n", torqueParams.ankleBypassSafety ? 1 : 0);
     return true;
   }
   hostPrintln("ERROR: Unknown A1 param name");
@@ -4124,7 +4143,7 @@ void processSerialCommand() {
     if (firstSpace < 0 || secondSpace < 0) {
       hostPrintln("ERROR: Usage: set <name> <value>");
       hostPrintln("       Example: set ankle_df_th 12");
-      hostPrintln("       Names: ankle_df_th, hip_ext_th, pushoff_max_ms, ankle_pf_target_deg, iq_pf_max, iq_pf_floor, diq_up_pf");
+      hostPrintln("       Names: ankle_df_th, hip_ext_th, pushoff_max_ms, ankle_pf_target_deg, iq_pf_max, iq_pf_floor, diq_up_pf, ankleBypassSafety");
     } else {
       String name = cmd.substring(firstSpace + 1, secondSpace);
       String value = cmd.substring(secondSpace + 1);
@@ -4496,20 +4515,30 @@ void runControlLoopOnce() {
                               ankle_vel_f);
   ankle_deg_prev = ankle_deg;
 
-  // 如果检测到异常且尚未进入 compliant，则启动软退出
-  if (ankleAbn != ABN_NONE && !ankleSafety.compliant && !ankleSafety.in_cooldown) {
+  // 如果检测到异常且尚未进入 compliant，则启动软退出（bypass 模式下跳过）
+  if (!torqueParams.ankleBypassSafety &&
+      ankleAbn != ABN_NONE && !ankleSafety.compliant && !ankleSafety.in_cooldown) {
     ankleSafety.compliant = true;
     ankleSafety.abnormal_start_ms = now;
   }
 
-  int16_t ankle_iq_cmd = applySafetyPipeline(
-      ankleSafety,
-      ankle_iq_target,
-      torqueParams.iq_pf_max,  // 正向为 PF
-      torqueParams.iq_df_max,  // 负向为 DF
-      (ankle_iq_target >= 0) ? torqueParams.diq_up_pf : torqueParams.diq_up_df,
-      (ankle_iq_target >= 0) ? torqueParams.diq_dn_pf : torqueParams.diq_dn_df,
-      now);
+  int16_t ankle_iq_cmd;
+  if (torqueParams.ankleBypassSafety) {
+    // 旁路模式：跳过斜率限幅和 compliant/cooldown，仅保留幅值裁剪
+    ankle_iq_cmd = ankle_iq_target;
+    if (ankle_iq_cmd >  torqueParams.iq_pf_max) ankle_iq_cmd =  torqueParams.iq_pf_max;
+    if (ankle_iq_cmd < -torqueParams.iq_df_max) ankle_iq_cmd = -torqueParams.iq_df_max;
+    ankleSafety.iq_cmd_prev = ankle_iq_cmd;  // 保持状态同步，避免退出 bypass 时跳变
+  } else {
+    ankle_iq_cmd = applySafetyPipeline(
+        ankleSafety,
+        ankle_iq_target,
+        torqueParams.iq_pf_max,  // 正向为 PF
+        torqueParams.iq_df_max,  // 负向为 DF
+        (ankle_iq_target >= 0) ? torqueParams.diq_up_pf : torqueParams.diq_up_df,
+        (ankle_iq_target >= 0) ? torqueParams.diq_dn_pf : torqueParams.diq_dn_df,
+        now);
+  }
 
   int16_t hip_iq_cmd = applySafetyPipeline(
       hipSafety,
