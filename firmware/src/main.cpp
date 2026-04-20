@@ -3498,7 +3498,7 @@ bool setA1Param(const String& name, const String& valueStr) {
     hostPrintf(">>> Set diq_up_pf=%d\n", (int)torqueParams.diq_up_pf);
     return true;
   }
-  if (name == "ankleBypassSafety") {
+  if (name == "anklebypasssafety") {  // cmd 已经 toLowerCase，此处用小写比较
     int v = valueStr.toInt();
     torqueParams.ankleBypassSafety = (v != 0);
     // 切换 bypass 时同步重置安全状态，避免遗留 compliant/cooldown 影响
@@ -3545,7 +3545,7 @@ bool getA1Param(const String& name) {
     hostPrintf(">>> diq_up_pf=%d\n", (int)torqueParams.diq_up_pf);
     return true;
   }
-  if (name == "ankleBypassSafety") {
+  if (name == "anklebypasssafety") {  // cmd 已经 toLowerCase，此处用小写比较
     hostPrintf(">>> ankleBypassSafety=%d\n", torqueParams.ankleBypassSafety ? 1 : 0);
     return true;
   }
