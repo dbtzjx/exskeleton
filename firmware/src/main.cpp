@@ -3289,10 +3289,11 @@ void sendGaitData() {
   // 蓝牙模式先发送精简字段，降低带宽压力
   if (useBluetoothTelemetry) {
     const int ph = phase4Det.initialized ? ((int)getCurrentGaitPhase4() * 10) : 0;
+    const int ph4d = phase4Det.initialized ? (isPhase4Degraded() ? 1 : 0) : 0;
     const int iqC_a = (int)assistDbg.ankle_iq_cmd;
     const int iqC_h = (int)assistDbg.hip_iq_cmd;
-    telemetryPrintf("{\"t\":%lu,\"h\":%.2f,\"ank\":%.2f,\"ph\":%d,\"iqC_a\":%d,\"iqC_h\":%d}\n",
-                    now, h, a, ph, iqC_a, iqC_h);
+    telemetryPrintf("{\"t\":%lu,\"h\":%.2f,\"ank\":%.2f,\"ph\":%d,\"ph4d\":%d,\"iqC_a\":%d,\"iqC_h\":%d}\n",
+                    now, h, a, ph, ph4d, iqC_a, iqC_h);
     return;
   }
 
