@@ -1319,11 +1319,11 @@ class GaitDataCollectorGUI:
                 if not self.collector.hip_module_enabled:
                     self.collector.start_hip_module()
                     self.control_loop_enabled = True
-                    self.control_loop_btn.config(text="禁用控制循环")
+                    self._safe_btn('control_loop_btn', text="禁用控制循环")
                     self._plot_initialized = False
                     self._last_realtime_len = 0
                     self._plot_lines = {'hip_f': None}
-                    self.hip_module_btn.config(text="髋关节数据: 开启")
+                    self._safe_btn('hip_module_btn', text="髋关节数据: 开启")
                 self.collector.send_command("ctrlon")
                 self.add_history("ctrlon", "TX")
                 self.collector.send_command("gc")
@@ -1659,7 +1659,7 @@ class GaitDataCollectorGUI:
             self._plot_initialized = False
             self._last_realtime_len = -1
             self._plot_lines = {"hip_f": None}
-            self.hip_module_btn.config(text="髋关节数据: 开启")
+            self._safe_btn('hip_module_btn', text="髋关节数据: 开启")
             self.add_history(f"已载入训练记录: {os.path.basename(_current_record['path'])}", "信息")
             dialog.destroy()
 
@@ -1727,83 +1727,39 @@ class GaitDataCollectorGUI:
         self.status_label = ttk.Label(control_frame, text="状态: 未连接", foreground="red")
         self.status_label.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=5)
         
-        # ── 可折叠控制区域（默认折叠）──
-        self._ctrl_expanded = False
-
-        def _toggle_ctrl_panel():
-            self._ctrl_expanded = not self._ctrl_expanded
-            if self._ctrl_expanded:
-                ctrl_expand_frame.grid()
-                ctrl_toggle_btn.config(text="折叠控制面板 ▲")
-            else:
-                ctrl_expand_frame.grid_remove()
-                ctrl_toggle_btn.config(text="展开控制面板 ▼")
-
-        ctrl_toggle_btn = ttk.Button(control_frame, text="展开控制面板 ▼",
-                                     command=_toggle_ctrl_panel)
-        ctrl_toggle_btn.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(4, 2))
-
-        # 可折叠容器（父级仍为 control_frame）
+        # ── 控制区域（始终展开，不再需要折叠按钮）──
         ctrl_expand_frame = ttk.Frame(control_frame)
-        ctrl_expand_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E))
-        ctrl_expand_frame.grid_remove()  # 默认折叠
+        ctrl_expand_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E))
         ctrl_expand_frame.columnconfigure(0, weight=0)
         ctrl_expand_frame.columnconfigure(1, weight=1)
         ctrl_expand_frame.columnconfigure(2, weight=0)
 
-        # 以下所有内容的父级改为 ctrl_expand_frame，行号从 0 重新计数
-
-        # 分隔线
-        ttk.Separator(ctrl_expand_frame, orient=tk.HORIZONTAL).grid(
-            row=0, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=6)
-
         # 命令输入
-        ttk.Label(ctrl_expand_frame, text="控制命令:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Label(ctrl_expand_frame, text="控制命令:").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.command_var = tk.StringVar()
         self.command_entry = ttk.Entry(ctrl_expand_frame, textvariable=self.command_var, width=20)
-        self.command_entry.grid(row=1, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        self.command_entry.grid(row=0, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=5)
         self.command_entry.bind('<Return>', lambda e: self.send_command())
 
         self.send_btn = ttk.Button(ctrl_expand_frame, text="发送", command=self.send_command, state=tk.DISABLED)
-        self.send_btn.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        self.send_btn.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
 
-        # 常用命令按钮
-        ttk.Label(ctrl_expand_frame, text="常用命令:").grid(row=3, column=0, sticky=tk.W, pady=(10, 5))
+        # 常用命令（点击向右弹出浮动窗口）
+        self._cmd_win = None
+        self.control_loop_btn = None  # 在弹出窗口中创建，可能不存在
+        self.hip_module_btn = None
+        self.cmd_toggle_btn = ttk.Button(
+            ctrl_expand_frame, text="常用命令 ▶", command=self.toggle_cmd_panel
+        )
+        self.cmd_toggle_btn.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(4, 2))
 
-        cmd_frame = ttk.Frame(ctrl_expand_frame)
-        cmd_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
-
-        # 第一行：基础控制
-        ttk.Button(cmd_frame, text="使能", command=lambda: self.send_command_text("e"), width=8).grid(row=0, column=0, padx=2)
-        ttk.Button(cmd_frame, text="掉电", command=lambda: self.send_command_text("d"), width=8).grid(row=0, column=1, padx=2)
-        ttk.Button(cmd_frame, text="读取", command=lambda: self.send_command_text("r"), width=8).grid(row=0, column=2, padx=2)
-        ttk.Button(cmd_frame, text="状态", command=lambda: self.send_command_text("s"), width=8).grid(row=0, column=3, padx=2)
-
-        # 第二行：新增按钮
-        ttk.Button(cmd_frame, text="站立初始化", command=self.send_stand_init, width=10).grid(row=1, column=1, padx=2, pady=2)
-        self.control_loop_btn = ttk.Button(cmd_frame, text="启用控制循环", command=self.toggle_control_loop, width=12)
-        self.control_loop_btn.grid(row=1, column=2, padx=2, pady=2)
-
-        # 第三行：电机重置
-        ttk.Button(cmd_frame, text="电机重置", command=self.reset_motors, width=10).grid(row=2, column=0, padx=2, pady=2)
-
-        # 分隔线
-        ttk.Separator(cmd_frame, orient=tk.HORIZONTAL).grid(row=3, column=0, columnspan=4, sticky=(tk.W, tk.E), pady=5)
-
-        # 后处理模块控制
-        ttk.Label(cmd_frame, text="后处理模块:", font=('', 9, 'bold')).grid(row=4, column=0, columnspan=4, sticky=tk.W, pady=(5, 2))
-
-        # 髋关节数据模块控制
-        self.hip_module_btn = ttk.Button(cmd_frame, text="髋关节数据: 关闭", command=self.toggle_hip_module, width=12)
-        self.hip_module_btn.grid(row=5, column=0, columnspan=4, padx=2, pady=2, sticky=(tk.W, tk.E))
-
-        # A1 参数调节（点击向右弹出浮动窗口，不占主界面纵向空间）
+        # A1 参数调节（点击向右弹出浮动窗口）
         self.a1_panel_expanded = False
         self._a1_win = None
         self.a1_toggle_btn = ttk.Button(
             ctrl_expand_frame, text="A1参数调节 ▶", command=self.toggle_a1_param_panel
         )
-        self.a1_toggle_btn.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(6, 2))
+        self.a1_toggle_btn.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(2, 2))
 
         # 参数变量（供浮动窗口和串口解析共享）
         self.a1_param_vars = {
@@ -1819,10 +1775,10 @@ class GaitDataCollectorGUI:
 
         # 数据管理
         ttk.Separator(ctrl_expand_frame, orient=tk.HORIZONTAL).grid(
-            row=7, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=6)
+            row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=6)
 
         data_btn_frame = ttk.Frame(ctrl_expand_frame)
-        data_btn_frame.grid(row=8, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        data_btn_frame.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
 
         ttk.Button(data_btn_frame, text="载入步态周期", command=self.load_gait_cycle).grid(row=0, column=0, sticky=(tk.W, tk.E), padx=2)
         ttk.Button(data_btn_frame, text="另存为", command=self.save_gait_cycle_as).grid(row=0, column=1, sticky=(tk.W, tk.E), padx=2)
@@ -1831,27 +1787,28 @@ class GaitDataCollectorGUI:
         data_btn_frame.columnconfigure(0, weight=1)
         data_btn_frame.columnconfigure(1, weight=1)
 
-        # 指令收发历史（始终可见，行号接在 row=3 的可折叠容器之后）
+        # 指令收发历史（始终可见）
         ttk.Separator(control_frame, orient=tk.HORIZONTAL).grid(
-            row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=6)
+            row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=6)
 
         ttk.Label(control_frame, text="指令收发历史:").grid(
-            row=5, column=0, columnspan=3, sticky=tk.W, pady=(5, 2))
+            row=4, column=0, columnspan=3, sticky=tk.W, pady=(5, 2))
 
         # 创建历史记录文本框（带滚动条）
         history_frame = ttk.Frame(control_frame)
-        history_frame.grid(row=6, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-        control_frame.rowconfigure(6, weight=1)
-        
+        history_frame.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        control_frame.rowconfigure(5, weight=1)
+
         self.history_text = tk.Text(history_frame, height=10, width=30, wrap=tk.WORD, font=('Consolas', 9))
         scrollbar = ttk.Scrollbar(history_frame, orient=tk.VERTICAL, command=self.history_text.yview)
         self.history_text.configure(yscrollcommand=scrollbar.set)
-        
+
         self.history_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
+
         # 清空历史按钮
-        ttk.Button(control_frame, text="清空历史", command=self.clear_history).grid(row=7, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        ttk.Button(control_frame, text="清空历史", command=self.clear_history).grid(
+            row=6, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
         
         # 右侧图表区域（跨两行，与患者面板+控制面板对齐）
         plot_frame = ttk.Frame(main_frame)
@@ -2088,6 +2045,85 @@ class GaitDataCollectorGUI:
         self.command_var.set(command)
         self.send_command()
 
+    # ------------------------------------------------------------------
+    # 常用命令 弹出面板
+    # ------------------------------------------------------------------
+    def toggle_cmd_panel(self):
+        """点击按钮：向右弹出 / 关闭 常用命令浮动窗口"""
+        if self._cmd_win is not None and self._cmd_win.winfo_exists():
+            self._close_cmd_window()
+            return
+        self._open_cmd_window()
+
+    def _open_cmd_window(self):
+        """创建常用命令浮动窗口（出现在按钮右侧，自动调整位置）"""
+        win = tk.Toplevel(self.root)
+        self._cmd_win = win
+        win.title("常用命令")
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self._close_cmd_window)
+
+        frame = ttk.Frame(win, padding="10")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # 第一行：基础控制
+        ttk.Button(frame, text="使能",  command=lambda: self.send_command_text("e"), width=8).grid(row=0, column=0, padx=2, pady=2)
+        ttk.Button(frame, text="掉电",  command=lambda: self.send_command_text("d"), width=8).grid(row=0, column=1, padx=2, pady=2)
+        ttk.Button(frame, text="读取",  command=lambda: self.send_command_text("r"), width=8).grid(row=0, column=2, padx=2, pady=2)
+        ttk.Button(frame, text="状态",  command=lambda: self.send_command_text("s"), width=8).grid(row=0, column=3, padx=2, pady=2)
+
+        # 第二行
+        ttk.Button(frame, text="站立初始化",  command=self.send_stand_init,      width=12).grid(row=1, column=0, columnspan=2, padx=2, pady=2, sticky=(tk.W, tk.E))
+        ctrl_text = "禁用控制循环" if getattr(self, '_control_loop_enabled', False) else "启用控制循环"
+        self.control_loop_btn = ttk.Button(frame, text=ctrl_text, command=self.toggle_control_loop, width=12)
+        self.control_loop_btn.grid(row=1, column=2, columnspan=2, padx=2, pady=2, sticky=(tk.W, tk.E))
+
+        # 第三行
+        ttk.Button(frame, text="电机重置", command=self.reset_motors, width=10).grid(row=2, column=0, padx=2, pady=2)
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).grid(row=3, column=0, columnspan=4, sticky=(tk.W, tk.E), pady=6)
+
+        ttk.Label(frame, text="后处理模块:", font=('', 9, 'bold')).grid(row=4, column=0, columnspan=4, sticky=tk.W, pady=(2, 2))
+        hip_text = "髋关节数据: 开启" if self.collector.hip_module_enabled else "髋关节数据: 关闭"
+        self.hip_module_btn = ttk.Button(frame, text=hip_text, command=self.toggle_hip_module, width=16)
+        self.hip_module_btn.grid(row=5, column=0, columnspan=4, padx=2, pady=2, sticky=(tk.W, tk.E))
+
+        self._popup_position(win, self.cmd_toggle_btn)
+        self.cmd_toggle_btn.config(text="常用命令 ▼")
+
+    def _close_cmd_window(self):
+        """关闭常用命令浮动窗口"""
+        if self._cmd_win is not None and self._cmd_win.winfo_exists():
+            self._cmd_win.destroy()
+        self._cmd_win = None
+        self.control_loop_btn = None
+        self.hip_module_btn = None
+        self.cmd_toggle_btn.config(text="常用命令 ▶")
+
+    def _safe_btn(self, attr, **kwargs):
+        """安全地更新可能在浮动窗口中的按钮（窗口关闭后属性为 None 或控件已销毁）"""
+        btn = getattr(self, attr, None)
+        if btn is None:
+            return
+        try:
+            btn.config(**kwargs)
+        except tk.TclError:
+            pass
+
+    def _popup_position(self, win, anchor_btn):
+        """将浮动窗口定位到 anchor_btn 右侧，并自动上移避免超出屏幕底部"""
+        win.update_idletasks()
+        bx = anchor_btn.winfo_rootx() + anchor_btn.winfo_width() + 10
+        by = anchor_btn.winfo_rooty()
+        win_h = win.winfo_reqheight()
+        screen_h = self.root.winfo_screenheight()
+        if by + win_h > screen_h - 40:
+            by = max(0, screen_h - win_h - 40)
+        win.geometry(f"+{bx}+{by}")
+
+    # ------------------------------------------------------------------
+    # A1 参数 弹出面板
+    # ------------------------------------------------------------------
     def toggle_a1_param_panel(self):
         """点击按钮：向右弹出 / 关闭 A1 参数浮动窗口"""
         # 如果窗口已存在且可见，则关闭
@@ -2100,19 +2136,12 @@ class GaitDataCollectorGUI:
             self.get_a1_params()
 
     def _open_a1_panel_window(self):
-        """创建并定位 A1 参数浮动窗口（出现在按钮右侧）"""
+        """创建并定位 A1 参数浮动窗口（出现在按钮右侧，自动调整位置）"""
         win = tk.Toplevel(self.root)
         self._a1_win = win
         win.title("A1实时参数")
         win.resizable(False, False)
         win.protocol("WM_DELETE_WINDOW", self._close_a1_panel_window)
-
-        # 定位：出现在切换按钮右侧
-        self.root.update_idletasks()
-        btn = self.a1_toggle_btn
-        bx = btn.winfo_rootx() + btn.winfo_width() + 10
-        by = btn.winfo_rooty()
-        win.geometry(f"+{bx}+{by}")
 
         frame = ttk.LabelFrame(win, text="A1实时参数", padding="8")
         frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -2144,6 +2173,7 @@ class GaitDataCollectorGUI:
             row=len(param_rows), column=0, columnspan=4,
             sticky=(tk.W, tk.E), pady=(8, 2))
 
+        self._popup_position(win, self.a1_toggle_btn)
         self.a1_panel_expanded = True
         self.a1_toggle_btn.config(text="A1参数调节 ▼")
 
@@ -3266,7 +3296,7 @@ class GaitDataCollectorGUI:
             # 关闭髋关节数据模块时，自动停止下位机 gait JSON 上传
             self.collector.send_command("gcs")
             self.add_history("gcs", "TX")
-            self.hip_module_btn.config(text="髋关节数据: 关闭")
+            self._safe_btn('hip_module_btn', text="髋关节数据: 关闭")
             self.add_history("髋关节数据模块已关闭（已自动发送 gcs）", "信息")
         else:
             # 启动髋关节数据模块
@@ -3283,7 +3313,7 @@ class GaitDataCollectorGUI:
                 self._plot_initialized = False
                 self._last_realtime_len = 0
                 self._plot_lines = {'hip_f': None}
-                self.hip_module_btn.config(text="髋关节数据: 开启")
+                self._safe_btn('hip_module_btn', text="髋关节数据: 开启")
                 self.add_history("髋关节数据模块已开启（已自动发送 gc）", "信息")
             except Exception as e:
                 error_msg = f"启动髋关节数据模块失败: {str(e)}"
@@ -3325,7 +3355,7 @@ class GaitDataCollectorGUI:
             try:
                 self.collector.send_command("ctrloff")
                 self.control_loop_enabled = False
-                self.control_loop_btn.config(text="启用控制循环")
+                self._safe_btn('control_loop_btn', text="启用控制循环")
                 self.add_history("ctrloff", "TX")
                 self.add_history("控制循环已禁用", "信息")
             except Exception as e:
@@ -3337,7 +3367,7 @@ class GaitDataCollectorGUI:
             try:
                 self.collector.send_command("ctrlon")
                 self.control_loop_enabled = True
-                self.control_loop_btn.config(text="禁用控制循环")
+                self._safe_btn('control_loop_btn', text="禁用控制循环")
                 self.add_history("ctrlon", "TX")
                 self.add_history("控制循环已启用", "信息")
             except Exception as e:
