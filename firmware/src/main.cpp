@@ -2821,7 +2821,13 @@ void saveA1ParamsToEeprom() {
 bool loadA1ParamsFromEeprom() {
   A1ParamsPersist p;
   EEPROM.get(EEPROM_ADDR_A1_PARAMS, p);
-  if (p.magic != A1_PARAMS_MAGIC || p.version != A1_PARAMS_VERSION) {
+  if (p.magic != A1_PARAMS_MAGIC) {
+    hostPrintln("WARN: EEPROM A1 magic not found (first boot or flash erased)");
+    return false;
+  }
+  if (p.version != A1_PARAMS_VERSION) {
+    hostPrintf("WARN: EEPROM A1 version mismatch (stored=%u, expected=%u), discarding\n",
+               (unsigned)p.version, (unsigned)A1_PARAMS_VERSION);
     return false;
   }
   uint16_t crc = calcA1ParamsChecksum(p);
@@ -4385,10 +4391,11 @@ void setup() {
 
   if (loadA1ParamsFromEeprom()) {
     hostPrintln(">>> Loaded A1 params from EEPROM");
-    printA1Params();  // 打印实际加载值，便于串口确认
+    printA1Params();
   } else {
-    hostPrintln(">>> EEPROM A1 params not found/invalid, using defaults");
-    printA1Params();  // 打印默认值
+    hostPrintln(">>> EEPROM A1 params not found/invalid — writing defaults to EEPROM");
+    saveA1ParamsToEeprom();  // 把当前默认值写入 EEPROM，下次启动可正常加载
+    printA1Params();
   }
   
   // 初始化默认步态轨迹
