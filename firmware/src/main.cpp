@@ -2745,13 +2745,13 @@ struct TorqueAssistParams {
   int16_t iq_pf_floor   = 800;     // +PF 起步偏置；实测<800无感，直接从800起步
   // hip 助力窗口与幅值（可通过串口/上位机调节）
   // hipAssistWindowEnd: 髋关节助力在 SWING 早期持续的摆动进度上限（0~1），例如 0.4 表示前 40%
-  // hipAssistMaxIq:     髋关节助力的最大峰值电流（iq 单位，可映射到 mA），例如 1500mA
-  float  hipAssistWindowEnd = 0.4f;
-  int16_t hipAssistMaxIq    = 50;
+  // hipAssistMaxIq:     髋关节助力的最大峰值电流（iq 协议单位，与驱动一致）
+  float  hipAssistWindowEnd = 0.6f;
+  int16_t hipAssistMaxIq    = 200;
   // 仍保留原有 hip 斜率/限幅参数，用于安全管线
   float hip_win_start   = 0.0f;
   float hip_win_end     = 0.25f;
-  int16_t iq_hip_flex_max = 10;
+  int16_t iq_hip_flex_max = 200;
   // slew per 10ms (OPTIMIZED FOR PUSH-OFF)
   int16_t diq_up_df  = 4,   diq_dn_df  = 8;   // DF上升
   int16_t diq_up_pf  = 500, diq_dn_pf  = 20;  // PF斜率大幅提速：500/10ms，约20~30ms内到达峰值
@@ -4128,6 +4128,9 @@ void processSerialCommand() {
     } else if (cmd == "hk off" || cmd == "hk disable" ||
                cmd == "hiptorque off" || cmd == "hiptorque disable") {
       hipTorqueMode = false;
+      hipIqTarget = 0;
+      sendTorqueCommand(hipMotor, 0);
+      hipSafety.iq_cmd_prev = 0;
       hostPrintln(">>> Hip torque MODE DISABLED");
     } else {
       hostPrintln("ERROR: Usage: hk | hk on <iq> | hk off | hk read");
@@ -4163,6 +4166,9 @@ void processSerialCommand() {
     } else if (cmd == "ak off" || cmd == "ak disable" ||
                cmd == "ankletorque off" || cmd == "ankletorque disable") {
       ankleTorqueMode = false;
+      ankleIqTargetManual = 0;
+      sendTorqueCommand(ankleMotor, 0);
+      ankleSafety.iq_cmd_prev = 0;
       hostPrintln(">>> Ankle torque MODE DISABLED");
     } else {
       hostPrintln("ERROR: Usage: ak | ak on <iq> | ak off | ak read");
@@ -4665,14 +4671,19 @@ void runControlLoopOnce() {
   // 5. 下发 A1 转矩命令（保持 100Hz，不阻塞）
   // ========================================================================
   if (ankleDataOk) {
-    sendTorqueCommand(ankleMotor, ankle_iq_cmd);
+    // 与 ak 测试模式互斥：手动转矩由 loop 周期发送，避免与助力 A1 抢同一节点
+    if (!ankleTorqueMode) {
+      sendTorqueCommand(ankleMotor, ankle_iq_cmd);
+    }
   } else {
     ankleSafety.iq_cmd_prev = 0;
   }
 
   if (hipDataOk) {
-    // 若 hipTorqueMode 仍需手动测试，可在此增加优先级判断
-    sendTorqueCommand(hipMotor, hip_iq_cmd);
+    // 与 hk 测试模式互斥：手动转矩由 loop 周期发送，避免与助力 A1 抢同一节点
+    if (!hipTorqueMode) {
+      sendTorqueCommand(hipMotor, hip_iq_cmd);
+    }
   } else {
     hipSafety.iq_cmd_prev = 0;
   }
