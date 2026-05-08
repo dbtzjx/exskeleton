@@ -3452,6 +3452,26 @@ void queryAndPrintAnkleIqTs() {
                 (int)iqRaw, iqA, iqA * 1000.0f);
 }
 
+void queryAndPrintHipIqTs() {
+  sendCanCommand(hipMotor.id, CMD_READ_STATUS2, nullptr, 0, false);
+  uint32_t t0 = millis();
+  while (millis() - t0 < 80) {
+    CAN_message_t inMsg;
+    while (can1.read(inMsg)) {
+      handleCanMessage(inMsg);
+    }
+    if (hipStatus.lastUpdateMs > 0 && (millis() - hipStatus.lastUpdateMs) < 120) {
+      break;
+    }
+    delay(5);
+  }
+
+  int16_t iqRaw = hipStatus.iq;
+  float iqA = iqLsbToAmpTs(iqRaw);
+  hostPrintf(">>> Hip iq(raw)=%d LSB, TS est current=%.3f A (%.1f mA)\n",
+                (int)iqRaw, iqA, iqA * 1000.0f);
+}
+
 void printA1Params() {
   hostPrintln(">>> A1 tunable params:");
   hostPrintf(">>>   ankle_df_th=%.2f deg (range: 0.0~40.0)\n", torqueParams.ankle_df_th);
@@ -4085,22 +4105,33 @@ void processSerialCommand() {
     setAnkleAssistEnabled(false);
     hostPrintln(">>> Ankle dorsiflexion assist DISABLED");
   }
-  // 髋关节力矩模式控制（串口调试）
-  else if (cmd.startsWith("hiptorque")) {
-    // 支持："hiptorque on <iq>", "hiptorque off", "hiptorque"(显示状态)
-    if (cmd == "hiptorque") {
+  // 髋关节力矩模式控制（串口调试，与 ak/ankletorque 对齐）
+  else if (cmd.startsWith("hk") || cmd.startsWith("hiptorque")) {
+    //   hk | hk on <iq> | hk off | hk read
+    //   hiptorque | hiptorque on <iq> | hiptorque off | hiptorque read
+    if (cmd == "hk" || cmd == "hiptorque") {
       hostPrintf(">>> Hip torque mode: %s, target iq=%d\n", hipTorqueMode ? "ON" : "OFF", hipIqTarget);
-    } else if (cmd.startsWith("hiptorque on")) {
-      int space = cmd.indexOf(' ', 12);
-      if (space > 0) {
-        int16_t iq = cmd.substring(space + 1).toInt();
+      queryAndPrintHipIqTs();
+    } else if (cmd == "hk read" || cmd == "hiptorque read") {
+      queryAndPrintHipIqTs();
+    } else if (cmd.startsWith("hk on ") || cmd.startsWith("hiptorque on ")) {
+      int lastSpace = cmd.lastIndexOf(' ');
+      if (lastSpace > 0 && lastSpace < (int)cmd.length() - 1) {
+        int16_t iq = cmd.substring(lastSpace + 1).toInt();
         hipIqTarget = iq;
+        hipTorqueMode = true;
+        hostPrintf(">>> Hip torque MODE ENABLED, target iq=%d\n", hipIqTarget);
+        queryAndPrintHipIqTs();
+      } else {
+        hostPrintln("ERROR: Usage: hk on <iq> / hiptorque on <iq>");
       }
-      hipTorqueMode = true;
-      hostPrintf(">>> Hip torque MODE ENABLED, target iq=%d\n", hipIqTarget);
-    } else if (cmd == "hiptorque off" || cmd == "hiptorque disable") {
+    } else if (cmd == "hk off" || cmd == "hk disable" ||
+               cmd == "hiptorque off" || cmd == "hiptorque disable") {
       hipTorqueMode = false;
       hostPrintln(">>> Hip torque MODE DISABLED");
+    } else {
+      hostPrintln("ERROR: Usage: hk | hk on <iq> | hk off | hk read");
+      hostPrintln("       or: hiptorque | hiptorque on <iq> | hiptorque off | hiptorque read");
     }
   }
   // 踝关节力矩模式控制（串口调试）
@@ -4385,6 +4416,7 @@ void processSerialCommand() {
     hostPrintln("Ankle Assist: assist (show ankle assist strategy status)");
     hostPrintln("Assist On/Off: assiston / assistoff (enable/disable ankle assist)");
     hostPrintln("Ankle Torque Test: ankletorque | ankletorque on <iq> | ankletorque off | ankletorque read");
+    hostPrintln("Hip Torque Test: hk | hk on <iq> | hk off | hk read | hiptorque …");
     hostPrintln("Compliance: compliance (show compliance control status)");
     hostPrintln("Reset Fault: resetfault (reset fault state to normal)");
     hostPrintln("Control Loop: ctrlon / ctrloff (enable/disable 100Hz control loop)");
@@ -4640,7 +4672,7 @@ void runControlLoopOnce() {
 
   if (hipDataOk) {
     // 若 hipTorqueMode 仍需手动测试，可在此增加优先级判断
-    // sendTorqueCommand(hipMotor, hip_iq_cmd);
+    sendTorqueCommand(hipMotor, hip_iq_cmd);
   } else {
     hipSafety.iq_cmd_prev = 0;
   }
