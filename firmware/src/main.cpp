@@ -7,6 +7,81 @@
 #include <cstdio>
 #include <cstddef>  // offsetof
 
+// ============================================================================
+// 轻量固件日志（环形缓冲，故障时仅写内存，无格式化输出）
+// ============================================================================
+namespace FwLog {
+
+static constexpr size_t kRingCap = 128;
+
+enum Tag : uint8_t {
+  TAG_CAN_TX_FAIL = 1,
+};
+
+struct Entry {
+  uint32_t ms;
+  Tag tag;
+  uint8_t motor_id;
+  uint8_t cmd;
+};
+
+static Entry g_ring[kRingCap];
+static volatile uint32_t g_seq = 0;               // 单调递增，用于槽位 (seq-1)%kRingCap
+static volatile uint32_t g_can_tx_fail_total = 0; // CAN 写队列失败累计次数
+
+void appendCanTxFail(uint8_t motor_id, uint8_t cmd) {
+  uint32_t t = millis();
+  noInterrupts();
+  uint32_t next = g_seq + 1;
+  g_seq = next;
+  g_can_tx_fail_total++;
+  size_t idx = (next - 1) % kRingCap;
+  g_ring[idx].ms = t;
+  g_ring[idx].tag = TAG_CAN_TX_FAIL;
+  g_ring[idx].motor_id = motor_id;
+  g_ring[idx].cmd = cmd;
+  interrupts();
+}
+
+uint32_t sequence() {
+  return g_seq;
+}
+
+uint32_t canTxFailTotal() {
+  return g_can_tx_fail_total;
+}
+
+void printDump(Print& out) {
+  uint32_t seq_snap;
+  uint32_t fail_total;
+  noInterrupts();
+  seq_snap = g_seq;
+  fail_total = g_can_tx_fail_total;
+  interrupts();
+
+  out.printf("fwlog ring=%u seq_total=%lu can_tx_fail_total=%lu\n",
+             (unsigned)kRingCap, (unsigned long)seq_snap, (unsigned long)fail_total);
+
+  uint32_t n = seq_snap;
+  if (n == 0) {
+    out.println("(empty)");
+    return;
+  }
+  uint32_t count = (n < kRingCap) ? n : kRingCap;
+  uint32_t first_seq = n - count + 1;
+  for (uint32_t s = first_seq; s <= n; ++s) {
+    size_t idx = (s - 1) % kRingCap;
+    const Entry& e = g_ring[idx];
+    if (e.tag == TAG_CAN_TX_FAIL) {
+      out.printf("  #%lu t=%lums CAN_TX_FAIL motor=%u cmd=0x%02X\n",
+                 (unsigned long)s, (unsigned long)e.ms,
+                 (unsigned)e.motor_id, (unsigned)e.cmd);
+    }
+  }
+}
+
+}  // namespace FwLog
+
 // ISR 上下文标志：当定时器回调在运行时置位，用于抑制 Serial 输出
 volatile bool inIsrContext = false;
 
@@ -1598,16 +1673,8 @@ bool sendCanCommand(uint8_t motorId, uint8_t cmd, const uint8_t *data = nullptr,
     }
     return true;
   } else {
-    // 发送失败（通常是发送队列满），记录错误但不阻塞
-    static uint32_t lastErrorMs = 0;
-    uint32_t now = millis();
-    // 限制错误输出频率（每1秒最多输出一次），避免串口阻塞
-    if (now - lastErrorMs >= 1000) {
-      if (!inIsrContext) {
-        Serial.printf("[TX ERROR] Motor %d, CMD=0x%02X failed (TX queue full?)\n", motorId, cmd);
-      }
-      lastErrorMs = now;
-    }
+    // 发送失败（通常是发送队列满）：记入环形日志，不在热路径上做串口格式化输出
+    FwLog::appendCanTxFail(motorId, cmd);
     return false;
   }
 }
@@ -2685,7 +2752,7 @@ void updateSensorPolling() {
     requestMotorAngle(hipMotor);
     
     // 请求踝关节状态2（获取电流数据）
-    sendCanCommand(ankleMotor.id, CMD_READ_STATUS2, nullptr, 0, false);
+    // sendCanCommand(ankleMotor.id, CMD_READ_STATUS2, nullptr, 0, false);
     
     // 请求电机状态1（检测错误）
     sendCanCommand(ankleMotor.id, CMD_READ_STATUS1, nullptr, 0, false);
@@ -4429,7 +4496,18 @@ void processSerialCommand() {
     hostPrintln("A1 Params: set <name> <value>, get <name>, params (auto-save EEPROM)");
     hostPrintln("Motor Speed: speed <value> / speed (set/query ankle motor speed, 100-10000)");
     hostPrintln("Dorsiflexion: dorsiflex <angle> / df <angle> (set/query ankle dorsiflexion target, 0-40 deg)");
+    hostPrintln("Firmware log: fwlog | logdump (ring buffer, e.g. CAN TX queue full)");
     hostPrintln("Help:    h, help");
+  }
+  else if (cmd == "fwlog" || cmd == "logdump") {
+    if (cmdReplyPort) {
+      FwLog::printDump(*cmdReplyPort);
+      if (cmdReplyPort == static_cast<Print*>(&BT_SERIAL)) {
+        FwLog::printDump(Serial);
+      }
+    } else {
+      FwLog::printDump(Serial);
+    }
   }
   else if (cmd == "p") {
     hostPrintln("=== System Status ===");
