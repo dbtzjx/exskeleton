@@ -143,9 +143,15 @@ struct CmdReplyScope {
 };
 
 #include <IntervalTimer.h>
-// 定时器前向声明与变量
+// 定时器前向声明与变量（方案二：ISR 仅节拍计数，CAN 收/发与控制在 loop 中统一调度）
 void runControlLoopOnce();
+void runUnifiedCanCycle100Hz();
+static void runControlAlgorithmOnce();
+static void sensorPollingScheduledTx(uint32_t now);
+void onCanCycleTimerTick();
 IntervalTimer controlTimer;
+// 100Hz 定时器仅累加待处理拍数，由 loop 消费，避免 ISR 与 loop 同时 sendCan
+volatile uint32_t g_canCycleTicksPending = 0;
 
 // ============================================================================
 // 全局安全状态（Global Safety State）
@@ -162,10 +168,28 @@ bool errorPrinted = false;               // 错误信息是否已打印到串口
 // 传感器轮询状态
 struct SensorPollingTimer {
   bool enabled;              // 是否启用轮询（在ctrlon开启时自动启用）
-  uint32_t lastPollMs;      // 上次轮询的时间
-  uint32_t pollIntervalMs;  // 轮询间隔（毫秒），建议 10-20ms
+  uint32_t lastStatusPollMs; // 上次完成一轮 STATUS 分拍发送的时间
+  uint32_t pollIntervalMs;   // 保留：startSensorPolling/gc 传入，用于 JSON 输出间隔说明
 };
-SensorPollingTimer sensorPolling = {false, 0, 20}; // 默认20ms间隔（50Hz）
+SensorPollingTimer sensorPolling = {false, 0, 20};
+
+// 角度采集频率验证：在 handleCanMessage 中累加，angleDiagPrintIfDue 以 ≤10Hz 串口打印
+static volatile uint16_t s_angleDiagRxHipCnt;
+static volatile uint16_t s_angleDiagRxAnkCnt;
+static volatile uint16_t s_angleTxFailWindowCnt;
+static volatile uint16_t s_angleTxHipWindowCnt;   // 窗口内 angle 查询 TX 次数（应与 RX 对应）
+static volatile uint16_t s_angleTxAnkWindowCnt;
+static volatile uint32_t s_unifiedExeWindowCnt;  // 诊断窗口内 runUnified 执行次数（期望≈100Hz×窗口）
+
+// 50Hz/轴：10ms 交替代发踝/髋角度查询（每周期仅 1 帧），避免与转矩/STATUS 同拍挤爆 TX
+static uint32_t s_angleNextHalfPeriodUs = 0;
+static bool s_anglePollAnkleNext = true;
+// STATUS 分拍：0=空闲，1→2→3 连续三拍各发一帧
+static uint8_t s_statusBurstPhase = 0;
+// 最后一次踝角度查询 TX 时间：踝 STATUS 须间隔足够长，否则驱动侧易丢 0x92 应答（表现为 ank_rx < 50Hz）
+static uint32_t s_usLastAnkleAngleQueryTx = 0;
+// ctrlon 时 100Hz×2 A1 + 50Hz 角度查询易撑爆 CAN：转矩改为 50Hz 下发（与计数器同步）
+static uint8_t s_torqueTxDecimatePhase = 0;
 
 // 步态相位枚举（提前定义，ControlLoop需要）
 enum GaitPhase {
@@ -959,7 +983,7 @@ void phase4SwitchTo(GaitPhase4 newPhase, uint32_t nowMs) {
   phase4RegisterTransition(nowMs);
 }
 
-// 更新4相步态状态机（100Hz，在runControlLoopOnce中调用）
+// 更新4相步态状态机（100Hz，在 runUnifiedCanCycle100Hz → runControlAlgorithmOnce 中调用）
 // 依赖：gaitPhaseDetector、swingProgress、stanceProg 均已更新
 void updateGaitPhase4Detector() {
   if (!gaitPhaseDetector.initialized || !swingProgress.initialized) return;
@@ -1892,6 +1916,13 @@ void handleCanMessage(const CAN_message_t &msg) {
         }
         
         status->lastUpdateMs = millis();
+
+        // 角度 RX 打点计数（用于验证 50Hz 采集：串口 ≤10Hz 打印换算频率）
+        if (motor->id == 1) {
+          s_angleDiagRxHipCnt++;
+        } else if (motor->id == 2) {
+          s_angleDiagRxAnkCnt++;
+        }
         
         // 对于髋关节，更新信号预处理、自适应阈值、步态相位识别和摆动进度
         if (motor->id == 1) {
@@ -2709,13 +2740,32 @@ void updateGaitPlayback() {
 // SensorPollingTimer sensorPolling = {false, 0, 20};
 
 
+// 电机角度：50Hz/轴（每 10ms 只发一轴查询，两轴交替）；STATUS：略降频以减少与角度抢占同一节点
+static constexpr uint32_t ANGLE_HALF_PERIOD_US = 10000;   // 10ms → 每轴 20ms 周期 = 50Hz
+// 每圈最多 1 次角度 TX：避免同周期连发多帧至同一节点；节拍正常时与 100Hz 对齐即可满 50Hz/轴
+static constexpr uint8_t MAX_ANGLE_SENDS_PER_UNIFIED = 1;
+static constexpr uint32_t STATUS_POLL_INTERVAL_MS = 130;           // 仅采集/gc、未跑闭环助力时
+static constexpr uint32_t STATUS_POLL_INTERVAL_MS_CTRL_ON = 800;    // ctrlon 时拉长 STATUS，把带宽留给角度应答
+// ctrlon 时 A1 转矩降频：1=每周期(~100Hz)，2≈50Hz，3≈33Hz（减轻过载时优先加大此值）
+static constexpr uint8_t TORQUE_TX_CTRL_ON_DIVISOR = 3;
+// 踝 0x92 之后至少间隔再发踝 STATUS（同一电机 ID；协议 350µs，此处加大裕量利于稳定 50Hz RX）
+static constexpr uint32_t ANKLE_GAP_AFTER_ANGLE_QUERY_US = 1800;
+// 诊断窗口加长，Hz 数字更稳；仍 ≤5Hz 串口（200ms 一行）
+static constexpr uint32_t ANGLE_DIAG_SERIAL_INTERVAL_MS = 200;
+
 // 启动传感器轮询（在ctrlon开启时调用）
 void startSensorPolling(uint32_t intervalMs = 20) {
   sensorPolling.enabled = true;
   sensorPolling.pollIntervalMs = intervalMs;
-  sensorPolling.lastPollMs = millis();
-  hostPrintf(">>> Sensor polling STARTED (interval: %lu ms, %.1f Hz)\n", 
-                intervalMs, 1000.0f / intervalMs);
+  uint32_t t = millis();
+  sensorPolling.lastStatusPollMs = t - STATUS_POLL_INTERVAL_MS;
+  uint32_t us = micros();
+  s_angleNextHalfPeriodUs = us;
+  s_anglePollAnkleNext = true;
+  s_statusBurstPhase = 0;
+  s_usLastAnkleAngleQueryTx = 0;
+  hostPrintf(">>> Sensor polling STARTED (angle 50 Hz/axis staggered, status ~7.7 Hz, gc/json param=%lu ms)\n",
+                static_cast<unsigned long>(intervalMs));
 }
 
 // 停止传感器轮询（在ctrloff时调用）
@@ -2724,39 +2774,123 @@ void stopSensorPolling() {
   hostPrintln(">>> Sensor polling STOPPED");
 }
 
+// 方案二：传感器查询由 runUnifiedCanCycle100Hz 统一调度（角度交错 + STATUS 分拍，减轻 TX 队列丢失）
+static bool ankleReadyForStatusTraffic(uint32_t usNow) {
+  // 从未发过踝角查询时允许 STATUS（避免初值阻塞）
+  if (s_usLastAnkleAngleQueryTx == 0) {
+    return true;
+  }
+  return (usNow - s_usLastAnkleAngleQueryTx) >= ANKLE_GAP_AFTER_ANGLE_QUERY_US;
+}
+
+static void sensorPollingScheduledTx(uint32_t now) {
+  if (!sensorPolling.enabled || isSystemError) {
+    return;
+  }
+
+  for (uint8_t n = 0; n < MAX_ANGLE_SENDS_PER_UNIFIED; n++) {
+    uint32_t us = micros();
+    int32_t angleLateUs = (int32_t)(us - s_angleNextHalfPeriodUs);
+    if (angleLateUs < 0) {
+      break;
+    }
+    if ((uint32_t)angleLateUs > 50000) {
+      s_angleNextHalfPeriodUs = us + ANGLE_HALF_PERIOD_US;
+    } else {
+      s_angleNextHalfPeriodUs += ANGLE_HALF_PERIOD_US;
+    }
+    const bool doAnkle = s_anglePollAnkleNext;
+    bool ok = doAnkle ? requestMotorAngle(ankleMotor) : requestMotorAngle(hipMotor);
+    if (doAnkle && ok) {
+      s_usLastAnkleAngleQueryTx = micros();
+    }
+    if (doAnkle) {
+      s_angleTxAnkWindowCnt++;
+    } else {
+      s_angleTxHipWindowCnt++;
+    }
+    if (!ok) {
+      s_angleTxFailWindowCnt++;
+    }
+    s_anglePollAnkleNext = !s_anglePollAnkleNext;
+  }
+
+  const uint32_t usNow = micros();
+
+  const uint32_t statusGapMs =
+      controlLoop.controlEnabled ? STATUS_POLL_INTERVAL_MS_CTRL_ON : STATUS_POLL_INTERVAL_MS;
+
+  if (s_statusBurstPhase == 0 &&
+      (now - sensorPolling.lastStatusPollMs >= statusGapMs)) {
+    s_statusBurstPhase = 1;
+  }
+  // 发往踝节点的 STATUS 须在最近一次踝 0x92 之后间隔足够（否则部分驱动丢角度应答）
+  if (s_statusBurstPhase == 1) {
+    if (!ankleReadyForStatusTraffic(usNow)) {
+      // 保持 phase==1
+    } else {
+      sendCanCommand(ankleMotor.id, CMD_READ_STATUS1, nullptr, 0, false);
+      s_statusBurstPhase = 2;
+    }
+  } else if (s_statusBurstPhase == 2) {
+    sendCanCommand(hipMotor.id, CMD_READ_STATUS1, nullptr, 0, false);
+    s_statusBurstPhase = 3;
+  } else if (s_statusBurstPhase == 3) {
+    if (!ankleReadyForStatusTraffic(usNow)) {
+      // 保持 phase==3，下一拍再发踝 STATUS2
+    } else {
+      sendCanCommand(ankleMotor.id, CMD_READ_STATUS2, nullptr, 0, false);
+      s_statusBurstPhase = 0;
+      sensorPolling.lastStatusPollMs = now;
+    }
+  }
+}
+
+// 串口输出实测角度 RX 频率（每 ANGLE_DIAG_SERIAL_INTERVAL_MS 最多 1 行，≤10Hz）
+static void angleDiagPrintIfDue(uint32_t now) {
+  if (!sensorPolling.enabled && !controlLoop.controlEnabled) {
+    return;
+  }
+  static uint32_t s_lastAngleDiagMs = 0;
+  static bool s_angleDiagPrimed = false;
+  if (!s_angleDiagPrimed) {
+    s_angleDiagPrimed = true;
+    s_lastAngleDiagMs = now;
+    return;
+  }
+  if (now - s_lastAngleDiagMs < ANGLE_DIAG_SERIAL_INTERVAL_MS) {
+    return;
+  }
+  s_lastAngleDiagMs = now;
+
+  uint16_t h = s_angleDiagRxHipCnt;
+  uint16_t a = s_angleDiagRxAnkCnt;
+  uint16_t f = s_angleTxFailWindowCnt;
+  uint16_t txh = s_angleTxHipWindowCnt;
+  uint16_t txa = s_angleTxAnkWindowCnt;
+  s_angleDiagRxHipCnt = 0;
+  s_angleDiagRxAnkCnt = 0;
+  s_angleTxFailWindowCnt = 0;
+  s_angleTxHipWindowCnt = 0;
+  s_angleTxAnkWindowCnt = 0;
+  uint32_t uc = s_unifiedExeWindowCnt;
+  s_unifiedExeWindowCnt = 0;
+  float scaleHz = 1000.0f / static_cast<float>(ANGLE_DIAG_SERIAL_INTERVAL_MS);
+  uint32_t pend = g_canCycleTicksPending;
+  Serial.printf("[ANGLE_RATE] hip_rx=%.1f ank_rx=%.1f tx_hip=%u tx_ank=%u fail=%u unif=%lu pend=%lu\n",
+                h * scaleHz, a * scaleHz,
+                static_cast<unsigned>(txh), static_cast<unsigned>(txa),
+                static_cast<unsigned>(f),
+                static_cast<unsigned long>(uc), static_cast<unsigned long>(pend));
+}
+
 // 更新传感器轮询（在loop中调用）
-// 负责定期请求角度和状态2，喂数据给状态机
+// CAN 收发已迁至 runUnifiedCanCycle100Hz；此处保留接口并在错误时关闭轮询
 void updateSensorPolling() {
   if (!sensorPolling.enabled) return;
-  // 如果发生系统错误，强制停止轮询
   if (isSystemError) {
     sensorPolling.enabled = false;
     return;
-  }
-  
-  uint32_t now = millis();
-
-  // 即使不发送轮询请求，也要尝试读取CAN消息，确保及时处理
-  CAN_message_t inMsg;
-  if (can1.read(inMsg)) {
-    handleCanMessage(inMsg);
-  }
-  
-  // 定期请求角度和状态（固定频率轮询）
-  if (now - sensorPolling.lastPollMs >= sensorPolling.pollIntervalMs) {
-    sensorPolling.lastPollMs = now;
-    
-    // 尝试发送请求，即使某一个失败也不返回，尽可能多发
-    // 请求电机角度
-    requestMotorAngle(ankleMotor);
-    requestMotorAngle(hipMotor);
-    
-    // 请求踝关节状态2（获取电流数据）
-    // sendCanCommand(ankleMotor.id, CMD_READ_STATUS2, nullptr, 0, false);
-    
-    // 请求电机状态1（检测错误）
-    sendCanCommand(ankleMotor.id, CMD_READ_STATUS1, nullptr, 0, false);
-    sendCanCommand(hipMotor.id, CMD_READ_STATUS1, nullptr, 0, false);
   }
 }
 
@@ -3420,7 +3554,7 @@ void startGaitCollection(uint32_t intervalMs = 20) {
   hostPrintln(">>> Gait data collection STARTED (JSON output only)");
   hostPrintf(">>> Output interval: %lu ms (%.1f Hz)\n", 
                 intervalMs, 1000.0f / intervalMs);
-  hostPrintln(">>> Note: Sensor polling should be enabled separately (via ctrlon)");
+  hostPrintln(">>> Sensor polling started here (CAN unified in runUnifiedCanCycle100Hz)");
   startSensorPolling(intervalMs);
 }
 
@@ -4572,8 +4706,8 @@ void setup() {
   
   // 初始化默认步态轨迹
   initDefaultGaitTrajectory();
-  // 启动硬件定时器，直接在定时器回调中调用 runControlLoopOnce，周期 10ms (100Hz)
-  controlTimer.begin(runControlLoopOnce, 10000); // 10000 us = 10 ms
+  // 方案二：定时器仅递增节拍，CAN 统一在 loop 中 runUnifiedCanCycle100Hz 处理
+  controlTimer.begin(onCanCycleTimerTick, 10000); // 10000 us = 10 ms
   controlTimer.priority(128);
 }
 
@@ -4585,9 +4719,6 @@ void setup() {
 // 控制循环变量定义（结构体定义已移到前面）
 // controlLoop 定义已移到文件头部
 
-
-// 控制循环定时器（通过定时器产生节拍，在 loop 中跑控制，避免 ISR 内部做重活）
-#include <IntervalTimer.h>
 
 // 启用/禁用控制循环
 void setControlLoopEnabled(bool enabled) {
@@ -4615,35 +4746,52 @@ void setControlLoopEnabled(bool enabled) {
     // hipProcessor.initialized = false; // 可选：是否重置滤波？暂时保留滤波历史可能更好
     
     hostPrintln(">>> Control loop ENABLED (100Hz) - States Reset");
+    s_torqueTxDecimatePhase = 0;
+    if (TORQUE_TX_CTRL_ON_DIVISOR > 1u) {
+      hostPrintln(">>> CAN: A1 torque decimated + STATUS 800ms while control ON (lower bus load for angle RX)");
+    }
     // 自动启动传感器轮询（喂数据给状态机）
     startSensorPolling(20);  // 默认20ms间隔（50Hz）
   } else {
     hostPrintln(">>> Control loop DISABLED");
-    // Timer continues running but runControlLoopOnce() will be no-op when disabled
-    // 停止传感器轮询
+    // 定时器仍 100Hz 打节拍；控制关闭后 runUnified 仅做 RX 与（若已停轮询则）无查询 TX
     stopSensorPolling();
   }
 }
 
-// 100Hz 控制循环主体（由定时器驱动，loop 中消费 pending 计数执行）
-void runControlLoopOnce() {
-  // Run only when enabled
-  if (!controlLoop.controlEnabled) {
-    return;
+// --- CAN 100Hz 节拍 ISR：只做计数，不做 CAN 读写 ---
+void onCanCycleTimerTick() {
+  // 上限过小会导致 loop 偏慢时丢节拍 → 角度采样率掉到 20~40Hz；pending 仅作迟到补偿用
+  if (g_canCycleTicksPending < 64) {
+    g_canCycleTicksPending++;
   }
+}
 
-  // Enter ISR context: suppress Serial output in called functions
-  inIsrContext = true;
+// 统一的 100Hz CAN 周期：先收包 → 先发角度/STATUS（查询）→ 再 A1 转矩。
+// ctrlon 时若先转矩再查询，两路 100Hz 转矩会占满 TX/RX 时隙，踝 0x92 应答易丢（ank_rx 掉至 0 而 tx_ank 仍满）。
+// 转矩发出后再收一轮，减少应答积压在 MB。
+void runUnifiedCanCycle100Hz() {
+  s_unifiedExeWindowCnt++;
+  uint32_t now = millis();
 
-  // 在每次控制计算前，优先处理所有 CAN 接收帧，确保获取到最新反馈
-  {
+  auto canRxDrain = []() {
     CAN_message_t inMsg;
-    // 处理尽可能多的消息，但避免死循环（硬件层面通常会停止返回）
     while (can1.read(inMsg)) {
       handleCanMessage(inMsg);
     }
-  }
+  };
 
+  canRxDrain();
+  sensorPollingScheduledTx(now);
+  if (controlLoop.controlEnabled) {
+    runControlAlgorithmOnce();
+  }
+  canRxDrain();
+  angleDiagPrintIfDue(now);
+}
+
+// 100Hz 控制算法与转矩下发（假定已在同一周期内做过 RX drain）
+static void runControlAlgorithmOnce() {
   uint32_t now = millis();
   controlLoop.lastControlMs = now;
   controlLoop.controlCount++;
@@ -4746,11 +4894,16 @@ void runControlLoopOnce() {
       now);
   
   // ========================================================================
-  // 5. 下发 A1 转矩命令（保持 100Hz，不阻塞）
+  // 5. 下发 A1 转矩命令（ctrlon 时按 TORQUE_TX_CTRL_ON_DIVISOR 降频，减轻 CAN 过载）
   // ========================================================================
+  s_torqueTxDecimatePhase++;
+  const bool torqueTxThisCycle =
+      (TORQUE_TX_CTRL_ON_DIVISOR <= 1u) ||
+      ((s_torqueTxDecimatePhase % TORQUE_TX_CTRL_ON_DIVISOR) == 1u);
+
   if (ankleDataOk) {
     // 与 ak 测试模式互斥：手动转矩由 loop 周期发送，避免与助力 A1 抢同一节点
-    if (!ankleTorqueMode) {
+    if (!ankleTorqueMode && torqueTxThisCycle) {
       sendTorqueCommand(ankleMotor, ankle_iq_cmd);
     }
   } else {
@@ -4759,7 +4912,7 @@ void runControlLoopOnce() {
 
   if (hipDataOk) {
     // 与 hk 测试模式互斥：手动转矩由 loop 周期发送，避免与助力 A1 抢同一节点
-    if (!hipTorqueMode) {
+    if (!hipTorqueMode && torqueTxThisCycle) {
       sendTorqueCommand(hipMotor, hip_iq_cmd);
     }
   } else {
@@ -4789,11 +4942,23 @@ void runControlLoopOnce() {
   assistDbg.phase4_output   = getPhase4ProfileOutput();
   assistDbg.phase4_degraded = isPhase4Degraded() ? 1 : 0;
   assistDbg.lastUpdateMs = now;
-  // 退出 ISR 上下文，允许主循环打印
-  inIsrContext = false;
+}
+
+// 兼容旧名称（若有外部或调试调用）；等价于一次完整 CAN 周期
+void runControlLoopOnce() {
+  runUnifiedCanCycle100Hz();
 }
 void loop() {
 
+  // 方案二：消费 100Hz 节拍；单圈多消化几拍以追上积压（否则 pending 封顶 + 每圈只跑 4 拍 → 有效远低于 100Hz）
+  {
+    uint16_t processed = 0;
+    while (g_canCycleTicksPending > 0 && processed < 48) {
+      g_canCycleTicksPending--;
+      runUnifiedCanCycle100Hz();
+      processed++;
+    }
+  }
 
   // ========================================================================
   // 严重错误处理
@@ -4891,21 +5056,5 @@ void loop() {
   
   // 更新步态轨迹播放
   updateGaitPlayback();
-  
-  // ========================================================================
-  // 6. 兜底 CAN 读取（当控制循环未开启时执行）
-  // ========================================================================
-  // 如果控制循环关闭，runControlLoopOnce 不会执行，因此也就不会读取 CAN。
-  // 这会导致 gc 指令、s 指令等无法更新数据。
-  // 因此在这里补充读取逻辑：
-  if (!controlLoop.controlEnabled) {
-    CAN_message_t inMsg;
-    // 限制每次 loop 最多读多少帧，避免阻塞太久
-    int maxReads = 10;
-    while (can1.read(inMsg) && maxReads > 0) {
-      handleCanMessage(inMsg);
-      maxReads--;
-    }
-  }
 }
 
