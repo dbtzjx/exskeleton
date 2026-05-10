@@ -2747,7 +2747,7 @@ static constexpr uint8_t MAX_ANGLE_SENDS_PER_UNIFIED = 1;
 static constexpr uint32_t STATUS_POLL_INTERVAL_MS = 130;           // 仅采集/gc、未跑闭环助力时
 static constexpr uint32_t STATUS_POLL_INTERVAL_MS_CTRL_ON = 800;    // ctrlon 时拉长 STATUS，把带宽留给角度应答
 // ctrlon 时 A1 转矩降频：1=每周期(~100Hz)，2≈50Hz，3≈33Hz（减轻过载时优先加大此值）
-static constexpr uint8_t TORQUE_TX_CTRL_ON_DIVISOR = 3;
+static constexpr uint8_t TORQUE_TX_CTRL_ON_DIVISOR = 2;
 // 踝 0x92 之后至少间隔再发踝 STATUS（同一电机 ID；协议 350µs，此处加大裕量利于稳定 50Hz RX）
 static constexpr uint32_t ANKLE_GAP_AFTER_ANGLE_QUERY_US = 1800;
 // 诊断窗口加长，Hz 数字更稳；仍 ≤5Hz 串口（200ms 一行）

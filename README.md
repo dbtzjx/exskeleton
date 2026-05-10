@@ -110,3 +110,25 @@ py -m platformio device monitor -b 115200  # 串口监视
 
 **如果已配置 `pio` 命令别名，也可以直接使用：**
 ```bash
+pio run
+pio run -t upload
+pio device monitor -b 115200
+```
+
+---
+
+## CAN / 闭环负载相关参数（修改方法）
+
+以下均在 **`firmware/src/main.cpp`** 中、**`sensorPollingScheduledTx` 实现上方** 的 `static constexpr` 常量区修改（可在编辑器中搜索 **`ANGLE_HALF_PERIOD_US`** 定位），改完后在 `firmware` 目录执行 **`py -m platformio run`** 编译、`upload` 烧录验证。详细调试结论见 **`docs/调试记录-主控与电机CAN.md`**。
+
+| 常量 | 作用简述 | 调参提示 |
+|------|-----------|-----------|
+| `ANGLE_HALF_PERIOD_US` | 髋/踝角度查询交错间隔（µs）；与 `MAX_ANGLE_SENDS_PER_UNIFIED` 配合决定每轴角度请求速率 | 增大则角度更新变慢、总线更空 |
+| `MAX_ANGLE_SENDS_PER_UNIFIED` | 每个统一 CAN 周期最多发几帧角度查询 | 保持 **1** 可避免同周期连轰同一节点 |
+| `STATUS_POLL_INTERVAL_MS` | 未开闭环助力时 STATUS 轮询间隔 | 仅影响非 `ctrlon` 场景 |
+| `STATUS_POLL_INTERVAL_MS_CTRL_ON` | **`ctrlon` 时** STATUS 间隔（当前默认 **800 ms**） | **增大**可进一步把带宽让给角度应答；**减小**则状态更勤但总线更挤 |
+| `TORQUE_TX_CTRL_ON_DIVISOR` | **`ctrlon` 时** A1 转矩指令降频：`1`≈每周期发（~100 Hz），`2`≈**50 Hz**，`3`≈**33 Hz** | 过载时**加大**；助力刷新变慢则**减小**。当前验证 **`2`** 时髋踝角度均可正常获取 |
+| `ANKLE_GAP_AFTER_ANGLE_QUERY_US` | 踝角度查询后再发踝 STATUS 的最小间隔（µs） | 踝应答不稳时可略增大 |
+| `ANGLE_DIAG_SERIAL_INTERVAL_MS` | `[ANGLE_RATE]` 串口行间隔（ms）；打印频率 = 1000/间隔（Hz） | 仅影响日志密度与 Hz 换算窗口 |
+
+**串口监视**：`py -m platformio device monitor -b 115200`，关注 `[ANGLE_RATE]` 中的 **`hip_rx` / `ank_rx`**（角度应答折算 Hz）、**`pend`**（节拍积压）。说明见 **`docs/调试记录-主控与电机CAN.md`**。
