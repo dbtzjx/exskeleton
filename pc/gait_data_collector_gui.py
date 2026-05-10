@@ -20,6 +20,7 @@ import re
 import matplotlib
 matplotlib.use('TkAgg')  # 使用TkAgg后端
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from collections import deque
@@ -47,9 +48,29 @@ MAX_DATA_POINTS = 2000  # 最大数据点数（用于实时显示）
 DATA_FOLDER = "data"  # 数据文件夹
 GAIT_CYCLE_FILE = os.path.join(DATA_FOLDER, "gait_cycle_data.json")  # 步态周期数据文件（默认）
 
-# 设置matplotlib中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+def _configure_matplotlib_chinese_font():
+    """选用本机已安装的无衬线中文字体；Linux 常见为 Noto CJK / 文泉驿（SimHei 在 Linux 常不存在）。"""
+    installed = {f.name for f in font_manager.fontManager.ttflist}
+    priority = (
+        'Noto Sans CJK SC', 'Noto Sans CJK TC', 'Noto Sans CJK JP',
+        'Noto Serif CJK SC', 'Source Han Sans SC', 'Source Han Sans CN',
+        'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei',
+        'AR PL UMing CN', 'AR PL UKai CN',
+        'SimHei', 'Microsoft YaHei', 'Arial Unicode MS',
+    )
+    chosen = next((n for n in priority if n in installed), None)
+    if chosen is None:
+        for n in sorted(installed):
+            if 'CJK' in n or 'WenQuanYi' in n or 'Source Han' in n:
+                chosen = n
+                break
+    if chosen:
+        plt.rcParams['font.sans-serif'] = [chosen, 'DejaVu Sans']
+    else:
+        plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+
+_configure_matplotlib_chinese_font()
 
 # ============================================================================
 # 数据采集类
@@ -1990,6 +2011,8 @@ class GaitDataCollectorGUI:
         # 获取Tkinter widget并绑定滚轮事件（优先级最高）
         canvas_widget = self.canvas.get_tk_widget()
         canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=1)
+        # Linux 下滚轮常需画布有焦点才送达子控件
+        canvas_widget.bind('<Enter>', lambda e: e.widget.focus_set())
         
         # 绑定滚轮事件到Tkinter widget（Windows/Linux）
         canvas_widget.bind('<MouseWheel>', self.on_tk_scroll)
@@ -2660,6 +2683,42 @@ class GaitDataCollectorGUI:
         # 初始化十字准星线（默认隐藏）
         self._init_crosshair()
 
+    def _is_realtime_axes(self, ax):
+        """主实时图左轴或右轴（twinx），用于交互判定。"""
+        if ax is None:
+            return False
+        if ax == self.ax1:
+            return True
+        return getattr(self, 'ax1_right', None) is not None and ax == self.ax1_right
+
+    def _tk_event_to_fig_display(self, event):
+        """Tk 鼠标坐标 → Figure 显示像素坐标（与 matplotlib display 一致，左下为原点）。"""
+        widget = self.canvas.get_tk_widget()
+        w, h = widget.winfo_width(), widget.winfo_height()
+        if w <= 1 or h <= 1:
+            return None
+        fb = self.fig.bbox
+        if fb is None:
+            return None
+        fig_x = fb.x0 + (event.x / w) * fb.width
+        fig_y = fb.y0 + (1.0 - event.y / h) * fb.height
+        return fig_x, fig_y
+
+    def _axes_at_fig_display(self, fig_x, fig_y):
+        """返回光标下的实时图坐标轴（含 twinx 右轴）。"""
+        for ax in (self.ax1, getattr(self, 'ax1_right', None)):
+            if ax is None:
+                continue
+            bb = ax.bbox
+            if bb is None:
+                continue
+            inside = bb.contains(fig_x, fig_y)
+            if isinstance(inside, tuple):
+                inside = inside[0]
+            if inside:
+                return ax
+        return None
+
     def _init_crosshair(self):
         """创建十字准星的两条虚线（竖线x/横线y）。"""
         try:
@@ -2736,7 +2795,7 @@ class GaitDataCollectorGUI:
             self.press_x = event.xdata
             self.press_y = event.ydata
             # 保存当前视图范围
-            if event.inaxes == self.ax1:
+            if self._is_realtime_axes(event.inaxes):
                 self.xlim_backup = self.ax1.get_xlim()
                 self.ylim_backup = self.ax1.get_ylim()
     
@@ -2765,7 +2824,7 @@ class GaitDataCollectorGUI:
         dx = event.xdata - self.press_x
         
         # 更新X轴范围（水平移动）
-        if event.inaxes == self.ax1:
+        if self._is_realtime_axes(event.inaxes):
             xlim = self.xlim_backup
             x_range = xlim[1] - xlim[0]
             new_xlim = (xlim[0] - dx, xlim[1] - dx)
@@ -2777,77 +2836,28 @@ class GaitDataCollectorGUI:
     
     def on_tk_scroll(self, event):
         """Tkinter滚轮事件处理（直接绑定到widget）"""
-        # 获取Tkinter widget
-        canvas_widget = self.canvas.get_tk_widget()
-        
-        # 获取鼠标在canvas中的坐标（相对于canvas widget）
-        x = event.x
-        y = event.y
-        
-        # 确定鼠标在哪个轴上
-        # 将Tkinter坐标转换为matplotlib display坐标
-        # 获取figure的bbox（display坐标）
-        fig_bbox = self.fig.bbox
-        if fig_bbox is None:
+        pos = self._tk_event_to_fig_display(event)
+        if pos is None:
+            return
+        fig_x, fig_y = pos
+        ax_hit = self._axes_at_fig_display(fig_x, fig_y)
+        if ax_hit is None:
             return
         
-        # 获取canvas widget的尺寸
-        widget_width = canvas_widget.winfo_width()
-        widget_height = canvas_widget.winfo_height()
-        
-        if widget_width == 1 or widget_height == 1:  # 未初始化
-            return
-        
-        # 计算figure在widget中的位置和缩放
-        fig_width = fig_bbox.width
-        fig_height = fig_bbox.height
-        
-        # 转换为figure的display坐标（像素，相对于figure左下角）
-        # 注意：Tkinter的y坐标是从上到下，matplotlib的display坐标是从下到上
-        fig_x = (x / widget_width) * fig_width
-        fig_y = fig_height - (y / widget_height) * fig_height  # 翻转y坐标
-        
-        # 检查在哪个axes中（使用axes的bbox来检查）
-        ax = None
-        ax1_bbox = self.ax1.bbox
-        
-        if ax1_bbox:
-            # 检查点是否在ax1的bbox内
-            ax1_x0, ax1_y0 = ax1_bbox.x0, ax1_bbox.y0
-            ax1_x1, ax1_y1 = ax1_bbox.x1, ax1_bbox.y1
-            
-            if ax1_x0 <= fig_x <= ax1_x1 and ax1_y0 <= fig_y <= ax1_y1:
-                ax = self.ax1
-            else:
-                return
-        else:
-            return
-        
-        # 将display坐标转换为数据坐标
-        inv = ax.transData.inverted()
+        # X 与左轴共享，统一用 ax1 的 transData 取数据横坐标
+        inv = self.ax1.transData.inverted()
         xdata, ydata = inv.transform((fig_x, fig_y))
         
-        # 获取当前轴范围
+        # 获取当前轴范围（X 轴始终与 ax1 一致）
+        ax = self.ax1
         xlim = ax.get_xlim()
-        ylim = ax.get_ylim()
         
-        # 确定滚动方向
-        # Windows: event.delta (正数=向上, 负数=向下)
-        # Linux: event.num (4=向上, 5=向下)
-        if hasattr(event, 'delta'):
-            if event.delta > 0:
-                scale_factor = 1.15  # 放大
-            elif event.delta < 0:
-                scale_factor = 1.0 / 1.15  # 缩小
-            else:
-                return
-        elif hasattr(event, 'num'):
-            if event.num == 4:
-                scale_factor = 1.15  # 放大
-            elif event.num == 5:
-                scale_factor = 1.0 / 1.15  # 缩小
-            else:
-                return
+        # 滚动方向：Linux Button-4/5 优先（避免与 delta==0 冲突导致误 return）
+        num = getattr(event, 'num', None)
+        if num in (4, 5):
+            scale_factor = 1.15 if num == 4 else 1.0 / 1.15
+        elif getattr(event, 'delta', 0):
+            scale_factor = 1.15 if event.delta > 0 else 1.0 / 1.15
         else:
             return
         
@@ -2865,9 +2875,12 @@ class GaitDataCollectorGUI:
         # 应用新的X轴范围
         ax.set_xlim(new_xlim)
         
-        # Y轴根据数据自适应（重新计算）
+        # Y轴根据数据自适应（左轴 + twinx 右轴）
         ax.relim()
         ax.autoscale_view(scalex=False, scaley=True)
+        if getattr(self, 'ax1_right', None) is not None:
+            self.ax1_right.relim()
+            self.ax1_right.autoscale_view(scalex=False, scaley=True)
         
         # 立即更新显示
         self.canvas.draw_idle()
@@ -2882,8 +2895,8 @@ class GaitDataCollectorGUI:
         if hasattr(self.toolbar, '_active') and self.toolbar._active in ['ZOOM', 'PAN']:
             return
         
-        # 获取当前轴
-        if event.inaxes == self.ax1:
+        # 获取当前轴（含 twinx 右轴）
+        if self._is_realtime_axes(event.inaxes):
             ax = self.ax1
             xlim = self.ax1.get_xlim()
         else:
@@ -2925,9 +2938,12 @@ class GaitDataCollectorGUI:
         # 应用新的X轴范围
         ax.set_xlim(new_xlim)
         
-        # Y轴根据数据自适应（重新计算）
+        # Y轴根据数据自适应（左轴 + twinx 右轴）
         ax.relim()
         ax.autoscale_view(scalex=False, scaley=True)
+        if getattr(self, 'ax1_right', None) is not None:
+            self.ax1_right.relim()
+            self.ax1_right.autoscale_view(scalex=False, scaley=True)
         
         # 立即更新显示
         self.canvas.draw_idle()
